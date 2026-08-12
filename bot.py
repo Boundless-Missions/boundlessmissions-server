@@ -395,6 +395,28 @@ async def main() -> None:
             import uvicorn
             from api_server import app as api_app
 
+            # Security gates that are OFF get shouted about on every start. These are
+            # meant to be flipped off briefly during development — a rebuild changes
+            # the DLL hash, so the version gate blocks the build you are testing — and
+            # the failure mode is forgetting to flip them back, which ships a server
+            # that accepts outdated and modified clients without challenge.
+            disabled_gates = [
+                name for name, on in (
+                    ("KSP_VERSION_CHECK_ENABLED", cfg.KSP_VERSION_CHECK_ENABLED),
+                    ("KSP_DEVICE_BINDING_ENABLED", cfg.KSP_DEVICE_BINDING_ENABLED),
+                    ("KSP_2FA_ENABLED", cfg.KSP_2FA_ENABLED),
+                ) if not on
+            ]
+            if disabled_gates:
+                banner = "  ".join(disabled_gates)
+                print("\n" + "!" * 72)
+                print("!!  SECURITY GATES DISABLED — DO NOT RUN THIS IN PRODUCTION")
+                print(f"!!  {banner}")
+                print("!!  Set these back to true in .env before public deployment.")
+                print("!" * 72 + "\n")
+                log.warning("SECURITY GATES DISABLED: %s — dev only, re-enable before deployment.",
+                            ", ".join(disabled_gates))
+
             # Serve HTTPS directly if a cert+key are configured; otherwise plain
             # HTTP (fine on localhost or behind a TLS-terminating reverse proxy).
             ssl_kwargs = {}

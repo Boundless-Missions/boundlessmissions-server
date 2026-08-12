@@ -213,6 +213,10 @@ class CorpInfo(BaseModel):
     owner_id: str
     owner_name: str
     corp_name: str
+    # Extras for the mod's player picker. Optional/defaulted so older mod builds,
+    # which parse this with MiniJSON and ignore unknown keys, are unaffected.
+    avatar_url: Optional[str] = None
+    level: int = 0
 
 class CorpListResponse(BaseModel):
     corps: list[CorpInfo]

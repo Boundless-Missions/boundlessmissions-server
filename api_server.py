@@ -1982,19 +1982,52 @@ async def give_up_contract(contract_id: str, user: dict = Depends(get_current_us
 
 @app.get("/api/v1/corps/list", response_model=CorpListResponse)
 async def list_corps(user: dict = Depends(get_current_user)):
-    """List all corporations in the guild."""
+    """
+    List all corporations in the guild.
+
+    avatar_url and level are extras for the KSP mod's player picker. Both come from
+    caches only — guild.get_member and the in-memory store — never fetch_member: this
+    endpoint is one round trip per picker open, and N members * one Discord fetch each
+    would turn that into a multi-second stall on a large guild. A member missing from
+    the cache simply comes back without an avatar, which the client renders as initials.
+    """
     gid = int(user["guild_id"])
+    guild = _bot_instance.get_guild(gid) if _bot_instance else None
 
     corps_col = _db.collection("guilds").document(str(gid)).collection("corps")
     corps = []
     for doc in corps_col.stream():
         d = doc.to_dict()
-        if d:
-            corps.append(CorpInfo(
-                owner_id=doc.id,
-                owner_name=d.get("owner_name", d.get("name", "Unknown")),
-                corp_name=d.get("name", "Unknown Corp"),
-            ))
+        if not d:
+            continue
+
+        avatar_url = None
+        level = 0
+        try:
+            uid = int(doc.id)
+            member = guild.get_member(uid) if guild else None
+            if member is not None:
+                asset = member.display_avatar
+                # 64px because these draw at ~40px in a list and every one is proxied
+                # through the mod's image route, and PNG because Nitro members have
+                # animated avatars whose default URL is a .gif — which the mod's proxy
+                # sniffs and rejects, since it only re-serves PNG/JPEG/WebP. Some assets
+                # reject replace() arguments, so fall back to the plain URL.
+                try:
+                    avatar_url = asset.replace(size=64, format="png").url
+                except Exception:
+                    avatar_url = asset.url
+            level = store.get_user(gid, uid).get("level", 0)
+        except (ValueError, TypeError):
+            pass  # non-numeric doc id — still listable, just without the extras
+
+        corps.append(CorpInfo(
+            owner_id=doc.id,
+            owner_name=d.get("owner_name", d.get("name", "Unknown")),
+            corp_name=d.get("name", "Unknown Corp"),
+            avatar_url=avatar_url,
+            level=level,
+        ))
 
     return CorpListResponse(corps=corps)
 
