@@ -174,6 +174,24 @@ CONTRACT_MOD_CHANNEL_ID: int | None = 1513934242315374744
 # Allow users to send contracts to themselves (for testing only!)
 CONTRACT_ALLOW_SELF = False
 
+# ── Disputes ─────────────────────────────────────────────────────────────────
+# A refused submission puts the contract in dispute, where the contractor chooses how
+# to resolve it. Left alone it would sit there forever — which is a free way to dodge
+# the fine, since nothing else in the system ever closes it. So the fine collects
+# itself this many days after the dispute opened.
+#
+# The clock is absolute from the moment the dispute opened and does NOT pause for a
+# pending settle or extension request. Pausing it would hand back the same loophole
+# through a different door: ask to settle, and stall for as long as the issuer takes
+# to answer. The agreed penalty is the default outcome; everything else needs someone
+# to actively agree to it in time.
+DISPUTE_AUTO_FINE_DAYS = 3
+
+# A contractor gets one deadline-extension request per dispute. Without this they can
+# keep asking with a new date every time one is refused, which is stalling by another
+# name. Submitting again and being refused again opens a *new* dispute, which resets it.
+DISPUTE_MAX_MORE_TIME_REQUESTS = 1
+
 # ── Mod-only gameplay ─────────────────────────────────────────────────────────
 # When True, gameplay commands that the in-game KSP mod can perform itself
 # (screenshot analysis, player-to-player contracts) are disabled on Discord, so

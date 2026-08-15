@@ -3,15 +3,19 @@ cogs/contracts.py – Player-to-player contract system.
 
 /g contract @user "mission" money date fine
 """
+import asyncio
 import logging
+from datetime import datetime
+
 import discord
 from discord import app_commands
-from discord.ext import commands
+from discord.ext import commands, tasks
 
 import settings
 from data.store import store, _db
 from data import contracts as cdb
 from i18n import t, tp, S
+import contract_actions as ca
 from cogs.contract_views import (
     ContractOfferView, ContractWorkView, ContractReviewView,
     DisputeView, SettleApprovalView, ModReviewView, _embed,
@@ -69,6 +73,10 @@ S.update({
 class Contracts(commands.Cog, name="Contracts"):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
+        self.dispute_timeout_loop.start()
+
+    def cog_unload(self):
+        self.dispute_timeout_loop.cancel()
 
     @app_commands.command(name="contract", description="Send a contract to another user")
     @app_commands.describe(
@@ -237,6 +245,13 @@ class Contracts(commands.Cog, name="Contracts"):
                 if str(c.get("issuer_id")) != str(interaction.client.user.id):
                     await store.add_balance(gid, int(c["issuer_id"]), c["payment"])
                     refunded += c["payment"]
+                # A rescue's wreck was deleted from the issuer's save when the contract
+                # was created. Wiping the contract without this leaves their ship gone
+                # for good, with nothing left pointing at the snapshot that could
+                # restore it. This bulk tool cancels statuses `contract_actions.cancel`
+                # deliberately refuses (submitted, disputed, mod_review), so it cannot
+                # simply delegate — but it owes the same clean-up.
+                await ca.restore_rescue(gid, c["contract_id"], c)
                 cancelled += 1
 
         # Also clear weekly mission selections for this user
@@ -256,6 +271,40 @@ class Contracts(commands.Cog, name="Contracts"):
         )
         log.info("%s reset contracts for %s: %d cancelled, %d refunded, %d selections cleared",
                  interaction.user, user, cancelled, refunded, selections_cleared)
+
+    # ── Background: close disputes nobody resolved ───────────────────────────
+    #
+    # A dispute is the one state with no natural end. Every other status is driven
+    # forward by somebody who wants something — but a contractor who owes a fine wants
+    # exactly nothing to happen, and before this loop nothing ever did.
+    #
+    # Half-hourly rather than by-the-minute: the deadline is measured in days, so the
+    # worst case is being fined 30 minutes late, and a tighter loop would just re-query
+    # Firestore for no one's benefit.
+    @tasks.loop(minutes=30)
+    async def dispute_timeout_loop(self):
+        try:
+            disputed = await asyncio.to_thread(cdb.list_by_status, cdb.DISPUTED)
+        except Exception as exc:
+            log.error("Dispute sweep could not list contracts: %s", exc)
+            return
+
+        now = datetime.utcnow()
+        for c in disputed:
+            deadline = ca.auto_fine_at(c)
+            # None means the dispute predates the clock. expire_dispute stamps it and
+            # returns without charging, so those get a full window from now.
+            if deadline is not None and now < deadline:
+                continue
+            try:
+                await ca.expire_dispute(int(c.get("guild_id") or 0), c["contract_id"])
+            except Exception as exc:
+                # One bad contract must not stop the sweep for every other one.
+                log.error("Dispute sweep failed on %s: %s", c.get("contract_id"), exc)
+
+    @dispute_timeout_loop.before_loop
+    async def _wait_ready(self):
+        await self.bot.wait_until_ready()
 
     # ── /rescues ────────────────────────────────────────────────────────────
     @app_commands.command(name="rescues", description="Show how many rescue missions a user has completed")

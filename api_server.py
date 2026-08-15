@@ -11,6 +11,8 @@ import asyncio
 import hashlib
 import io
 import logging
+import math
+import re
 import secrets
 import time
 import uuid
@@ -36,10 +38,11 @@ from api_models import (
     LinkRequest, LinkResponse, PollRequest, DeviceStatusResponse,
     UserProfile,
     WeeklyMissionsResponse, Mission, MissionSelectRequest, MissionSelectResponse,
-    ContractSummary, ContractListResponse, ContractAcceptResponse,
+    ContractSummary, ContractListResponse, ContractAcceptResponse, PendingRequest,
     PartCatalogUpload, PartCatalogResponse,
     CorpInfo, CorpListResponse, ContractCreateRequest, AuctionCreateRequest, ContractReviewRequest,
-    ContractDisputeRequest, RescueTarget,
+    ContractDisputeRequest, ContractRequestResponse, RescueTarget,
+    GameCommandRequest, GameCommandResult,
     SubmissionResult, FlightSubmission, VesselSnapshot,
     Notification, NotificationsResponse,
     MarketplaceListResult, MarketplaceListing, MarketplaceListingsResponse,
@@ -59,6 +62,10 @@ from data import orbit_constraints as oc
 from data import part_resolver as pr
 from data import marketplace as mkt
 from data import imports as imp
+# The contract state machine, shared with the Discord buttons. `contract_actions`
+# late-imports this module back (for the notification hub and the rescue helpers), so
+# the cycle is resolved at call time, not import time.
+import contract_actions as ca
 
 log = logging.getLogger(__name__)
 
@@ -198,6 +205,30 @@ class NotificationHub:
                 dead.append(ws)
         for ws in dead:
             conns.discard(ws)
+
+    async def push_frame(self, gid: int, uid: int, payload: dict) -> int:
+        """Send a raw typed frame to one user's live clients. Returns how many
+        received it.
+
+        Deliberately separate from broadcast(), which is fleet-wide: a command is
+        addressed to one account's running games and must never reach anyone else.
+        Two KSP installs linked to the same account both get it, which is why the
+        count is returned — the caller reports where it went.
+        """
+        conns = self._conns.get((gid, uid))
+        if not conns:
+            return 0
+        delivered = 0
+        dead = []
+        for ws in list(conns):
+            try:
+                await ws.send_json(payload)
+                delivered += 1
+            except Exception:
+                dead.append(ws)
+        for ws in dead:
+            conns.discard(ws)
+        return delivered
 
     async def broadcast(self, payload: dict):
         """Send a raw frame to every live connection (not per-user). Used for
@@ -808,6 +839,13 @@ def _prune_attest() -> None:
 @app.get("/api/v1/attest/challenge", response_model=AttestChallenge)
 async def attest_challenge(user: dict = Depends(get_user_token_only)):
     """Issue a one-time nonce + byte-window for the client to hash against its DLL."""
+    # Attestation asks the same question the version gate asks — "is this the published
+    # build?" — just cryptographically instead of on the client's word. So it honours
+    # the same switch. With the gate off for development, every local build is by
+    # definition not the published one, and each attestation round would open a
+    # mods-only "possible modified mod" ticket about the developer.
+    if not cfg.KSP_VERSION_CHECK_ENABLED:
+        return AttestChallenge(enabled=False)
     info = await asyncio.to_thread(mver.get_latest_dll_bytes)
     if not info:
         return AttestChallenge(enabled=False)   # nothing stored → can't verify, skip
@@ -838,6 +876,11 @@ async def attest_respond(req: AttestRespondRequest, request: Request,
     """Verify the client's attestation digest. A mismatch on a valid, fresh,
     owner-matched challenge is a strong tamper signal → flag for moderators."""
     _rate_limit(f"attest:{_client_ip(request)}", max_hits=30, window=60.0)
+    # Checked here too, not only when issuing: a challenge handed out before the switch
+    # was flipped can still arrive, and nothing stops a client POSTing here unprompted.
+    # An accusation is the expensive half of this endpoint, so it gets its own guard.
+    if not cfg.KSP_VERSION_CHECK_ENABLED:
+        return AttestResult(ok=True)
     ch = _attest_challenges.pop(req.attest_id, None)
     # Unknown/expired/foreign challenge: inconclusive (e.g. server restart) — don't
     # accuse, just report not-ok so the client retries on its next cycle.
@@ -1505,6 +1548,11 @@ async def get_active_contracts(user: dict = Depends(get_current_user)):
             rescue_vessel_node_url = None
             if c.get("mission_type") == cdb.RESCUE:
                 rt = c.get("rescue_target") or {}
+                # wreck_parts is only useful to the rescuer's client (to tell them
+                # live whether the wreck is aboard) and is the biggest field on a
+                # rescue — one entry per part. Everyone else gets the target without it.
+                if rt and c.get("contractor_id") != uid and rt.get("wreck_parts"):
+                    rt = {**rt, "wreck_parts": []}
                 rescue_target = RescueTarget(**rt) if rt else None
                 rescue_kerbals = c.get("rescue_kerbals", [])
                 is_modded_target = bool(rt.get("is_modded"))
@@ -1535,6 +1583,17 @@ async def get_active_contracts(user: dict = Depends(get_current_user)):
                 is_modded_target=is_modded_target,
                 rescue_vessel_node_url=rescue_vessel_node_url,
                 flag_preview_url=c.get("flag_preview_url"),
+                life_support=c.get("life_support", "none") or "none",
+                ls_endurance_days=float(c.get("ls_endurance_days") or 0.0),
+                ls_crew_capacity=int(c.get("ls_crew_capacity") or 0),
+                # Only meaningful while disputed; carried for both parties so the
+                # contractor sees "waiting on the issuer" and the issuer sees the ask.
+                pending_request=(PendingRequest(**c["pending_request"])
+                                 if c.get("pending_request") else None),
+                auto_fine_at=(_dt.isoformat()
+                              if (_dt := ca.auto_fine_at(c)) else None),
+                more_time_used=(int(c.get("more_time_requests") or 0)
+                                >= settings.DISPUTE_MAX_MORE_TIME_REQUESTS),
             ))
 
     # Sort newest first
@@ -1568,415 +1627,140 @@ async def get_incoming_contracts(user: dict = Depends(get_current_user)):
                 is_bot_issued=False,
                 mission_type=c.get("mission_type", "active_vessel"),
                 flag_preview_url=c.get("flag_preview_url"),
+                life_support=c.get("life_support", "none") or "none",
+                ls_endurance_days=float(c.get("ls_endurance_days") or 0.0),
+                ls_crew_capacity=int(c.get("ls_crew_capacity") or 0),
             ))
 
     return ContractListResponse(contracts=contracts)
 
 
+# ── Contract state transitions ───────────────────────────────────────────────
+#
+# The transitions themselves live in `contract_actions`, not here. They are driven by
+# three front ends — these endpoints, the Discord buttons in `cogs/contract_views.py`,
+# and (Phase 6a) the website — and when each front end owned its own copy they drifted
+# apart on what a transition *does*, not just on how it reports failure. See that
+# module's docstring for the specific divergences that motivated the split.
+#
+# What stays here is HTTP shape: which failures are a status code and which are a
+# 200 with `success: false`. The KSP client distinguishes the two, so the existing
+# mapping is preserved exactly.
+
+def _raise_for(result: ca.Result) -> None:
+    """Turn the codes the KSP client expects as HTTP failures into HTTP failures.
+
+    Everything else (a wrong-state contract, an unaffordable fine) stays a 200 with
+    `success: false`, because the mod renders that as an in-window message rather than
+    a transport error.
+    """
+    if result.code == ca.NOT_FOUND:
+        raise HTTPException(status_code=404, detail="Contract not found")
+    if result.code == ca.FORBIDDEN:
+        raise HTTPException(status_code=403, detail=result.message)
+    # USE_GIVE_UP deliberately does *not* land here. It is a business rule with a
+    # sentence the player needs to read ("Give Up instead — it costs the fine"), and
+    # both clients render a 403 as a generic transport error. `cancel` returns it as a
+    # 200 with the message intact.
+
+
 @app.post("/api/v1/contracts/{contract_id}/accept", response_model=ContractAcceptResponse)
 async def accept_contract(contract_id: str, user: dict = Depends(get_current_user)):
     """Accept a pending contract."""
-    gid = int(user["guild_id"])
-    uid = str(user["user_id"])
+    r = await ca.accept(int(user["guild_id"]), contract_id,
+                        actor_id=int(user["user_id"]), actor_name=user["username"])
+    _raise_for(r)
+    if not r.ok:
+        return ContractAcceptResponse(success=False, message=r.message)
 
-    c = cdb.get_contract(gid, contract_id)
-    if not c:
-        raise HTTPException(status_code=404, detail="Contract not found")
-
-    if c.get("contractor_id") != uid:
-        raise HTTPException(status_code=403, detail="Not your contract")
-
-    if c.get("status") != cdb.PENDING:
-        return ContractAcceptResponse(success=False, message="Contract is not pending.")
-
-    cdb.update_contract(gid, contract_id, status=cdb.ACTIVE)
-    log.info("KSP: %s accepted contract %s", user["username"], contract_id)
-
-    # Tell the issuer their offer was accepted so their in-game contract list
-    # refreshes live (the contractor already sees the result of their own click).
-    issuer_id = int(c["issuer_id"])
-    if issuer_id != _get_bot_user_id():
-        _create_notification(
-            gid, issuer_id, "contract_accepted",
-            "🤝 Contract Accepted",
-            f"{user['username']} accepted your contract \"{c['mission'][:80]}\".",
-            data={"contract_id": contract_id},
-        )
-
-    # Rescue: hand the rescuer the wreck snapshot + target so their client can
-    # spawn the stranded vessel at the chosen orbit/surface. The issuer's vessel
-    # was already removed at creation, so nothing to do on their side here.
-    if c.get("mission_type") == cdb.RESCUE:
-        rt = c.get("rescue_target") or {}
-        return ContractAcceptResponse(
-            success=True, message="Rescue accepted! Spawning the stranded vessel.",
-            rescue_vessel_node_url=c.get("rescue_vessel_node_url"),
-            rescue_target=RescueTarget(**rt) if rt else None,
-            rescue_kerbals=c.get("rescue_kerbals", []),
-        )
-
-    return ContractAcceptResponse(success=True, message="Contract accepted!")
+    rt = r.data.get("rescue_target") or {}
+    return ContractAcceptResponse(
+        success=True, message=r.message,
+        rescue_vessel_node_url=r.data.get("rescue_vessel_node_url"),
+        rescue_target=RescueTarget(**rt) if rt else None,
+        rescue_kerbals=r.data.get("rescue_kerbals", []),
+    )
 
 
 @app.post("/api/v1/contracts/{contract_id}/review", response_model=ContractAcceptResponse)
 async def review_submission(contract_id: str, req: ContractReviewRequest,
                             user: dict = Depends(get_current_user)):
-    """Issuer reviews a submitted contract: approve (→ completed, pay contractor)
-    or refuse (→ disputed). Mirrors the Discord ContractReviewView buttons so the
-    review can be done from the KSP mod without switching to Discord."""
-    gid = int(user["guild_id"])
-    uid = str(user["user_id"])
-
-    c = cdb.get_contract(gid, contract_id)
-    if not c:
-        raise HTTPException(status_code=404, detail="Contract not found")
-
-    # Only the issuer reviews submissions (the contractor is the submitter).
-    if str(c.get("issuer_id")) != uid:
-        raise HTTPException(status_code=403, detail="Only the contract issuer can review submissions.")
-
-    if c.get("status") != cdb.SUBMITTED:
-        return ContractAcceptResponse(success=False, message="Contract is not awaiting review.")
-
-    contractor_id = int(c["contractor_id"])
-
-    if req.approve:
-        cdb.update_contract(gid, contract_id, status=cdb.COMPLETED,
-                            completed_at=datetime.utcnow().isoformat())
-        await store.add_balance(gid, contractor_id, c["payment"])
-        c["status"] = cdb.COMPLETED
-        _create_notification(
-            gid, contractor_id, "review_result",
-            "✅ Mission Approved!",
-            f"Your submission for \"{c['mission'][:80]}\" was approved. "
-            f"+{c['payment']} {settings.CURRENCY_SYMBOL} paid.",
-            {"contract_id": contract_id},
-        )
-        # Best-effort Discord DM so the contractor is notified outside the game too.
-        if _bot_instance:
-            try:
-                import discord
-                from i18n import t
-                contractor = await _bot_instance.fetch_user(contractor_id)
-                ne = discord.Embed(
-                    title=f"✅ {t(gid, 'ct.accepted')}",
-                    description=t(gid, 'ct.accepted_desc',
-                                 payment=c['payment'], sym=settings.CURRENCY_SYMBOL),
-                    color=discord.Color.green())
-                await contractor.send(embed=ne)
-            except Exception as exc:
-                log.warning("Could not DM contractor after KSP review-approve: %s", exc)
-        # Rescue: return the kerbals to the issuer. Restore their original names,
-        # queue the rescue craft for live import into the issuer's save, and tell
-        # the rescuer's client to remove the craft it just handed over.
-        if c.get("mission_type") == cdb.RESCUE:
-            await _deliver_rescue_craft(gid, contract_id, c)
-            _create_notification(
-                gid, contractor_id, "rescue_craft_removed",
-                "🚀 Rescue Craft Transferred",
-                "Your rescue craft and the rescued kerbals were delivered to the issuer.",
-                {"contract_id": contract_id},
-            )
-        # Flag-design: deliver the full-res flag to the issuer's in-game picker.
-        if c.get("mission_type") == cdb.FLAG_DESIGN and c.get("flag_fullres_url"):
-            imp.enqueue(gid, int(c["issuer_id"]), source="flag", ref_id=contract_id,
-                        craft_name=c["mission"], flag_url=c["flag_fullres_url"],
-                        craft_filename=c.get("flag_filename") or "flag.png")
-            _create_notification(
-                gid, int(c["issuer_id"]), "flag_delivered",
-                "🚩 Flag Delivered",
-                "Your custom flag is queued. Open KSP at the Space Center to install it "
-                "into your flag picker.",
-                {"contract_id": contract_id},
-            )
-        log.info("KSP: %s approved submission for contract %s", user["username"], contract_id)
-        return ContractAcceptResponse(success=True, message="Submission approved! Payment released.")
-
-    # Refuse → dispute. Hand the dispute flow back to Discord (DisputeView is
-    # Discord-only), so the contractor can settle / request more time / pay fine.
-    cdb.update_contract(gid, contract_id, status=cdb.DISPUTED)
-    c["status"] = cdb.DISPUTED
-    _create_notification(
-        gid, contractor_id, "review_result",
-        "⚠️ Submission Refused",
-        f"Your submission for \"{c['mission'][:80]}\" was refused. "
-        f"Check Discord to resolve the dispute.",
-        {"contract_id": contract_id},
-    )
-    if _bot_instance:
-        try:
-            import discord
-            from i18n import t
-            from cogs.contract_views import DisputeView
-            contractor = await _bot_instance.fetch_user(contractor_id)
-            de = discord.Embed(
-                title=f"⚠️ {t(gid, 'ct.disputed')}",
-                description=t(gid, 'ct.disputed_desc'),
-                color=discord.Color.orange())
-            await contractor.send(embed=de, view=DisputeView(contract_id, gid))
-        except Exception as exc:
-            log.warning("Could not DM contractor after KSP review-refuse: %s", exc)
-    log.info("KSP: %s refused submission for contract %s", user["username"], contract_id)
-    return ContractAcceptResponse(success=True, message="Submission refused. Dispute opened on Discord.")
+    """Issuer reviews a submitted contract: approve (→ completed, pay contractor) or
+    refuse (→ disputed). Mirrors the Discord ContractReviewView buttons so the review
+    can be done from the KSP mod without switching to Discord."""
+    r = await ca.review(int(user["guild_id"]), contract_id,
+                        actor_id=int(user["user_id"]), actor_name=user["username"],
+                        approve=bool(req.approve))
+    _raise_for(r)
+    return ContractAcceptResponse(success=r.ok, message=r.message)
 
 
 @app.post("/api/v1/contracts/{contract_id}/dispute", response_model=ContractAcceptResponse)
 async def resolve_dispute(contract_id: str, req: ContractDisputeRequest,
                           user: dict = Depends(get_current_user)):
-    """Contractor resolves a refused (disputed) submission from the KSP mod,
-    mirroring the Discord DisputeView buttons: settle / more_time / pay_fine / sue.
+    """Contractor resolves a refused (disputed) submission from the KSP mod, mirroring
+    the Discord DisputeView buttons: settle / more_time / pay_fine / sue.
 
-    Actions needing the other party's approval (settle, more_time on human
-    contracts) hand off to the existing Discord approval views, exactly like
-    review_submission does for the dispute itself."""
-    gid = int(user["guild_id"])
-    uid = str(user["user_id"])
+    Actions needing the other party's approval (settle, more_time on human contracts)
+    hand off to the existing Discord approval views, exactly like review_submission
+    does for the dispute itself."""
+    r = await ca.dispute(int(user["guild_id"]), contract_id,
+                         actor_id=int(user["user_id"]), actor_name=user["username"],
+                         action=req.action or "", new_date=req.new_date or "")
+    _raise_for(r)
+    return ContractAcceptResponse(success=r.ok, message=r.message)
 
-    c = cdb.get_contract(gid, contract_id)
-    if not c:
-        raise HTTPException(status_code=404, detail="Contract not found")
 
-    # Only the contractor (whose submission was refused) drives the dispute.
-    if str(c.get("contractor_id")) != uid:
-        raise HTTPException(status_code=403, detail="Only the contractor can resolve this dispute.")
+@app.post("/api/v1/contracts/{contract_id}/settle_response", response_model=ContractAcceptResponse)
+async def settle_response_from_ksp(contract_id: str, req: ContractRequestResponse,
+                                   user: dict = Depends(get_current_user)):
+    """Issuer answers a settlement request from in game.
 
-    if c.get("status") != cdb.DISPUTED:
-        return ContractAcceptResponse(success=False, message="Contract is not in dispute.")
+    Until this existed the answer lived only in a Discord DM, which meant the whole
+    dispute flow stalled for anyone playing without Discord open."""
+    r = await ca.settle_response(int(user["guild_id"]), contract_id,
+                                 actor_id=int(user["user_id"]), actor_name=user["username"],
+                                 approve=bool(req.approve))
+    _raise_for(r)
+    return ContractAcceptResponse(success=r.ok, message=r.message)
 
-    action = (req.action or "").lower()
-    issuer_id = int(c["issuer_id"])
-    contractor_id = int(c["contractor_id"])
-    is_bot_issued = issuer_id == _get_bot_user_id()
 
-    # ── Pay Fine ── deduct the fine and release escrow; closes the contract.
-    if action == "pay_fine":
-        # Atomic: don't let a concurrent spend slip the fine past a stale balance check.
-        if not await store.try_debit(gid, contractor_id, c["fine"]):
-            return ContractAcceptResponse(success=False, message="Insufficient balance to pay the fine.")
-        await store.add_balance(gid, issuer_id, c["fine"] + c["payment"])
-        cdb.update_contract(gid, contract_id, status=cdb.COMPLETED,
-                            completed_at=datetime.utcnow().isoformat())
-        if not is_bot_issued:
-            _create_notification(
-                gid, issuer_id, "review_result", "💰 Fine Paid",
-                f"{c['contractor_name']} paid the fine for \"{c['mission'][:80]}\". "
-                f"+{c['fine'] + c['payment']} {settings.CURRENCY_SYMBOL}.",
-                {"contract_id": contract_id},
-            )
-        # Rescue: the rescuer gave up (paid the fine) — kerbals weren't returned,
-        # so hand the issuer their stranded vessel back.
-        if c.get("mission_type") == cdb.RESCUE:
-            await _restore_issuer_vessel(gid, contract_id, c)
-        log.info("KSP: %s paid fine for contract %s", user["username"], contract_id)
-        return ContractAcceptResponse(success=True, message="Fine paid. Contract closed.")
+@app.post("/api/v1/contracts/{contract_id}/more_time_response", response_model=ContractAcceptResponse)
+async def more_time_response_from_ksp(contract_id: str, req: ContractRequestResponse,
+                                      user: dict = Depends(get_current_user)):
+    """Issuer answers a deadline-extension request from in game.
 
-    # ── Sue ── escalate to the moderator channel for review.
-    if action == "sue":
-        if not guild_config.get_channel_id(gid, "contract_mod"):
-            return ContractAcceptResponse(success=False, message="Moderator review is not configured.")
-        cdb.update_contract(gid, contract_id, status=cdb.MOD_REVIEW)
-        c["status"] = cdb.MOD_REVIEW
-        if _bot_instance:
-            try:
-                import discord
-                from i18n import t
-                from cogs.contract_views import ModReviewView, _embed
-                ch = guild_config.resolve_channel(_bot_instance, gid, "contract_mod")
-                if ch is None:
-                    return ContractAcceptResponse(success=False, message="Moderator review is not configured.")
-                e = _embed(c, gid)
-                e.title = f"⚖️ {t(gid, 'ct.mod_review')}"
-                e.color = discord.Color.purple()
-                # Why the submission was refused (AI verdict or issuer note), so mods
-                # can judge whether the refusal was wrong.
-                reason = c.get("review_reason")
-                if reason:
-                    e.add_field(name="Refusal Reason", value=str(reason)[:1024], inline=False)
-                # Blueprint (.craft) + screenshots the player submitted.
-                files = c.get("submitted_files", [])
-                if files:
-                    e.add_field(name="📁 Submitted Files", value="\n".join(
-                        f"📎 [{f['filename']}]({f['url']})" for f in files), inline=False)
-                await ch.send(embed=e, view=ModReviewView(contract_id, gid))
-            except Exception as exc:
-                log.warning("Could not post sue case to mod channel: %s", exc)
-        log.info("KSP: %s sued contract %s", user["username"], contract_id)
-        return ContractAcceptResponse(success=True, message="Case escalated to moderators.")
-
-    # ── Settle ── ask the issuer to drop the contract with no exchange.
-    if action == "settle":
-        if is_bot_issued:
-            return ContractAcceptResponse(success=False, message="AI contracts cannot be settled.")
-        if _bot_instance:
-            try:
-                import discord
-                from i18n import t
-                from cogs.contract_views import SettleApprovalView
-                issuer = await _bot_instance.fetch_user(issuer_id)
-                e = discord.Embed(
-                    title=f"🤝 {t(gid, 'ct.settle_request')}",
-                    description=t(gid, 'ct.settle_desc', name=c['contractor_name']),
-                    color=discord.Color.light_grey())
-                await issuer.send(embed=e, view=SettleApprovalView(contract_id, gid))
-            except Exception as exc:
-                log.warning("Could not send settle request: %s", exc)
-                return ContractAcceptResponse(success=False, message="Could not reach the issuer on Discord.")
-        log.info("KSP: %s requested settlement for contract %s", user["username"], contract_id)
-        return ContractAcceptResponse(success=True, message="Settlement request sent to the issuer.")
-
-    # ── More Time ── extend the deadline (bot: auto; human: issuer approves).
-    if action == "more_time":
-        if is_bot_issued:
-            tz = timezone(timedelta(hours=3))
-            now = datetime.now(tz)
-            days_to_sunday = 6 - now.weekday()
-            if days_to_sunday <= 0:
-                days_to_sunday = 7
-            end_of_week = (now + timedelta(days=days_to_sunday)).strftime("%Y-%m-%d")
-            cdb.update_contract(gid, contract_id, due_date=end_of_week, status=cdb.ACTIVE)
-            log.info("KSP: %s auto-extended bot contract %s to %s",
-                     user["username"], contract_id, end_of_week)
-            return ContractAcceptResponse(
-                success=True, message=f"Deadline extended to {end_of_week}. Submit again!")
-
-        new_date = (req.new_date or "").strip()
-        try:
-            datetime.strptime(new_date, "%Y-%m-%d")
-        except ValueError:
-            return ContractAcceptResponse(
-                success=False, message="A valid new date (YYYY-MM-DD) is required.")
-        if _bot_instance:
-            try:
-                import discord
-                from i18n import t
-                from cogs.contract_views import MoreTimeApprovalView
-                issuer = await _bot_instance.fetch_user(issuer_id)
-                e = discord.Embed(
-                    title=f"⏰ {t(gid, 'ct.moretime_request')}",
-                    description=t(gid, 'ct.moretime_desc', name=c['contractor_name'],
-                                 old=c['due_date'], new=new_date),
-                    color=discord.Color.blue())
-                await issuer.send(embed=e, view=MoreTimeApprovalView(contract_id, gid, new_date))
-            except Exception as exc:
-                log.warning("Could not send more-time request: %s", exc)
-                return ContractAcceptResponse(success=False, message="Could not reach the issuer on Discord.")
-        log.info("KSP: %s requested more time (%s) for contract %s",
-                 user["username"], new_date, contract_id)
-        return ContractAcceptResponse(success=True, message="Time extension request sent to the issuer.")
-
-    return ContractAcceptResponse(success=False, message=f"Unknown dispute action: {action}")
+    No date is accepted here on purpose — the granted date is the one stored on the
+    contract when the contractor asked, so approving cannot quietly grant a different
+    extension than the one requested."""
+    r = await ca.more_time_response(int(user["guild_id"]), contract_id,
+                                    actor_id=int(user["user_id"]), actor_name=user["username"],
+                                    approve=bool(req.approve))
+    _raise_for(r)
+    return ContractAcceptResponse(success=r.ok, message=r.message)
 
 
 @app.post("/api/v1/contracts/{contract_id}/cancel", response_model=ContractAcceptResponse)
 async def cancel_contract(contract_id: str, user: dict = Depends(get_current_user)):
-    """Cancel a contract (available to issuer or contractor for pending/active contracts)."""
-    gid = int(user["guild_id"])
-    uid = str(user["user_id"])
+    """Withdraw (issuer) or decline (contractor) a contract that has not finished.
 
-    c = cdb.get_contract(gid, contract_id)
-    if not c:
-        return ContractAcceptResponse(success=False, message="Contract not found.")
-
-    # Only issuer or contractor can cancel
-    if c.get("issuer_id") != uid and c.get("contractor_id") != uid:
-        return ContractAcceptResponse(success=False, message="Not your contract.")
-
-    # Only pending or active contracts can be cancelled
-    if c.get("status") not in [cdb.PENDING, cdb.ACTIVE]:
-        return ContractAcceptResponse(success=False, message=f"Cannot cancel a {c.get('status')} contract.")
-
-    cdb.update_contract(gid, contract_id, status=cdb.CANCELLED)
-
-    # Refund escrow to issuer
-    issuer_id = int(c["issuer_id"])
-    bot_uid = _get_bot_user_id()
-    if issuer_id != bot_uid:
-        await store.add_balance(gid, issuer_id, c["payment"])
-
-    log.info("KSP: %s cancelled contract %s (refunded %d to issuer %s)",
-             user["username"], contract_id, c["payment"], c["issuer_id"])
-
-    # Notify the other party (not the one who cancelled) so their in-game contract
-    # list updates live. Skip bot-issued counterparties.
-    other_id = c["contractor_id"] if str(c.get("issuer_id")) == uid else c.get("issuer_id")
-    if other_id and int(other_id) != bot_uid:
-        _create_notification(
-            gid, int(other_id), "contract_cancelled",
-            "🚫 Contract Cancelled",
-            f"{user['username']} cancelled \"{c['mission'][:80]}\".",
-            data={"contract_id": contract_id},
-        )
-
-    # Rescue: the rescue won't happen — return the issuer's vessel to its spot.
-    if c.get("mission_type") == cdb.RESCUE:
-        await _restore_issuer_vessel(gid, contract_id, c)
-
-    return ContractAcceptResponse(success=True, message="Contract cancelled. Escrow refunded.")
+    A contractor may only cancel while the offer is still pending — backing out after
+    accepting is `give_up`, which costs the agreed fine. Cancelling here used to be a
+    free alternative to that, which made the fine optional.
+    """
+    r = await ca.cancel(int(user["guild_id"]), contract_id,
+                        actor_id=int(user["user_id"]), actor_name=user["username"])
+    return ContractAcceptResponse(success=r.ok, message=r.message)
 
 
 @app.post("/api/v1/contracts/{contract_id}/give_up", response_model=ContractAcceptResponse)
 async def give_up_contract(contract_id: str, user: dict = Depends(get_current_user)):
-    """Contractor gives up on an active contract they accepted.
+    """Contractor gives up on an active contract they accepted, paying the agreed fine
+    to the issuer (who also gets their escrowed payment back)."""
+    r = await ca.give_up(int(user["guild_id"]), contract_id,
+                         actor_id=int(user["user_id"]), actor_name=user["username"])
+    return ContractAcceptResponse(success=r.ok, message=r.message)
 
-    The proactive counterpart to the dispute 'pay_fine' action: the contractor pays
-    the agreed fine to the issuer (who also gets their escrowed payment back) and the
-    contract closes. Lets a contractor back out *before* submitting, at the cost of the
-    penalty they agreed to. Only the contractor may give up, and only while the
-    contract is active — pending uses Decline, submitted/disputed use the review and
-    dispute flows. Refused if the contractor can't cover the fine.
-    """
-    gid = int(user["guild_id"])
-    uid = str(user["user_id"])
-
-    c = cdb.get_contract(gid, contract_id)
-    if not c:
-        return ContractAcceptResponse(success=False, message="Contract not found.")
-
-    if str(c.get("contractor_id")) != uid:
-        return ContractAcceptResponse(success=False, message="Only the contractor can give up a contract.")
-
-    if c.get("status") != cdb.ACTIVE:
-        return ContractAcceptResponse(success=False, message=f"Cannot give up a {c.get('status')} contract.")
-
-    issuer_id = int(c["issuer_id"])
-    contractor_id = int(c["contractor_id"])
-    bot_uid = _get_bot_user_id()
-    fine = c.get("fine", 0)
-
-    # The fine is the agreed penalty for backing out — charged regardless of who
-    # issued the contract. Atomic check-and-deduct blocks a concurrent spend from
-    # slipping the give-up through on funds that are no longer there.
-    if not await store.try_debit(gid, contractor_id, fine):
-        return ContractAcceptResponse(
-            success=False,
-            message=f"You need {fine} {settings.CURRENCY_SYMBOL} to pay the fine and give up.")
-
-    # Release escrow (+ the fine) to the issuer. A bot issuer has no wallet to credit
-    # (same gating as cancel), but the contractor still pays the penalty above.
-    if issuer_id != bot_uid:
-        await store.add_balance(gid, issuer_id, fine + c["payment"])
-
-    cdb.update_contract(gid, contract_id, status=cdb.CANCELLED,
-                        completed_at=datetime.utcnow().isoformat())
-
-    log.info("KSP: %s gave up contract %s (fine %d to issuer %s)",
-             user["username"], contract_id, fine, c["issuer_id"])
-
-    if issuer_id != bot_uid:
-        _create_notification(
-            gid, issuer_id, "contract_cancelled", "🏳️ Contract Given Up",
-            f"{c['contractor_name']} gave up on \"{c['mission'][:80]}\" and paid the "
-            f"{fine} {settings.CURRENCY_SYMBOL} fine.",
-            {"contract_id": contract_id},
-        )
-
-    # Rescue: the rescuer backed out — return the issuer's stranded vessel to its spot.
-    if c.get("mission_type") == cdb.RESCUE:
-        await _restore_issuer_vessel(gid, contract_id, c)
-
-    msg = (f"Contract given up. You paid the {fine} {settings.CURRENCY_SYMBOL} fine."
-           if fine else "Contract given up.")
-    return ContractAcceptResponse(success=True, message=msg)
 
 # ── Corporations ─────────────────────────────────────────────────────────────
 
@@ -2227,6 +2011,18 @@ async def create_rescue_contract(
     rescue_pid: Optional[str] = Form(None),
     kerbals: str = Form("[]"),         # JSON list of tagged names: ["{issuer}'s Jeb Kerman", ...]
     vessel_node: UploadFile = File(...),  # gzipped issuer vessel snapshot (the wreck)
+    # Life-support provisioning of the wreck, scanned on the issuer's client. The
+    # rescuer's client compares it with their own install: a wreck built for another LS
+    # mod carries nothing they can use, so its crew stay in emergency freeze and the
+    # wreck is stocked with a ration kit of the rescuer's own life support.
+    life_support: str = Form("none"),
+    ls_endurance_days: float = Form(0.0),
+    ls_crew_capacity: int = Form(0),
+    # What the rescuer has to bring back: "crew" (the kerbals, wreck optional) or
+    # "vessel" (the wreck too). min_dv is a floor on the delivering craft's remaining
+    # vacuum delta-v so the crew aren't stranded a second time. 0 = no requirement.
+    recovery: str = Form("crew"),
+    min_dv: float = Form(0.0),
     user: dict = Depends(get_current_user),
 ):
     """Create a rescue contract from the KSP mod.
@@ -2286,10 +2082,19 @@ async def create_rescue_contract(
     if not is_modded and body.strip().lower() not in _STOCK_BODIES:
         is_modded = True
 
+    recovery = (recovery or "crew").strip().lower()
+    if recovery not in ("crew", "vessel"):
+        return ContractAcceptResponse(
+            success=False, message="Recovery must be 'crew' or 'vessel'.")
+    if min_dv < 0 or min_dv != min_dv or min_dv in (float("inf"), float("-inf")):
+        return ContractAcceptResponse(
+            success=False, message="Invalid delta-v requirement.")
+
     rescue_target = {
         "body": body, "mode": (mode or "orbit").lower(),
         "ap": ap, "pe": pe, "lat": lat, "lon": lon,
         "margin_alt": margin_alt, "margin_pos": margin_pos, "is_modded": is_modded,
+        "recovery": recovery, "min_dv": float(min_dv),
     }
 
     # Escrow the payment (atomic check-and-deduct — no double-spend across requests).
@@ -2306,6 +2111,9 @@ async def create_rescue_contract(
         rescue_target=rescue_target,
         rescue_kerbals=rescue_kerbals,
         rescue_pid=rescue_pid,
+        life_support=life_support,
+        ls_endurance_days=ls_endurance_days,
+        ls_crew_capacity=ls_crew_capacity,
     )
 
     # Store the wreck snapshot (gzipped ConfigNode) in Firebase Storage.
@@ -2313,7 +2121,14 @@ async def create_rescue_contract(
         node_bytes = await _read_upload(vessel_node)
         node_url = await cdb.upload_to_storage(
             c["contract_id"], "rescue_vessel.cfg", node_bytes, "application/gzip")
-        cdb.update_contract(gid, c["contract_id"], rescue_vessel_node_url=node_url)
+        updates: dict = {"rescue_vessel_node_url": node_url}
+        # On a "vessel" recovery the wreck's own parts are the evidence it came home,
+        # so pin them now. Taken from the node rather than trusted from the client:
+        # the same bytes the rescuer will spawn are the ones we check against.
+        if recovery == "vessel":
+            rescue_target["wreck_parts"] = _extract_part_uids(node_bytes)
+            updates["rescue_target"] = rescue_target
+        cdb.update_contract(gid, c["contract_id"], **updates)
     except Exception as exc:
         # Roll the contract back — without the wreck node the rescue can't happen.
         log.error("Rescue vessel upload failed for %s: %s", c["contract_id"], exc)
@@ -2372,10 +2187,46 @@ def _extract_crew_names(vn_data: bytes | None) -> set[str]:
     return names
 
 
-def _validate_rescue_submission(c: dict, vessel_data: str | None, vn_data: bytes | None):
+# Share of the wreck's original parts that must arrive on a "vessel" recovery. Not
+# 100%: a tow that loses a solar panel to a docking bump is still the wreck brought
+# home. Must match ContractCreation.WreckCoverageRequired in the KSP mod, or the
+# client would pass a submission the server then rejects.
+_WRECK_COVERAGE_REQUIRED = 0.5
+
+
+def _extract_part_uids(vn_data: bytes | None) -> list[str]:
+    """Pull part flightIDs out of a (gzipped) vessel ConfigNode. KSP writes them as
+    `uid = <n>` on each PART node and preserves them across export, import, docking
+    and undocking — which is what lets a towed wreck still be recognised as itself."""
+    import re
+    if not vn_data:
+        return []
+    try:
+        text = _safe_gunzip(vn_data).decode("utf-8", "ignore")
+    except (OSError, EOFError):
+        text = vn_data.decode("utf-8", "ignore")
+    except Exception:
+        return []
+    seen: set[str] = set()
+    uids: list[str] = []
+    for m in re.finditer(r"^\s*uid\s*=\s*(\d+)\s*$", text, re.MULTILINE):
+        val = m.group(1)
+        # uid 0 is KSP's "unset" — every editor part carries it, so it identifies
+        # nothing and would make coverage meaningless.
+        if val == "0" or val in seen:
+            continue
+        seen.add(val)
+        uids.append(val)
+    return uids
+
+
+def _validate_rescue_submission(c: dict, vessel_data: str | None, vn_data: bytes | None,
+                                delta_v_vac: str | None = None):
     """Defense-in-depth recheck of a rescue submission: right body + situation
-    (from telemetry) and every stranded kerbal aboard (from the node). Returns
-    (ok, reason). Orbit/surface margins are enforced authoritatively client-side."""
+    (from telemetry), every stranded kerbal aboard (from the node), the wreck itself
+    aboard on a "vessel" recovery (part flightIDs, from the node), and any delta-v
+    floor the issuer set (from telemetry). Returns (ok, reason). Orbit/surface
+    margins are enforced authoritatively client-side."""
     rt = c.get("rescue_target") or {}
     body = (rt.get("body") or "").strip().lower()
     mode = (rt.get("mode") or "orbit").lower()
@@ -2402,6 +2253,36 @@ def _validate_rescue_submission(c: dict, vessel_data: str | None, vn_data: bytes
         missing = [k for k in c.get("rescue_kerbals", []) if k not in names]
         if missing:
             return False, f"Rescue craft is missing kerbals: {', '.join(missing)}."
+
+    # "vessel" recovery: the wreck itself has to be in what was submitted. wreck_parts
+    # was pinned from the uploaded node at creation, so this compares the handed-over
+    # craft against the returned one by part flightID.
+    if (rt.get("recovery") or "crew").lower() == "vessel":
+        wreck = {str(u) for u in (rt.get("wreck_parts") or [])}
+        if wreck:
+            here = set(_extract_part_uids(vn_data))
+            found = len(wreck & here)
+            needed = max(1, math.ceil(len(wreck) * _WRECK_COVERAGE_REQUIRED))
+            if found < needed:
+                return False, (
+                    f"This rescue requires the stranded vessel itself: only {found} of "
+                    f"{len(wreck)} of its parts came back (at least {needed} needed).")
+
+    # Delta-v floor, so the crew are delivered somewhere they can leave from. The
+    # client sends -1/blank when the stock readout can't give it a number; a value we
+    # can't read is not a violation we can prove, and the client already warned.
+    min_dv = float(rt.get("min_dv") or 0.0)
+    if min_dv > 0 and delta_v_vac not in (None, ""):
+        try:
+            dv = float(delta_v_vac)
+        except (TypeError, ValueError):
+            dv = -1.0
+        # Same 0.5% slack as the mission-limit delta-v check, so a craft sitting right
+        # on the number isn't failed by rounding between client and server.
+        if dv >= 0 and dv < min_dv * 0.995:
+            return False, (f"Rescue craft has {dv:.0f} m/s delta-v left, "
+                           f"this contract requires at least {min_dv:.0f} m/s.")
+
     return True, ""
 
 
@@ -2511,7 +2392,7 @@ async def submit_contract(
     # rescue craft must be at the target body/situation and carry every stranded
     # kerbal. The client gates this too, but a modified DLL must not bypass it.
     if c.get("mission_type") == cdb.RESCUE:
-        ok, reason = _validate_rescue_submission(c, vessel_data, vn_data)
+        ok, reason = _validate_rescue_submission(c, vessel_data, vn_data, delta_v_vac)
         if not ok:
             return SubmissionResult(success=False, message=reason)
 
@@ -2891,8 +2772,11 @@ async def _ai_review_submission(
         )
     else:
         reason = result.get("reason", "AI review did not approve this submission.")
-        # Persist the reason so it can be shown to mods if the player sues.
-        cdb.update_contract(gid, contract_id, status=cdb.DISPUTED, review_reason=reason)
+        # Persist the reason so it can be shown to mods if the player sues. The dispute
+        # fields are shared with the other two entry points so the auto-fine clock
+        # starts here too (see contract_actions.open_dispute_fields).
+        cdb.update_contract(gid, contract_id, review_reason=reason,
+                            **ca.open_dispute_fields())
         _create_notification(gid, uid, "review_result",
                              "❌ Submission Refused",
                              reason,
@@ -3736,6 +3620,235 @@ async def web_marketplace_buy(listing_id: str, user: dict = Depends(get_user_tok
         craft_filename=listing.get("craft_filename") or None,
         already_owned=already_owned,
     )
+
+
+# ── Website: contracts ───────────────────────────────────────────────────────
+#
+# The same contracts the KSP mod shows, on a phone. Every action below is a thin
+# wrapper over `contract_actions`, which is also what the mod endpoints and the
+# Discord buttons call — adding this surface adds no new copy of any transition,
+# which was the whole point of extracting that module first.
+#
+# What is deliberately NOT here: **submitting**. A submission carries live telemetry
+# and a screenshot from a running game, so it cannot originate in a browser at all —
+# and it is where cheating actually bites, which is why the gated tier (device
+# binding + mod hash) exists on the mod endpoints and is not needed on these.
+#
+# Each action gets its own path. Never a `/contracts/{id}/{action}` wildcard: that
+# would silently enrol every verb `contract_actions` grows later, and this tier has
+# the weakest auth of the three.
+
+
+def _web_contract_summary(c: dict, uid: str, bot_uid: str) -> ContractSummary:
+    """A contract as the website needs it.
+
+    Classification is deliberately skipped, unlike /api/v1/contracts/active. That path
+    calls `_classify_single_contract` for anything unclassified — a *Gemini request* —
+    and resolves part constraints against the user's installed-part catalog. Both exist
+    to drive in-editor enforcement in KSP. A browser enforces nothing, so paying an AI
+    call to open a list on a phone would be pure waste; stored values are used as-is.
+    """
+    return ContractSummary(
+        contract_id=c["contract_id"],
+        mission=c["mission"],
+        issuer_name=c.get("issuer_name", "Unknown"),
+        contractor_name=c.get("contractor_name", "Unknown"),
+        payment=c["payment"],
+        fine=c["fine"],
+        due_date=c["due_date"],
+        status=c["status"],
+        created_at=c.get("created_at"),
+        is_bot_issued=(str(c.get("issuer_id")) == bot_uid),
+        is_outgoing=(str(c.get("issuer_id")) == uid),
+        modlist=c.get("modlist"),
+        mission_type=c.get("mission_type") or "active_vessel",
+        required_situation=c.get("required_situation"),
+        required_body=c.get("required_body"),
+        flag_preview_url=c.get("flag_preview_url"),
+        rescue_kerbals=c.get("rescue_kerbals", []) or [],
+        life_support=c.get("life_support", "none") or "none",
+        ls_endurance_days=float(c.get("ls_endurance_days") or 0.0),
+        ls_crew_capacity=int(c.get("ls_crew_capacity") or 0),
+        pending_request=(PendingRequest(**c["pending_request"])
+                         if c.get("pending_request") else None),
+        auto_fine_at=(_dt.isoformat() if (_dt := ca.auto_fine_at(c)) else None),
+        more_time_used=(int(c.get("more_time_requests") or 0)
+                        >= settings.DISPUTE_MAX_MORE_TIME_REQUESTS),
+    )
+
+
+@app.get("/api/v1/web/contracts", response_model=ContractListResponse)
+async def web_contracts(user: dict = Depends(get_user_token_only)):
+    """Every contract this user is party to that is still going somewhere.
+
+    One call for both directions and both open states, because the client is a single
+    page that filters in memory — the mod splits active/incoming only because its two
+    IMGUI tabs fetch independently.
+    """
+    gid = int(user["guild_id"])
+    uid = str(user["user_id"])
+    bot_uid = str(_get_bot_user_id())
+
+    open_statuses = {cdb.PENDING, cdb.ACTIVE, cdb.SUBMITTED, cdb.DISPUTED,
+                     cdb.MOD_REVIEW, cdb.COMPLETED}
+    contracts = [_web_contract_summary(c, uid, bot_uid)
+                 for c in cdb.iter_user_contracts(gid, uid)
+                 if c.get("status") in open_statuses]
+    contracts.sort(key=lambda x: x.created_at or "", reverse=True)
+    return ContractListResponse(contracts=contracts)
+
+
+def _web_actor(user: dict, request: Request) -> tuple[int, int, str]:
+    """(guild_id, user_id, username) after a per-user rate limit.
+
+    Keyed on the account rather than the IP: these actions move money, and the thing
+    worth bounding is one account hammering its own contracts, not a shared NAT.
+    """
+    _rate_limit(f"webct:{user['user_id']}", max_hits=30, window=60.0)
+    return int(user["guild_id"]), int(user["user_id"]), user["username"]
+
+
+def _web_result(r: ca.Result) -> ContractAcceptResponse:
+    """Business failures come back as 200 + success:false so the page can print the
+    sentence; only "not yours" and "no such contract" are HTTP failures."""
+    _raise_for(r)
+    return ContractAcceptResponse(success=r.ok, message=r.message)
+
+
+@app.post("/api/v1/web/contracts/{contract_id}/accept", response_model=ContractAcceptResponse)
+async def web_contract_accept(contract_id: str, request: Request,
+                              user: dict = Depends(get_user_token_only)):
+    gid, uid, name = _web_actor(user, request)
+    return _web_result(await ca.accept(gid, contract_id, actor_id=uid, actor_name=name))
+
+
+@app.post("/api/v1/web/contracts/{contract_id}/cancel", response_model=ContractAcceptResponse)
+async def web_contract_cancel(contract_id: str, request: Request,
+                              user: dict = Depends(get_user_token_only)):
+    gid, uid, name = _web_actor(user, request)
+    return _web_result(await ca.cancel(gid, contract_id, actor_id=uid, actor_name=name))
+
+
+@app.post("/api/v1/web/contracts/{contract_id}/give_up", response_model=ContractAcceptResponse)
+async def web_contract_give_up(contract_id: str, request: Request,
+                               user: dict = Depends(get_user_token_only)):
+    gid, uid, name = _web_actor(user, request)
+    return _web_result(await ca.give_up(gid, contract_id, actor_id=uid, actor_name=name))
+
+
+@app.post("/api/v1/web/contracts/{contract_id}/review", response_model=ContractAcceptResponse)
+async def web_contract_review(contract_id: str, req: ContractReviewRequest, request: Request,
+                              user: dict = Depends(get_user_token_only)):
+    gid, uid, name = _web_actor(user, request)
+    return _web_result(await ca.review(gid, contract_id, actor_id=uid, actor_name=name,
+                                       approve=bool(req.approve)))
+
+
+@app.post("/api/v1/web/contracts/{contract_id}/dispute", response_model=ContractAcceptResponse)
+async def web_contract_dispute(contract_id: str, req: ContractDisputeRequest, request: Request,
+                               user: dict = Depends(get_user_token_only)):
+    gid, uid, name = _web_actor(user, request)
+    return _web_result(await ca.dispute(gid, contract_id, actor_id=uid, actor_name=name,
+                                        action=req.action or "", new_date=req.new_date or ""))
+
+
+@app.post("/api/v1/web/contracts/{contract_id}/settle_response", response_model=ContractAcceptResponse)
+async def web_contract_settle_response(contract_id: str, req: ContractRequestResponse,
+                                       request: Request,
+                                       user: dict = Depends(get_user_token_only)):
+    gid, uid, name = _web_actor(user, request)
+    return _web_result(await ca.settle_response(gid, contract_id, actor_id=uid,
+                                                actor_name=name, approve=bool(req.approve)))
+
+
+@app.post("/api/v1/web/contracts/{contract_id}/more_time_response", response_model=ContractAcceptResponse)
+async def web_contract_more_time_response(contract_id: str, req: ContractRequestResponse,
+                                          request: Request,
+                                          user: dict = Depends(get_user_token_only)):
+    gid, uid, name = _web_actor(user, request)
+    return _web_result(await ca.more_time_response(gid, contract_id, actor_id=uid,
+                                                   actor_name=name, approve=bool(req.approve)))
+
+
+# ── Web → game commands ──────────────────────────────────────────────────────
+#
+# The website can ask the caller's own running KSP to raise a window. It travels
+# down the notification socket the client already holds, addressed to one account.
+#
+# Two rules hold this surface in place, and both are deliberate:
+#
+#   1. **Commands may only raise UI.** Contract actions go over HTTP and are
+#      authorized against the account like any other request. A command is
+#      different: it reaches into a running game process, where no per-action
+#      authorization is possible on the receiving end. So the allow-list stays
+#      UI-only. Something irreversible needs a stronger auth tier, not a bigger
+#      allow-list — `/api/v1/web/*` is token-only, with no device binding and no
+#      mod-version gate, because a browser has no DLL to hash.
+#   2. **The frame carries an id, never terms.** The mod re-reads the mission
+#      type, situation, body, mod list and constraints from /contracts/active,
+#      so a caller here cannot quietly relax a contract's own requirements.
+#
+# Free by construction: the socket is closed while data sharing is off, so no
+# command can arrive at an opted-out client.
+
+_GAME_COMMANDS = {"open_submit"}
+_SAFE_CONTRACT_ID = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+
+@app.post("/api/v1/web/game/command", response_model=GameCommandResult)
+async def web_game_command(req: GameCommandRequest, request: Request,
+                           user: dict = Depends(get_user_token_only)):
+    gid = int(user["guild_id"])
+    uid = int(user["user_id"])
+    _rate_limit(f"cmd:{uid}", max_hits=20, window=60.0)
+
+    command = (req.command or "").strip()
+    if command not in _GAME_COMMANDS:
+        raise HTTPException(status_code=400, detail="Unknown command.")
+
+    # An enumerated arm per command, matching the mod's switch. Each new command is
+    # a decision made here and there — this is not a dispatcher.
+    frame = None
+    if command == "open_submit":
+        cid = (req.contract_id or "").strip()
+        if not _SAFE_CONTRACT_ID.match(cid):
+            raise HTTPException(status_code=400, detail="Bad contract id.")
+
+        # Checked here only so the page can say why nothing happened. The mod
+        # re-validates independently against its own token, which is what actually
+        # guards this — the check below can only ever see the caller's contracts.
+        c = cdb.get_contract(gid, cid)
+        if not c or str(c.get("contractor_id")) != str(uid):
+            raise HTTPException(status_code=404, detail="Contract not found.")
+        if c.get("status") != cdb.ACTIVE:
+            return GameCommandResult(
+                success=False,
+                message="That contract is not active, so there is nothing to submit.")
+
+        # `mission` is the server's own lookup, not something the page supplied, so
+        # naming it in the prompt is safe — and a prompt that says which contract it
+        # is about is the difference between an answerable question and a jump scare.
+        frame = {"type": "command", "command": "open_submit",
+                 "contract_id": cid, "mission": c.get("mission") or ""}
+
+    if frame is None:
+        # A name in the allow-list with no arm above. Refuse rather than send a frame
+        # the mod's switch has never seen.
+        log.error("Game command %s is allow-listed but has no handler", command)
+        raise HTTPException(status_code=500, detail="Command not implemented.")
+
+    clients = await _hub.push_frame(gid, uid, frame)
+    if clients == 0:
+        return GameCommandResult(
+            success=False, clients=0,
+            message="KSP isn't running, or notifications are off in the mod's settings.")
+
+    log.info("WS: command %s sent to user %d (%d client%s)",
+             command, uid, clients, "" if clients == 1 else "s")
+    return GameCommandResult(
+        success=True, clients=clients,
+        message="Sent to KSP — accept the prompt in game." if clients == 1
+                else f"Sent to {clients} running KSP clients — accept the prompt in game.")
 
 
 @app.get("/api/v1/web/marketplace/mine", response_model=MarketplaceListingsResponse)

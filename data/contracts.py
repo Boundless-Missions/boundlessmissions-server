@@ -48,6 +48,9 @@ def create_contract(
     rescue_vessel_node_url: str | None = None,
     rescue_kerbals: list | None = None,
     rescue_pid: str | None = None,
+    life_support: str | None = None,
+    ls_endurance_days: float = 0.0,
+    ls_crew_capacity: int = 0,
 ) -> ContractData:
     cid = uuid.uuid4().hex[:12]
     now = datetime.utcnow().isoformat()
@@ -84,6 +87,13 @@ def create_contract(
         doc["rescue_pid"] = rescue_pid
         doc["issuer_vessel_removed"] = True
         doc["delivered_vessel_node_url"] = None
+    # Life-support provisioning of the craft this contract is about. On a rescue it is
+    # known at creation (the wreck already exists and was scanned); on a normal contract
+    # it arrives with the submitted craft instead, and is written then.
+    if life_support and life_support.lower() != "none":
+        doc["life_support"] = life_support.lower()
+        doc["ls_endurance_days"] = float(ls_endurance_days or 0.0)
+        doc["ls_crew_capacity"] = int(ls_crew_capacity or 0)
     _col(guild_id).document(cid).set(doc)
     log.info("Contract %s created: %s -> %s (%d coins)", cid, issuer_name, contractor_name, payment)
     return doc
@@ -114,6 +124,16 @@ def iter_user_contracts(guild_id: int, user_id: int) -> list[ContractData]:
         for doc in col.where(field, "==", uid).stream():
             by_id[doc.id] = doc.to_dict()
     return list(by_id.values())
+
+
+def list_by_status(status: str) -> list[ContractData]:
+    """Every contract in a given status, across all guilds.
+
+    Served by Firestore's automatic single-field index, so this is a bounded query
+    rather than a full-collection scan — which matters because the dispute-timeout
+    sweep runs on a timer forever. Contracts are global (see _col), hence no guild_id.
+    """
+    return [doc.to_dict() for doc in _col().where("status", "==", status).stream()]
 
 
 def count_active(guild_id: int, user_id: int) -> int:

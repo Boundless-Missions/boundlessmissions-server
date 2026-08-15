@@ -41,9 +41,13 @@ log = logging.getLogger(__name__)
 #
 # SECURITY: the swap only changes *business-logic identity*. It must NEVER let the
 # real actor gain authority they don't have. Two invariants enforce that:
-#   1. /mimic is owner-only and refuses privileged targets (see cogs/admin.py).
+#   1. /mimic is owner-only (see cogs/admin.py). It may target any member, including
+#      server administrators — the target's permissions are never borrowed, so who it
+#      points at is not what makes it safe.
 #   2. Every permission check gates on the REAL invoker via cogs/perms.real_user
 #      (which reads interaction.extras["_mimic_real_user"]), not the swapped user.
+#      This is the load-bearing one. A new check that reads interaction.user directly
+#      would be a privilege escalation, so route every one of them through perms.
 # Entries auto-expire (MIMIC_TTL) so a forgotten mimic can't linger indefinitely.
 
 MIMIC_TTL = 1800.0   # seconds — a mimic session auto-clears after 30 minutes
@@ -303,12 +307,16 @@ class GeneKermanBot(commands.Bot):
                 state="Managing Missions",
             )
         )
-        # Set bot user ID and instance for the KSP API server
-        if cfg.KSP_API_ENABLED:
-            from api_server import set_bot_user_id, set_bot_instance
-            set_bot_user_id(self.user.id)
-            set_bot_instance(self)
-            log.info("KSP API: bot user ID set to %s", self.user.id)
+        # Register the bot handle and id with api_server. Deliberately *not* gated on
+        # KSP_API_ENABLED: `contract_actions` reads both through api_server, and it now
+        # backs the Discord contract buttons as well as the KSP endpoints. Left behind
+        # the gate, an install with the API turned off would treat weekly contracts as
+        # human-issued (bot id 0 matches nobody) and could not deliver the settle /
+        # more-time / dispute hand-off DMs at all.
+        from api_server import set_bot_user_id, set_bot_instance
+        set_bot_user_id(self.user.id)
+        set_bot_instance(self)
+        log.info("Bot user ID registered with api_server: %s", self.user.id)
 
     async def on_interaction(self, interaction: discord.Interaction) -> None:
         if getattr(self, "extlog_enabled", False):

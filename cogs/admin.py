@@ -497,21 +497,34 @@ class Admin(commands.Cog, name="Admin"):
         log.info("%s generated admin link code for %s (%s)", interaction.user, target, target.id)
 
     # ── /mimic ────────────────────────────────────────────────────────────────
-    # Owner-only. Mimic lets the actor run every interaction AS another user, so it
-    # is a powerful impersonation tool: restricted to the bot owner, and it refuses
-    # to target another privileged user (owner/admin) so it can't be used to act
-    # destructively as them. Sessions auto-expire (see bot.MIMIC_TTL).
+    # Owner-only. Mimic lets the actor run every interaction AS another user, so it is
+    # a powerful impersonation tool. What keeps it safe is not who it may target but
+    # that it swaps *business identity only*: every authority check goes through
+    # `cogs/perms.py`, which unwraps the swap via `interaction.extras`, so a mimicked
+    # target's permissions are never borrowed. Sessions auto-expire (bot.MIMIC_TTL).
     @app_commands.command(
         name="mimic", description="Act as another user for testing (Owner only)"
     )
     @app_commands.describe(target="The user to mimic")
     @is_owner()
     async def mimic(self, interaction: discord.Interaction, target: discord.Member) -> None:
-        # Never mimic another privileged account (owner/admin) — avoids acting with
-        # or against their authority and keeps the audit trail meaningful.
-        if target.id == cfg.OWNER_ID or target.guild_permissions.administrator:
+        # Server administrators used to be refused here. That was an accountability
+        # rule rather than a security boundary, and it made testing awkward — an admin
+        # is often the only other account on a dev server. Lifting it is safe because
+        # authority never rides on the swapped identity:
+        #   • nothing reads interaction.user.guild_permissions directly;
+        #   • is_owner_user / is_admin_user / is_mod_user all gate on perms.real_user;
+        #   • the one app_commands.checks.has_permissions (/setxp) sits behind
+        #     default_permissions(administrator=True), which Discord enforces against
+        #     the real invoker before the interaction reaches the bot.
+        # The audit trail is unaffected: the start/stop pair is logged below, and
+        # on_interaction tags every mimicked interaction with "(Mimicking …)".
+        #
+        # The owner is still refused: mimicking yourself is a no-op that would leave a
+        # live entry in mimic_map for no reason.
+        if target.id == cfg.OWNER_ID:
             await interaction.response.send_message(
-                "❌ You can't mimic another administrator or the owner.", ephemeral=True)
+                "❌ You can't mimic yourself.", ephemeral=True)
             return
 
         import time as _time

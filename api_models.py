@@ -138,6 +138,17 @@ class RescueTarget(BaseModel):
     mode == "surface" → lat/lon define the landing spot (degrees); margin_pos is
                         the allowed great-circle tolerance (degrees).
     is_modded is flagged by the issuer's client (it scans the real body list).
+
+    `mode` is where; `recovery` is *what* has to get there:
+        "crew"   → the stranded kerbals, aboard whatever ship brought them. The
+                   wreck may be stripped, abandoned or destroyed.
+        "vessel" → the crew and the wreck itself, towed or flown home. Verified by
+                   part flightID (KSP keeps a part's uid across export, import and
+                   docking), so the wreck stays identifiable however it gets back.
+    min_dv is a floor in m/s on the delivering craft's remaining vacuum delta-v, so
+    the crew are dropped somewhere they can actually leave from. 0 = no requirement.
+    Both default to the pre-existing behaviour, which is what every rescue issued
+    before these modes existed had.
     """
     body: str
     mode: str = "orbit"  # "orbit" | "surface"
@@ -148,6 +159,25 @@ class RescueTarget(BaseModel):
     margin_alt: float = 0.0
     margin_pos: float = 0.0
     is_modded: bool = False
+    recovery: str = "crew"  # "crew" | "vessel"
+    min_dv: float = 0.0
+    # flightIDs of the wreck's parts as handed over. Sent only to the rescuer, and
+    # only on a "vessel" recovery — nobody else has anything to check them against,
+    # and on a big craft this is the largest field on the contract.
+    wreck_parts: list[str] = []
+
+
+class PendingRequest(BaseModel):
+    """An open ask from the contractor that the issuer has to answer.
+
+    Settle and more-time change nothing until the issuer agrees. This is what makes
+    that ask visible outside the Discord DM that used to be its only record, so the
+    in-game UI can offer Approve/Refuse on the issuer's side.
+    """
+    kind: str                          # "settle" | "more_time"
+    new_date: Optional[str] = None     # set for "more_time" (YYYY-MM-DD)
+    requested_at: Optional[str] = None
+    requested_by: Optional[str] = None
 
 
 class ContractSummary(BaseModel):
@@ -180,6 +210,23 @@ class ContractSummary(BaseModel):
     # Wreck snapshot URL — only set for the rescuer (contractor) on an accepted
     # rescue, so their client can spawn/respawn the stranded vessel on demand.
     rescue_vessel_node_url: Optional[str] = None
+    # Life-support provisioning of the craft this contract is about: which LS mod its
+    # supplies belong to and how long they last per kerbal. Set at creation for a rescue
+    # (the wreck is scanned on the issuer's client) and at submission for everything
+    # else. The rescuer's client compares life_support with its own install to decide
+    # whether the wreck's supplies mean anything there.
+    life_support: str = "none"
+    ls_endurance_days: float = 0.0
+    ls_crew_capacity: int = 0
+    # Set on a disputed contract while the contractor is waiting on an answer.
+    pending_request: Optional[PendingRequest] = None
+    # When the fine collects itself if nobody resolves the dispute (ISO, UTC). Only set
+    # while disputed. Sent as an instant rather than a countdown so the client does not
+    # have to know the policy, and a clock that is a few minutes out cannot drift.
+    auto_fine_at: Optional[str] = None
+    # True once the contractor has used their one deadline-extension request for this
+    # dispute. The UI hides the control; the server refuses it either way.
+    more_time_used: bool = False
 
 class ContractListResponse(BaseModel):
     contracts: list[ContractSummary]
@@ -259,6 +306,35 @@ class ContractDisputeRequest(BaseModel):
     action: str  # "settle" | "more_time" | "pay_fine" | "sue"
     # Required for "more_time" on human-issued contracts (YYYY-MM-DD).
     new_date: Optional[str] = None
+
+
+class ContractRequestResponse(BaseModel):
+    """Issuer's answer to a pending settle / more-time request.
+
+    Deliberately just a yes/no. The date being granted comes from the request stored on
+    the contract, so approving means approving what was actually asked for.
+    """
+    approve: bool
+
+
+# ── Web → game commands ──────────────────────────────────────────────────────
+
+class GameCommandRequest(BaseModel):
+    """A request from the website to raise UI inside the caller's running game.
+
+    `command` is checked against a server-side allow-list, not used to dispatch —
+    this channel may only raise UI, never cause an irreversible in-game effect.
+    """
+    command: str
+    contract_id: str = ""
+
+
+class GameCommandResult(BaseModel):
+    success: bool
+    message: str
+    #: Live KSP clients the frame reached. 0 means the game isn't running, which
+    #: the page must report — otherwise pressing the button looks like it worked.
+    clients: int = 0
 
 
 # ── Submissions ──────────────────────────────────────────────────────────────
