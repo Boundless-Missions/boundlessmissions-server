@@ -351,6 +351,15 @@ ORBIT_FROZEN_INCL_TOL = 5.0
 ORBIT_MOLNIYA_ECC_MIN = 0.50
 ORBIT_TUNDRA_ECC_MIN = 0.20
 
+# ── Rescue target: orbital plane ─────────────────────────────────────────────
+# A rescue in "orbit" mode names an Ap/Pe the rescuer has to reach, which says
+# nothing about the *plane* — the expensive half of a rendezvous. The issuer can
+# additionally require an inclination (rescue_target.inc, degrees) with a tolerance
+# (rescue_target.margin_inc). Absent / margin <= 0 == any plane, which is what every
+# rescue issued before this existed meant.
+RESCUE_INCL_MARGIN_DEFAULT = 5.0   # used when an inclination is set with no margin
+RESCUE_INCL_MARGIN_MIN = 1.0       # floor, like the Ap/Pe margin: tighter is impossible
+
 # ── Known Celestial Bodies ───────────────────────────────────────────────────
 # Used by the heuristic mission classifier (fallback when Gemini is unavailable).
 # The AI classifier handles any body name from text automatically — this list

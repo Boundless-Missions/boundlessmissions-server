@@ -288,7 +288,7 @@ async def cancel(gid: int, contract_id: str, *, actor_id: int, actor_name: str) 
         return _fail(BAD_STATE, f"Cannot cancel a {status} contract.", c)
     if status == cdb.ACTIVE and is_contractor and not is_issuer:
         return _fail(USE_GIVE_UP,
-                     "You already accepted this contract. Give Up instead — it costs the "
+                     "You already accepted this contract. Use Give Up instead; it costs the "
                      f"agreed {c.get('fine', 0)} {settings.CURRENCY_SYMBOL} fine.", c)
 
     cdb.update_contract(gid, contract_id, status=cdb.CANCELLED)
@@ -391,8 +391,8 @@ async def review(gid: int, contract_id: str, *, actor_id: int, actor_name: str,
         days = settings.DISPUTE_AUTO_FINE_DAYS
         _notify(gid, contractor_id, "review_result", "⚠️ Submission Refused",
                 f"Your submission for \"{c['mission'][:80]}\" was refused. Settle it, "
-                f"ask for more time, pay the fine or sue — if nothing happens within "
-                f"{days} days the {c.get('fine', 0)} {sym} fine is collected "
+                f"ask for more time, pay the fine or sue. If nothing happens within "
+                f"{days} days, the {c.get('fine', 0)} {sym} fine is collected "
                 "automatically.", contract_id)
         await _dm_dispute_options(gid, contract_id, contractor_id)
         log.info("Contract %s submission refused by %s", contract_id, actor_name)

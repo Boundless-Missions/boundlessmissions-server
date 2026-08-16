@@ -290,3 +290,76 @@ def summary_line(constraint: dict | None) -> str | None:
         return constraint["notes"]
     labels = [_LABELS.get(r, r) for r in constraint["requirements"]]
     return ("Required orbit: " + ", ".join(labels)) if labels else None
+
+
+def label(req: str) -> str:
+    """Friendly name for one requirement token."""
+    return _LABELS.get(req, req)
+
+
+# ── Explicit requirements (rescue targets) ────────────────────────────────────
+#
+# Everything above turns *mission text* into a requirement. A rescue target is
+# different: the issuer picks the regime and the plane in the form, so the tokens
+# arrive already canonical and there is nothing to parse. These helpers verify that
+# kind of requirement against the same tolerances, so "polar" means one thing
+# whether it was typed in a sentence or ticked in a box.
+
+def normalize_types(raw) -> list[str]:
+    """Coerce a client-supplied list (or comma-separated string) of regime tokens
+    into canonical, deduped, order-preserved form. Unknown tokens are dropped."""
+    if isinstance(raw, str):
+        raw = raw.split(",")
+    out: list[str] = []
+    for tok in raw or []:
+        t = str(tok).strip().lower()
+        if t in REQUIREMENTS and t not in out:
+            out.append(t)
+    return out
+
+
+def verify_types(types, snap: dict | None) -> list[str]:
+    """Verify canonical regime tokens against a vessel snapshot. Thin wrapper over
+    verify_orbit so explicit and text-derived requirements read identically."""
+    types = normalize_types(types)
+    if not types:
+        return []
+    return verify_orbit({"requirements": types}, snap)
+
+
+def check_inclination(target: float | None, margin: float | None,
+                      incl: float | None) -> str | None:
+    """Plane match against an explicit target inclination, in degrees.
+
+    Returns a violation message, or None when it passes / can't be checked. A
+    missing target or a margin <= 0 means "any plane" — that is how every rescue
+    issued before this field existed is read. Inclination runs 0..180° (>90° is
+    retrograde), and 179° is not 1°: opposite directions in the same plane are
+    opposite rendezvous problems, so the comparison deliberately doesn't wrap."""
+    if target is None or incl is None:
+        return None
+    try:
+        target = float(target)
+        margin = float(margin or 0.0)
+        incl = float(incl)
+    except (TypeError, ValueError):
+        return None
+    if not (math.isfinite(target) and math.isfinite(margin) and math.isfinite(incl)):
+        return None
+    if margin <= 0:
+        return None
+    if abs(incl - target) > margin:
+        return (f"Orbit must be inclined {target:.1f}° (±{margin:.1f}°); "
+                f"current inclination is {incl:.1f}°.")
+    return None
+
+
+def describe_target(inc: float | None, margin_inc: float | None, types) -> str | None:
+    """One-line summary of a rescue target's orbit requirement, or None."""
+    bits: list[str] = []
+    toks = normalize_types(types)
+    if toks:
+        bits.append(", ".join(label(t) for t in toks))
+    if inc is not None and (margin_inc or 0) > 0:
+        bits.append(f"inclination {float(inc):.1f}° (±{float(margin_inc):.1f}°)")
+    return " · ".join(bits) if bits else None

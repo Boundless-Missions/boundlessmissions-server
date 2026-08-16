@@ -69,7 +69,7 @@ def role_label(key: str) -> str:
             return key
         info = settings.LEVEL_ROLES.get(lvl)
         if info:
-            return f"{info[1]} — {info[2][:60]}"
+            return f"{info[1]}: {info[2][:60]}"
         return key
     return key
 

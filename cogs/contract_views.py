@@ -24,6 +24,7 @@ import settings
 from data.store import store
 from data import contracts as cdb
 from data import mission_constraints as mc
+from data import orbit_constraints as oc
 import contract_actions as ca
 from cogs import perms
 
@@ -86,11 +87,17 @@ def _rescue_terms_text(c: dict) -> str | None:
     else:
         where = (f"orbit **{body}** at "
                  f"{float(rt.get('ap') or 0) / 1000:.0f}×{float(rt.get('pe') or 0) / 1000:.0f} km")
+        # The plane / regime, when the issuer asked for one. Ap/Pe alone don't say
+        # which orbit this is, and matching the plane is the expensive half.
+        orbit_req = oc.describe_target(rt.get("inc"), rt.get("margin_inc"),
+                                       rt.get("orbit_types"))
+        if orbit_req:
+            where += f" (**{orbit_req}**)"
 
     bits = [where]
     bits.append("bring the **stranded vessel** back too"
                 if (rt.get("recovery") or "crew").lower() == "vessel"
-                else "the crew alone — the wreck may be left behind")
+                else "the crew alone (the wreck may be left behind)")
     min_dv = float(rt.get("min_dv") or 0.0)
     if min_dv > 0:
         bits.append(f"arrive with **≥{min_dv:.0f} m/s** Δv left")
@@ -167,6 +174,15 @@ def _embed(c, guild_id):
     ls_txt = _ls_endurance_text(c, constraints)
     if ls_txt:
         e.add_field(name="🥫 Life Support", value=ls_txt, inline=True)
+
+    # An orbit the mission text names ("reach a polar orbit around Kerbin"). Enforced
+    # at submit time either way; shown here because a requirement the contractor only
+    # meets by accident is not a requirement they were told about.
+    orbit_c = oc.extract_heuristic(c.get("mission", ""))
+    if not oc.is_empty(orbit_c):
+        e.add_field(name="🛰 Orbit",
+                    value=", ".join(oc.label(r) for r in orbit_c["requirements"]),
+                    inline=True)
 
     rescue_txt = _rescue_terms_text(c)
     if rescue_txt:

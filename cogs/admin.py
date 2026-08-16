@@ -66,7 +66,7 @@ class SetChannelView(View):
             mark = "✅" if ch else "❌"
             value = ch.mention if ch else "_not set_"
             sel = " ⬅️" if key == self.selected_key else ""
-            lines.append(f"{mark} **{label}** — {value}{sel}")
+            lines.append(f"{mark} **{label}**: {value}{sel}")
         embed = discord.Embed(
             title="⚙️ Channel configuration",
             description="\n".join(lines),
@@ -267,10 +267,10 @@ class SetRoleView(View):
             mark = "✅" if role else "❌"
             value = role.mention if role else "_not set_"
             sel = " ⬅️" if key == self.selected_key else ""
-            lines.append(f"{mark} **{guild_config.role_label(key)}** — {value}{sel}")
-        status = ("🟢 **Role feature ENABLED** — all required roles are mapped."
+            lines.append(f"{mark} **{guild_config.role_label(key)}**: {value}{sel}")
+        status = ("🟢 **Role feature ENABLED**. All required roles are mapped."
                   if ready else
-                  f"🔴 **Role feature DISABLED** — {len(missing)} required role(s) "
+                  f"🔴 **Role feature DISABLED**. {len(missing)} required role(s) "
                   "still unmapped (level + notification roles must all be set).")
         embed = discord.Embed(
             title="🎭 Role configuration",

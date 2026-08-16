@@ -149,6 +149,17 @@ class RescueTarget(BaseModel):
     the crew are dropped somewhere they can actually leave from. 0 = no requirement.
     Both default to the pre-existing behaviour, which is what every rescue issued
     before these modes existed had.
+
+    In "orbit" mode the issuer may also constrain the *shape and plane* of the
+    target orbit, which ap/pe alone say nothing about:
+        inc / margin_inc → required inclination in degrees, ± tolerance. margin_inc
+                           <= 0 (the default) means any plane. Matching the wreck's
+                           plane is the expensive half of a rendezvous, so this is
+                           what turns "be at 100×100 km" into a real intercept.
+        orbit_types      → canonical regime tokens ("polar", "equatorial",
+                           "stationary", …) from data/orbit_constraints.REQUIREMENTS,
+                           verified with the same tolerances as the ones parsed out
+                           of mission text.
     """
     body: str
     mode: str = "orbit"  # "orbit" | "surface"
@@ -161,6 +172,10 @@ class RescueTarget(BaseModel):
     is_modded: bool = False
     recovery: str = "crew"  # "crew" | "vessel"
     min_dv: float = 0.0
+    # Orbit-plane / orbit-regime requirements (orbit mode only; see the docstring).
+    inc: Optional[float] = None
+    margin_inc: float = 0.0
+    orbit_types: list[str] = []
     # flightIDs of the wreck's parts as handed over. Sent only to the rescuer, and
     # only on a "vessel" recovery — nobody else has anything to check them against,
     # and on a big craft this is the largest field on the contract.

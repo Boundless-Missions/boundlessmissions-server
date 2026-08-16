@@ -812,7 +812,7 @@ def _note_user_action(gid: int, uid: int, username: str, bucket: str,
     asyncio.create_task(flag_suspicion(
         gid, uid, username, reason="request_flood",
         details=(f"User sent **{len(hits)}** `{bucket}` requests in under "
-                 f"{int(window)}s — far above normal play. Likely a scripted "
+                 f"{int(window)}s, far above normal play. Likely a scripted "
                  f"client hammering reward/AI endpoints."),
         severity="medium"))
 
@@ -1493,6 +1493,50 @@ async def upload_part_catalog(req: PartCatalogUpload, user: dict = Depends(get_c
     return PartCatalogResponse(success=True, stored=True, parts=len(parts))
 
 
+def _summary_constraints(c: dict, gid: int, uid: str, constraints: dict | None) -> dict | None:
+    """The `constraints` object a contract summary ships to the KSP client: the part
+    limits (already decided by the caller — stored, AI-classified or heuristic),
+    resolved against this user's installed catalog, plus the orbit-regime requirement
+    parsed from the mission text. None when there is nothing to enforce.
+
+    Deliberately AI-free, so it can run over a whole list — and so a contract shows
+    the same requirements while it is still pending as it does once it is active. The
+    orbit requirement is re-derived from the text every time rather than stored, which
+    is also what the /submit re-check does.
+    """
+    if not mc.is_empty(constraints):
+        # Resolve loose part mentions against this user's installed catalog so the
+        # client filters/checks the exact part, not a fragile substring.
+        constraints = _resolve_constraints(constraints, gid, uid, c.get("mission", ""))
+    orbit_c = oc.extract_heuristic(c.get("mission", ""))
+    # Don't ship an all-empty constraints object to the client — but keep it when
+    # there's an orbit requirement even if there are no part limits.
+    if mc.is_empty(constraints) and oc.is_empty(orbit_c):
+        return None
+    out = dict(constraints) if constraints else {}
+    if not oc.is_empty(orbit_c):
+        out["orbit"] = orbit_c
+    return out
+
+
+def _summary_rescue_target(c: dict, uid: str, include_wreck_parts: bool = True) -> dict | None:
+    """A rescue's target as a summary should carry it, or None.
+
+    wreck_parts is only useful to the rescuer's client once they have accepted (to
+    tell them live whether the wreck is aboard) and is the biggest field on a rescue
+    — one entry per part. Everyone else, and every still-pending offer, gets the
+    target without it.
+    """
+    rt = c.get("rescue_target") or {}
+    if not rt:
+        return None
+    if not rt.get("wreck_parts"):
+        return rt
+    if not include_wreck_parts or c.get("contractor_id") != uid:
+        rt = {**rt, "wreck_parts": []}
+    return rt
+
+
 @app.get("/api/v1/contracts/active", response_model=ContractListResponse)
 async def get_active_contracts(user: dict = Depends(get_current_user)):
     """Get all active contracts for the current user."""
@@ -1525,34 +1569,16 @@ async def get_active_contracts(user: dict = Depends(get_current_user)):
                 # keeps its stored decision, including a deliberate "no limits"
                 # (empty dict) — we must not re-derive over the AI's call here.
                 constraints = mc.extract_heuristic(c.get("mission", ""))
-            # Resolve loose part mentions against this user's installed catalog
-            # so the client filters/checks the exact part, not a fragile substring.
-            if not mc.is_empty(constraints):
-                constraints = _resolve_constraints(constraints, gid, uid, c.get("mission", ""))
-            # Orbit-regime requirement parsed from the mission text (heuristic — no
-            # extra AI call). Shipped inside the constraints dict under "orbit" so
-            # the existing constraints plumbing carries it to the client unchanged.
-            orbit_c = oc.extract_heuristic(c.get("mission", ""))
-            # Don't ship an all-empty constraints object to the client — but keep it
-            # when there's an orbit requirement even if there are no part limits.
-            if mc.is_empty(constraints) and oc.is_empty(orbit_c):
-                constraints = None
-            else:
-                constraints = dict(constraints) if constraints else {}
-                if not oc.is_empty(orbit_c):
-                    constraints["orbit"] = orbit_c
+            # Part limits (resolved against this user's catalog) plus the orbit-regime
+            # requirement parsed from the mission text — see _summary_constraints.
+            constraints = _summary_constraints(c, gid, uid, constraints)
 
             rescue_target = None
             rescue_kerbals = []
             is_modded_target = False
             rescue_vessel_node_url = None
             if c.get("mission_type") == cdb.RESCUE:
-                rt = c.get("rescue_target") or {}
-                # wreck_parts is only useful to the rescuer's client (to tell them
-                # live whether the wreck is aboard) and is the biggest field on a
-                # rescue — one entry per part. Everyone else gets the target without it.
-                if rt and c.get("contractor_id") != uid and rt.get("wreck_parts"):
-                    rt = {**rt, "wreck_parts": []}
+                rt = _summary_rescue_target(c, uid) or {}
                 rescue_target = RescueTarget(**rt) if rt else None
                 rescue_kerbals = c.get("rescue_kerbals", [])
                 is_modded_target = bool(rt.get("is_modded"))
@@ -1604,33 +1630,64 @@ async def get_active_contracts(user: dict = Depends(get_current_user)):
 
 @app.get("/api/v1/contracts/incoming", response_model=ContractListResponse)
 async def get_incoming_contracts(user: dict = Depends(get_current_user)):
-    """Get pending contracts where this user is the contractor."""
+    """Get pending contracts where this user is the contractor.
+
+    These carry the same requirement fields as /contracts/active — what the craft may
+    be built from, where it has to get to, and which orbit it has to be in. "No ion
+    engines" and "polar orbit" are things to know *before* accepting, and an offer
+    that only revealed its terms once accepted was showing them one decision too late.
+
+    What it deliberately doesn't carry is anything only the accepted rescuer can use:
+    the wreck's part list and its vessel node stay behind the accept.
+    """
     gid = int(user["guild_id"])
     uid = str(user["user_id"])
+    bot_uid = str(_get_bot_user_id())
 
     col = cdb._col(gid)
     contracts = []
 
     for doc in col.where("contractor_id", "==", uid).stream():
         c = doc.to_dict()
-        if c.get("status") == cdb.PENDING:
-            contracts.append(ContractSummary(
-                contract_id=c["contract_id"],
-                mission=c["mission"],
-                issuer_name=c.get("issuer_name", "Unknown"),
-                contractor_name=c.get("contractor_name", "Unknown"),
-                payment=c["payment"],
-                fine=c["fine"],
-                due_date=c["due_date"],
-                status=c["status"],
-                created_at=c.get("created_at"),
-                is_bot_issued=False,
-                mission_type=c.get("mission_type", "active_vessel"),
-                flag_preview_url=c.get("flag_preview_url"),
-                life_support=c.get("life_support", "none") or "none",
-                ls_endurance_days=float(c.get("ls_endurance_days") or 0.0),
-                ls_crew_capacity=int(c.get("ls_crew_capacity") or 0),
-            ))
+        if c.get("status") != cdb.PENDING:
+            continue
+
+        # Never AI-classify here: an inbox is a list, the classifier is a per-contract
+        # AI call, and /contracts/active runs it on accept anyway. A contract that has
+        # already been classified (weekly missions, anything previously listed) shows
+        # its stored terms; one that hasn't shows the part/orbit limits its text
+        # implies, which is the cheap half and the half that gates the build.
+        constraints = c.get("constraints")
+        if "constraints" not in c and c.get("mission_type") != cdb.RESCUE:
+            constraints = mc.extract_heuristic(c.get("mission", ""))
+
+        rt = (_summary_rescue_target(c, uid, include_wreck_parts=False)
+              if c.get("mission_type") == cdb.RESCUE else None)
+
+        contracts.append(ContractSummary(
+            contract_id=c["contract_id"],
+            mission=c["mission"],
+            issuer_name=c.get("issuer_name", "Unknown"),
+            contractor_name=c.get("contractor_name", "Unknown"),
+            payment=c["payment"],
+            fine=c["fine"],
+            due_date=c["due_date"],
+            status=c["status"],
+            created_at=c.get("created_at"),
+            is_bot_issued=(c.get("issuer_id") == bot_uid),
+            modlist=c.get("modlist"),
+            mission_type=c.get("mission_type", "active_vessel"),
+            required_situation=c.get("required_situation"),
+            required_body=c.get("required_body"),
+            constraints=_summary_constraints(c, gid, uid, constraints),
+            rescue_target=RescueTarget(**rt) if rt else None,
+            rescue_kerbals=c.get("rescue_kerbals", []),
+            is_modded_target=bool((c.get("rescue_target") or {}).get("is_modded")),
+            flag_preview_url=c.get("flag_preview_url"),
+            life_support=c.get("life_support", "none") or "none",
+            ls_endurance_days=float(c.get("ls_endurance_days") or 0.0),
+            ls_crew_capacity=int(c.get("ls_crew_capacity") or 0),
+        ))
 
     return ContractListResponse(contracts=contracts)
 
@@ -2007,6 +2064,12 @@ async def create_rescue_contract(
     lon: Optional[float] = Form(None),
     margin_alt: float = Form(0.0),
     margin_pos: float = Form(0.0),
+    # Orbit-mode only: the plane (inclination ± margin) and any named orbital regimes
+    # the delivery orbit has to be. Both absent == any orbit with the right Ap/Pe,
+    # which is what every rescue issued before these fields existed asked for.
+    inc: Optional[float] = Form(None),
+    margin_inc: float = Form(0.0),
+    orbit_types: str = Form(""),       # comma-separated canonical tokens
     is_modded: bool = Form(False),
     rescue_pid: Optional[str] = Form(None),
     kerbals: str = Form("[]"),         # JSON list of tagged names: ["{issuer}'s Jeb Kerman", ...]
@@ -2090,11 +2153,34 @@ async def create_rescue_contract(
         return ContractAcceptResponse(
             success=False, message="Invalid delta-v requirement.")
 
+    # Orbital plane + regime, both orbit-mode only. A surface target has no orbit to
+    # constrain, so anything sent with one is dropped rather than stored unreachable.
+    mode_l = (mode or "orbit").lower()
+    req_inc: float | None = None
+    req_margin_inc = 0.0
+    req_types: list[str] = []
+    if mode_l == "orbit":
+        req_types = oc.normalize_types(orbit_types)
+        if inc is not None:
+            if not math.isfinite(inc) or not 0.0 <= inc <= 180.0:
+                return ContractAcceptResponse(
+                    success=False, message="Inclination must be between 0° and 180°.")
+            if not math.isfinite(margin_inc):
+                return ContractAcceptResponse(
+                    success=False, message="Invalid inclination margin.")
+            req_inc = float(inc)
+            # A margin is a floor, not an error: too tight a tolerance makes the
+            # contract impossible rather than malformed (same as the Ap/Pe margin).
+            req_margin_inc = max(float(margin_inc) if margin_inc > 0
+                                 else settings.RESCUE_INCL_MARGIN_DEFAULT,
+                                 settings.RESCUE_INCL_MARGIN_MIN)
+
     rescue_target = {
-        "body": body, "mode": (mode or "orbit").lower(),
+        "body": body, "mode": mode_l,
         "ap": ap, "pe": pe, "lat": lat, "lon": lon,
         "margin_alt": margin_alt, "margin_pos": margin_pos, "is_modded": is_modded,
         "recovery": recovery, "min_dv": float(min_dv),
+        "inc": req_inc, "margin_inc": req_margin_inc, "orbit_types": req_types,
     }
 
     # Escrow the payment (atomic check-and-deduct — no double-spend across requests).
@@ -2223,10 +2309,11 @@ def _extract_part_uids(vn_data: bytes | None) -> list[str]:
 def _validate_rescue_submission(c: dict, vessel_data: str | None, vn_data: bytes | None,
                                 delta_v_vac: str | None = None):
     """Defense-in-depth recheck of a rescue submission: right body + situation
+    (from telemetry), the target orbit's plane and regime when the issuer named one
     (from telemetry), every stranded kerbal aboard (from the node), the wreck itself
     aboard on a "vessel" recovery (part flightIDs, from the node), and any delta-v
-    floor the issuer set (from telemetry). Returns (ok, reason). Orbit/surface
-    margins are enforced authoritatively client-side."""
+    floor the issuer set (from telemetry). Returns (ok, reason). The Ap/Pe and
+    lat/lon margins are enforced authoritatively client-side."""
     rt = c.get("rescue_target") or {}
     body = (rt.get("body") or "").strip().lower()
     mode = (rt.get("mode") or "orbit").lower()
@@ -2235,8 +2322,14 @@ def _validate_rescue_submission(c: dict, vessel_data: str | None, vn_data: bytes
     if vessel_data:
         import json
         try:
-            vd = json.loads(vessel_data)
+            payload = json.loads(vessel_data)
         except Exception:
+            payload = None
+        # The submission wraps the snapshot: {"contract_id": …, "active_vessel": {…}}.
+        # Fall back to the bare snapshot so a hand-rolled payload still gets checked.
+        if isinstance(payload, dict):
+            vd = payload.get("active_vessel") or payload
+        if not isinstance(vd, dict):
             vd = {}
     if vd:
         vbody = (vd.get("body") or "").strip().lower()
@@ -2247,6 +2340,20 @@ def _validate_rescue_submission(c: dict, vessel_data: str | None, vn_data: bytes
             return False, "Rescue craft must be ORBITING the target."
         if mode == "surface" and sit and sit not in ("LANDED", "SPLASHED"):
             return False, "Rescue craft must be LANDED/SPLASHED at the target."
+
+        # The plane and the regime of the delivery orbit. Ap/Pe say nothing about
+        # either, so without these a craft can sit in an equatorial orbit and satisfy
+        # a rescue from a polar one. Elements the client didn't report are skipped
+        # rather than failed, like every other telemetry-derived check here.
+        if mode == "orbit":
+            incl = vd.get("inclination")
+            msg = oc.check_inclination(rt.get("inc"), rt.get("margin_inc"), incl)
+            if msg:
+                return False, f"Rescue craft is in the wrong orbital plane. {msg}"
+            violations = oc.verify_types(rt.get("orbit_types"), vd)
+            if violations:
+                return False, ("Rescue craft isn't in the orbit this contract requires:\n- "
+                               + "\n- ".join(violations))
 
     names = _extract_crew_names(vn_data)
     if names:
@@ -3847,8 +3954,8 @@ async def web_game_command(req: GameCommandRequest, request: Request,
              command, uid, clients, "" if clients == 1 else "s")
     return GameCommandResult(
         success=True, clients=clients,
-        message="Sent to KSP — accept the prompt in game." if clients == 1
-                else f"Sent to {clients} running KSP clients — accept the prompt in game.")
+        message="Sent to KSP. Accept the prompt in game." if clients == 1
+                else f"Sent to {clients} running KSP clients. Accept the prompt in game.")
 
 
 @app.get("/api/v1/web/marketplace/mine", response_model=MarketplaceListingsResponse)
@@ -4169,7 +4276,7 @@ async def achievement_photo(
         result = await _run_gemini([data], gid)
     except Exception as exc:
         log.error("Achievement photo analysis failed for %s: %s", uid, exc, exc_info=True)
-        return SubmissionResult(success=False, message="Couldn't analyze the shot — try again.")
+        return SubmissionResult(success=False, message="Couldn't analyze the shot. Try again.")
 
     if not result.get("approved", False):
         # Not a KSP shot — don't pour arbitrary images into the community channel.
@@ -4207,9 +4314,9 @@ async def achievement_photo(
 
     # In-game popup message.
     if qualifies and is_new:
-        message = f"🏅 {title_desc} — unlocked! Check your Discord DMs to equip the title.{reward_suffix}"
+        message = f"🏅 {title_desc} unlocked! Check your Discord DMs to equip the title.{reward_suffix}"
     elif qualifies:
-        message = f"✅ Verified: {title_desc}. You already hold this title — shot shared!{reward_suffix}"
+        message = f"✅ Verified: {title_desc}. You already hold this title, so the shot was shared!{reward_suffix}"
     else:
         message = f"📸 Shot shared! It doesn't match a title role.{reward_suffix}"
 
