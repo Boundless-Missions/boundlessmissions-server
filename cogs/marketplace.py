@@ -261,10 +261,28 @@ async def _execute_purchase(interaction: discord.Interaction, gid: int, listing:
     await edit_all_mirrors(interaction.client, listing)
 
     new_balance = store.get_user(gid, buyer_id)["balance"]
+
+    # Best-effort heads-up when the buyer's install can't load what they just bought.
+    # Imported lazily: api_server imports this module too, so a module-level import
+    # would be circular. Never allowed to break a completed purchase.
+    compat_note = ""
+    try:
+        from api_server import _craft_compatibility
+        compat = _craft_compatibility(gid, buyer_id, listing)
+        if compat.known and not compat.compatible:
+            blocking = [p for p in compat.missing_parts if p not in compat.substitutable_parts]
+            shown = ", ".join(f"`{p}`" for p in blocking[:5])
+            more = f" (+{len(blocking) - 5} more)" if len(blocking) > 5 else ""
+            compat_note = (f"\n\n⚠️ Heads-up: your install is missing {len(blocking)} part(s) "
+                           f"this craft uses — {shown}{more}. It won't load until you install "
+                           "what provides them.")
+    except Exception as exc:
+        log.warning("Marketplace: compatibility check failed for %s: %s", lid, exc)
+
     await interaction.followup.send(
         f"✅ Purchased **{listing['craft_name']}** for **{price:,}** {settings.CURRENCY_SYMBOL}. "
         f"Your balance is now **{new_balance:,}** {settings.CURRENCY_SYMBOL}. "
-        "Check your DMs for the blueprint!",
+        "Check your DMs for the blueprint!" + compat_note,
         ephemeral=True,
     )
 

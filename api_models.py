@@ -428,6 +428,24 @@ class MarketplaceListingsResponse(BaseModel):
     listings: list[MarketplaceListing]
 
 
+class CraftCompatibility(BaseModel):
+    """Whether the requesting user can actually load a craft, checked against the
+    part catalog their KSP client uploaded.
+
+    `known` is False when we can't tell — the user has never uploaded a catalog, or
+    the listing predates part tagging. That is deliberately distinct from "compatible":
+    an unknown result must never be shown as a green light."""
+    known: bool = False
+    compatible: bool = True
+    # Parts the craft uses that aren't in the user's catalog under that name.
+    missing_parts: list[str] = []
+    # Of those, the ones the mod can silently substitute on install because the user
+    # has an equivalent (e.g. a DLC part they lack vs the ReStock+ stand-in they have).
+    # `compatible` stays True when every missing part is in here.
+    substitutable_parts: list[str] = []
+    reason: str = ""
+
+
 # ── Marketplace (website) ────────────────────────────────────────────────────
 
 class MarketplaceListingsPage(BaseModel):
@@ -449,6 +467,10 @@ class WebBuyResult(BaseModel):
     craft_url: Optional[str] = None
     craft_filename: Optional[str] = None
     already_owned: bool = False
+    # Pre-flight against the buyer's uploaded part catalog. Advisory only — a craft
+    # they can't load yet is still theirs to keep, and the mod substitutes what it can
+    # on install, so this warns rather than blocks.
+    compatibility: Optional[CraftCompatibility] = None
 
 
 # ── Notifications ────────────────────────────────────────────────────────────

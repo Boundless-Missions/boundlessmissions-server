@@ -38,6 +38,7 @@ def create_listing(
     blueprint_url: str = "",
     thumbnail_url: str = "",
     mods: list[str] | None = None,
+    parts: list[str] | None = None,
     life_support: str = "none",
     ls_endurance_days: float = 0.0,
     ls_crew_capacity: int = 0,
@@ -67,6 +68,12 @@ def create_listing(
         # list-time. Empty for stock-only crafts or listings made before mod tagging
         # existed. Powers the website's "filter by mod" facet.
         "mods": mods or [],
+        # Exact part names the craft uses, sent by the KSP client at list-time. Powers
+        # the pre-purchase compatibility check against a buyer's uploaded part catalog,
+        # which "mods" cannot do: having the mod is no guarantee of having the part.
+        # Empty for listings made before part tagging existed — the check reports
+        # "unknown" for those rather than guessing.
+        "parts": parts or [],
         # Life-support flag sent by the KSP client: which LS mod the craft is provisioned
         # for ("none"/"usi"/"tac"/"snacks"/"kerbalism"), how many in-game days it lasts per
         # kerbal, and its crew capacity — together these give the min/max endurance range

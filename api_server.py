@@ -46,7 +46,7 @@ from api_models import (
     SubmissionResult, FlightSubmission, VesselSnapshot,
     Notification, NotificationsResponse,
     MarketplaceListResult, MarketplaceListing, MarketplaceListingsResponse,
-    MarketplaceListingsPage, WebBuyResult,
+    MarketplaceListingsPage, WebBuyResult, CraftCompatibility,
     VersionCheckResponse,
     AttestChallenge, AttestRespondRequest, AttestResult,
 )
@@ -1152,6 +1152,65 @@ def _get_user_catalog(gid: int, uid: int) -> dict | None:
     except Exception as exc:
         log.warning("Failed to load part catalog for %s: %s", key, exc)
     return None
+
+
+def _craft_compatibility(gid: int, uid: int, listing: dict) -> CraftCompatibility:
+    """Can this user actually load this craft? Checked against the part catalog their
+    KSP client uploaded (see /api/v1/parts/catalog).
+
+    Advisory, never a gate: a craft nobody can load yet is still worth owning, and the
+    mod substitutes what it can at install time. Which is exactly why substitutable
+    parts are separated out — warning someone about a part PartAliases will silently
+    swap for them on install would be a false alarm about a problem that fixes itself.
+
+    Returns known=False rather than guessing when the answer isn't knowable: the user
+    has never uploaded a catalog, or the listing predates part tagging. "Unknown" must
+    never render as a green light.
+    """
+    from data.part_aliases import equivalents
+
+    craft_parts = [str(p) for p in (listing.get("parts") or []) if p]
+    if not craft_parts:
+        return CraftCompatibility(
+            known=False, reason="This listing was made before crafts recorded their parts."
+        )
+
+    cat = _get_user_catalog(gid, uid)
+    if not cat or not cat.get("parts"):
+        return CraftCompatibility(
+            known=False,
+            reason="Start KSP with the mod linked once and we can check this craft "
+                   "against your installed parts.",
+        )
+
+    installed = {str(p.get("name", "")) for p in cat["parts"] if p.get("name")}
+
+    missing, substitutable = [], []
+    for name in craft_parts:
+        if name in installed:
+            continue
+        missing.append(name)
+        if any(alt in installed for alt in equivalents(name)):
+            substitutable.append(name)
+
+    blocking = [p for p in missing if p not in substitutable]
+
+    if not missing:
+        reason = "You have every part this craft uses."
+    elif not blocking:
+        reason = (f"{len(substitutable)} part(s) aren't installed under that name, but you "
+                  "have an equivalent — the mod swaps them in when the craft arrives.")
+    else:
+        reason = (f"You're missing {len(blocking)} part(s) this craft needs; it won't load "
+                  "until you install what provides them.")
+
+    return CraftCompatibility(
+        known=True,
+        compatible=not blocking,
+        missing_parts=missing,
+        substitutable_parts=substitutable,
+        reason=reason,
+    )
 
 
 def _ai_resolve_part(mission_text: str):
@@ -3317,6 +3376,7 @@ async def marketplace_list_craft(
     cost: float = Form(0.0),
     price: int = Form(...),
     mods: str = Form(""),
+    parts: str = Form(""),
     life_support: str = Form("none"),
     ls_endurance_days: float = Form(0.0),
     ls_crew_capacity: int = Form(0),
@@ -3357,13 +3417,17 @@ async def marketplace_list_craft(
     # mods: client sends a comma-separated list of distinct GameData folders the
     # craft's parts come from. Dedup + drop blanks; stock-only crafts send nothing.
     mod_list = sorted({m.strip() for m in mods.split(",") if m.strip()})
+    # parts: the craft's exact part names, for the pre-purchase compatibility check.
+    # Capped — a very large craft is still only a few hundred distinct parts, and this
+    # goes into a Firestore document with a 1 MiB ceiling.
+    part_list = sorted({p.strip() for p in parts.split(",") if p.strip()})[:2000]
 
     listing = mkt.create_listing(
         gid, uid, user["username"],
         craft_name=craft_name, craft_type=craft_type, part_count=part_count,
         mass=mass, cost=cost, price=price,
         craft_url="", craft_filename=filename,
-        mods=mod_list,
+        mods=mod_list, parts=part_list,
         life_support=(life_support or "none").strip().lower(),
         ls_endurance_days=ls_endurance_days,
         ls_crew_capacity=ls_crew_capacity,
@@ -3726,7 +3790,21 @@ async def web_marketplace_buy(listing_id: str, user: dict = Depends(get_user_tok
         craft_url=listing.get("craft_url") or None,
         craft_filename=listing.get("craft_filename") or None,
         already_owned=already_owned,
+        compatibility=_craft_compatibility(gid, uid, listing),
     )
+
+
+@app.get("/api/v1/web/marketplace/{listing_id}/compatibility",
+         response_model=CraftCompatibility)
+async def web_marketplace_compatibility(listing_id: str,
+                                        user: dict = Depends(get_user_token_only)):
+    """Whether the caller can load this craft, checked against the part catalog their
+    KSP client uploaded. For the listing detail view, so a buyer finds out BEFORE
+    paying rather than when the craft won't open in the VAB."""
+    listing = mkt.get_listing(int(user["guild_id"]), listing_id)
+    if not listing:
+        raise HTTPException(status_code=404, detail="No such listing.")
+    return _craft_compatibility(int(user["guild_id"]), int(user["user_id"]), listing)
 
 
 # ── Website: contracts ───────────────────────────────────────────────────────
