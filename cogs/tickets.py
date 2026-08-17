@@ -9,6 +9,8 @@ the filer and the mods (MOD_ROLE_ID) can see — no outside access.
 Other flows reuse `create_ticket()` to open tickets programmatically:
   • KSP account-sharing reports  (cogs/ksp_bridge.py)
   • Contract "sue" escalations    (cogs/contract_views.py)
+  • In-game bug reports           (api_server.py, /api/v1/bugreport) — these ping
+    the `bug_report` role instead of the mods, see `notify_role_key` below.
 
 Each ticket channel carries a "🔒 Close" button (mods or the opener may close).
 The opener's id is stored in the channel topic so the close check survives a
@@ -100,6 +102,15 @@ def _ticket_opener_id(channel: discord.abc.GuildChannel) -> int | None:
     return None
 
 
+def _ticket_kind(channel: discord.abc.GuildChannel) -> str:
+    """Read the ticket's kind back out of its channel topic (empty if unknown)."""
+    topic = getattr(channel, "topic", None) or ""
+    for part in topic.split("|"):
+        if part.startswith("kind="):
+            return part.split("=", 1)[1]
+    return ""
+
+
 # ── Programmatic ticket creation (shared by all flows) ────────────────────────
 
 async def create_ticket(
@@ -117,14 +128,23 @@ async def create_ticket(
     extra_view: View | None = None,
     files: list[discord.File] | None = None,
     ping_mods: bool = True,
+    notify_role_key: str | None = None,
 ) -> discord.TextChannel | None:
     """Create a private ticket channel under TICKET_CATEGORY_ID and post the opening
     message. Visible only to @mods, the opener (if any), and any extra_user_ids.
 
     `opener_id=None` makes a **mods-only** ticket (used for auto-flagged anti-cheat
     reports where the suspect must NOT see it); only mods can then close it.
-    `subject_user_id` is shown for context but is NOT granted access. Returns the
-    channel, or None if the ticket system is unconfigured / creation failed."""
+    `subject_user_id` is shown for context but is NOT granted access.
+
+    `notify_role_key` names a *second* guild_config role (see its role registry) that
+    is granted access and pinged — for a ticket whose audience isn't moderation, like
+    an in-game bug report going to whoever maintains the mod. Such callers normally
+    pass `ping_mods=False` too; if the named role isn't configured in this guild the
+    mods are pinged after all, since an unread report is worse than a misrouted one.
+
+    Returns the channel, or None if the ticket system is unconfigured / creation
+    failed."""
     cat_id = guild_config.get_channel_id(guild.id, "ticket_category")
     if not cat_id:
         log.warning("create_ticket called but no ticket_category is configured for guild %s", guild.id)
@@ -147,9 +167,11 @@ async def create_ticket(
         ),
     }
     mod_role = guild_config.resolve_role(guild, "mod")
-    if mod_role:
-        overwrites[mod_role] = discord.PermissionOverwrite(
-            view_channel=True, send_messages=True, attach_files=True)
+    notify_role = guild_config.resolve_role(guild, notify_role_key) if notify_role_key else None
+    for role in (mod_role, notify_role):
+        if role is not None:
+            overwrites[role] = discord.PermissionOverwrite(
+                view_channel=True, send_messages=True, attach_files=True)
 
     member_ids = ([int(opener_id)] if opener_id else []) + [int(u) for u in (extra_user_ids or [])]
     for uid in dict.fromkeys(member_ids):  # de-dupe, preserve order
@@ -193,11 +215,21 @@ async def create_ticket(
                     value=(f"{subj.mention} (`{subject_user_id}`)" if subj else f"`{subject_user_id}`"),
                     inline=False)
 
+    ping_roles: list[discord.Role] = []
+    if ping_mods and mod_role:
+        ping_roles.append(mod_role)
+    if notify_role_key:
+        if notify_role is not None:
+            ping_roles.append(notify_role)
+        elif mod_role is not None:
+            log.warning("Ticket role '%s' is not configured in guild %s — pinging the "
+                        "mod role instead", notify_role_key, guild.id)
+            ping_roles.append(mod_role)
+
     content_bits = []
     if opener:
         content_bits.append(opener.mention)
-    if ping_mods and mod_role:
-        content_bits.append(mod_role.mention)
+    content_bits += [r.mention for r in dict.fromkeys(ping_roles)]
     content = " ".join(content_bits) or None
 
     try:
@@ -331,7 +363,16 @@ class CloseTicketButton(DynamicItem[Button], template=r"gk_ticket_close"):
         # Mod power gates on the REAL invoker (mimic-safe); the opener check stays on
         # the acting-as identity, which mimic legitimately changes.
         ru = real_user(interaction)
+        # A bug ticket belongs to the bug-report role, not to moderation — they are
+        # the ones who resolve it, so they can close it too. Same mimic-safety rule
+        # as the mod check: it gates on the REAL invoker.
+        bug_role = guild_config.resolve_role(interaction.guild, "bug_report")
+        owns_bug_ticket = (
+            _ticket_kind(channel) == "bug" and bug_role is not None
+            and isinstance(ru, discord.Member) and bug_role in ru.roles
+        )
         allowed = (isinstance(ru, discord.Member) and is_mod(ru)) \
+            or owns_bug_ticket \
             or (opener_id is not None and member.id == opener_id)
         if not allowed:
             await interaction.response.send_message(

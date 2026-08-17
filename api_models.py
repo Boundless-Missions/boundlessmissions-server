@@ -225,6 +225,12 @@ class ContractSummary(BaseModel):
     # Wreck snapshot URL — only set for the rescuer (contractor) on an accepted
     # rescue, so their client can spawn/respawn the stranded vessel on demand.
     rescue_vessel_node_url: Optional[str] = None
+    # The issuer's local vessel GUID for the craft they handed over. Sent back only
+    # to the issuer, and only so their client can verify the removal actually took:
+    # the contract existing at all means the ship is no longer theirs, so a copy
+    # still sitting in their save is a failed removal to be retried. Never sent to
+    # the rescuer — another save's vessel id is no use to them.
+    rescue_pid: Optional[str] = None
     # Life-support provisioning of the craft this contract is about: which LS mod its
     # supplies belong to and how long they last per kerbal. Set at creation for a rescue
     # (the wreck is scanned on the issuer's client) and at submission for everything
@@ -306,8 +312,8 @@ class AuctionCreateRequest(BaseModel):
     due_date: str = Field(..., pattern=r"^\d{4}-\d{2}-\d{2}$")
     duration_hours: int = Field(..., gt=0)
     modlist: Optional[str] = None  # mods required / limited to
-    # craft_build / active_vessel — inherited by the winner's contract. Other
-    # values (or null) are ignored, leaving the contract untyped.
+    # craft_build / active_vessel / flag_design — inherited by the winner's contract.
+    # Other values (or null) are ignored, leaving the contract untyped.
     contract_type: Optional[str] = None
 
 

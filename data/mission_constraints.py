@@ -28,8 +28,25 @@ Canonical constraints dict (every key optional; omitted/empty == no restriction)
       "min_dv":                       float,  # vacuum Δv floor, m/s (optional)
       "max_crew":                     int,    # crew-aboard ceiling (optional)
       "min_crew":                     int,    # crew-aboard floor (optional)
+      "crew_traits":                  {str: {"min": int, "max": int}},  # per-profession
       "notes":                        str,    # human-readable summary (optional)
     }
+
+`crew_traits` is the same floor/ceiling idea applied per profession — "send two
+pilots and a scientist" => {"Pilot": {"min": 2}, "Scientist": {"min": 1}}, "no
+tourists" => {"Tourist": {"max": 0}}. Keys are canonical KSP trait names, spelled
+exactly as `ProtoCrewMember.trait` holds them, because that string is what both
+ends match on. That matters for modded professions (USI/MKS Kolonist, Miner,
+Medic…): the trait string survives in a save even where the mod defining it is
+absent, so matching by name works on any install — while a contract that asks for
+a profession the contractor hasn't got is simply one they cannot fill, and the
+violation message says so rather than pretending nobody was aboard.
+
+Crew is stated as a floor, a ceiling, or both ("exactly N" == min_crew == max_crew).
+`max_crew` is the one bound where **0 is a real value**, not "unset": an uncrewed
+mission ("unmanned probe", "no kerbals aboard") is a ceiling of zero. Every read of
+it therefore tests `is not None` rather than truthiness, and the KSP client uses -1
+(not 0) as its "no limit" sentinel.
 
 Δv (delta-v) is a whole-craft metric, so unlike the part rules it can't be
 enforced by hiding parts in the editor. It's checked only at submit time: the
@@ -56,6 +73,97 @@ LIST_KEYS = (
 ENGINE_CATEGORIES = {
     "nuclear", "ion", "solid", "chemical", "electric", "monoprop", "rcs",
 }
+
+# Natural-language profession word -> canonical KSP trait name. The canonical form
+# is the exact string KSP stores in ProtoCrewMember.trait, since that is what the
+# client counts against and what survives in a save whose defining mod is missing.
+#
+# Stock ships four; the rest are the USI/MKS professions, which are the ones that
+# actually turn up in this community's saves. The table is closed on purpose: a
+# count in front of an unknown noun ("2 rovers") must not become a crew rule.
+_TRAIT_ALIASES = {
+    "pilot": "Pilot", "pilots": "Pilot", "pilotu": "Pilot", "pilotlar": "Pilot",
+    "engineer": "Engineer", "engineers": "Engineer",
+    "mühendis": "Engineer", "mühendisler": "Engineer", "muhendis": "Engineer",
+    "scientist": "Scientist", "scientists": "Scientist",
+    "bilim insanı": "Scientist", "bilim insanları": "Scientist",
+    "bilim adamı": "Scientist", "bilimci": "Scientist",
+    "tourist": "Tourist", "tourists": "Tourist", "turist": "Tourist", "turistler": "Tourist",
+    "kolonist": "Kolonist", "kolonists": "Kolonist",
+    "colonist": "Kolonist", "colonists": "Kolonist",
+    "miner": "Miner", "miners": "Miner", "madenci": "Miner",
+    "mechanic": "Mechanic", "mechanics": "Mechanic", "tamirci": "Mechanic",
+    "technician": "Technician", "technicians": "Technician", "teknisyen": "Technician",
+    "medic": "Medic", "medics": "Medic", "doktor": "Medic", "sağlıkçı": "Medic",
+    "quartermaster": "Quartermaster", "quartermasters": "Quartermaster",
+    "scout": "Scout", "scouts": "Scout", "izci": "Scout",
+    "biologist": "Biologist", "biologists": "Biologist", "biyolog": "Biologist",
+    "geologist": "Geologist", "geologists": "Geologist", "jeolog": "Geologist",
+    "botanist": "Botanist", "botanists": "Botanist", "botanikçi": "Botanist",
+    "chemist": "Chemist", "chemists": "Chemist", "kimyager": "Chemist",
+    "farmer": "Farmer", "farmers": "Farmer", "çiftçi": "Farmer",
+}
+
+# Canonical trait names, for validating an AI-supplied `crew_traits` object.
+TRAIT_NAMES = set(_TRAIT_ALIASES.values())
+
+# Canonical trait -> the mod that defines it. Stock's four are absent on purpose:
+# a profession every install already has is not a dependency worth naming.
+#
+# This is the one thing a trait name cannot express and no part walk can recover.
+# Every mod-detection path in this project resolves *parts* to a GameData folder
+# (`CkanGenerator.GetModFolder`), and a profession requirement has no part to walk
+# — the same blind spot Textures Unlimited needed its own side channel for. So the
+# mapping is written down rather than derived.
+#
+# Deliberately coarse (one mod per profession, the one this community actually gets
+# it from) and closed like `_TRAIT_ALIASES`: a trait with no entry produces no hint
+# rather than a guessed name, because sending a player to install the wrong mod is
+# worse than telling them only which profession they're missing. Kept in sync with
+# `ContractConstraints.cs::TraitMods` on the KSP side, which says the same thing in
+# the submit pre-flight — the two naming different mods for one profession would
+# read as two different problems.
+_TRAIT_MODS = {
+    "Kolonist": "USI/MKS",
+    "Miner": "USI/MKS",
+    "Mechanic": "USI/MKS",
+    "Technician": "USI/MKS",
+    "Medic": "USI/MKS",
+    "Quartermaster": "USI/MKS",
+    "Scout": "USI/MKS",
+    "Biologist": "USI/MKS",
+    "Geologist": "USI/MKS",
+    "Botanist": "USI/MKS",
+    "Chemist": "USI/MKS",
+    "Farmer": "USI/MKS",
+}
+
+
+def trait_mod(trait: str | None) -> str | None:
+    """The mod that defines a profession, or None for stock's four and for anything
+    `_TRAIT_MODS` doesn't know."""
+    if not trait:
+        return None
+    return _TRAIT_MODS.get(str(trait).strip()) or _TRAIT_MODS.get(
+        _TRAIT_ALIASES.get(str(trait).strip().lower(), ""))
+
+
+def crew_trait_mod_requirements(constraints: dict | None) -> list[str]:
+    """One phrase per mod a contract's professions need ("USI/MKS (Kolonist, Miner)"),
+    grouped by mod so two professions from one install read as one thing to install.
+
+    Only floors count: a ceiling ("no Kolonists aboard") is satisfied by not having
+    the mod at all, so naming it would be advice to install something in order to
+    obey a ban.
+    """
+    by_mod: dict[str, list[str]] = {}
+    for trait, bounds in ((constraints or {}).get("crew_traits") or {}).items():
+        if not bounds.get("min"):
+            continue
+        mod = trait_mod(trait)
+        if mod:
+            by_mod.setdefault(mod, []).append(str(trait))
+    return [f"{mod} ({', '.join(traits)})" for mod, traits in by_mod.items()]
 
 # Natural-language phrase -> canonical engine category.
 _ENGINE_CATEGORY_ALIASES = {
@@ -146,9 +254,12 @@ def is_empty(constraints: dict | None) -> bool:
         return True
     if any(constraints.get(k) for k in LIST_KEYS):
         return False
+    # max_crew 0 ("uncrewed") is a restriction, so it's tested for presence.
+    if constraints.get("max_crew") is not None:
+        return False
     return not (constraints.get("max_parts") or constraints.get("min_parts")
                 or constraints.get("max_dv") or constraints.get("min_dv")
-                or constraints.get("max_crew") or constraints.get("min_crew"))
+                or constraints.get("min_crew") or constraints.get("crew_traits"))
 
 
 def _as_str_list(val) -> list[str]:
@@ -189,7 +300,7 @@ def normalize(raw: dict | None) -> dict:
         out[key] = _dedupe(_map_tokens(raw.get(key), _PART_CATEGORY_ALIASES, keep_unknown=True,
                                        lower=True))
 
-    for key in ("max_parts", "min_parts", "max_crew", "min_crew"):
+    for key in ("max_parts", "min_parts", "min_crew"):
         val = raw.get(key)
         if isinstance(val, bool):
             continue
@@ -199,6 +310,17 @@ def normalize(raw: dict | None) -> dict:
             continue
         if iv > 0:
             out[key] = iv
+
+    # max_crew alone keeps 0 — "fly this uncrewed" is a ceiling, not an absent one.
+    # A negative value is still treated as "unset" (the client's no-limit sentinel).
+    _mx = raw.get("max_crew")
+    if not isinstance(_mx, bool):
+        try:
+            _mxi = int(_mx)
+        except (TypeError, ValueError):
+            _mxi = None
+        if _mxi is not None and _mxi >= 0:
+            out["max_crew"] = _mxi
 
     for key in ("max_dv", "min_dv"):
         val = raw.get(key)
@@ -211,11 +333,62 @@ def normalize(raw: dict | None) -> dict:
         if fv > 0:
             out[key] = fv
 
+    traits = _normalize_crew_traits(raw.get("crew_traits"))
+    if traits:
+        out["crew_traits"] = traits
+
     notes = raw.get("notes")
     if isinstance(notes, str) and notes.strip():
         out["notes"] = notes.strip()[:300]
     _resolve_conflicts(out)
     return out
+
+
+def _normalize_crew_traits(raw) -> dict:
+    """Coerce a `crew_traits` object into {CanonicalTrait: {"min": int, "max": int}}.
+
+    Tolerates the two shapes an AI (or a future caller) is likely to produce: the
+    full bounds object, and the shorthand {"Pilot": 2} meaning a floor of two.
+    Unknown profession words are dropped rather than kept — a name no install
+    defines is a requirement nobody could ever satisfy, and silently failing every
+    submission is worse than ignoring the phrase.
+    """
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, dict] = {}
+    for key, val in raw.items():
+        canon = _TRAIT_ALIASES.get(str(key).strip().lower())
+        if canon is None and str(key).strip() in TRAIT_NAMES:
+            canon = str(key).strip()
+        if canon is None:
+            continue
+
+        bounds = val if isinstance(val, dict) else {"min": val}
+        clean: dict[str, int] = {}
+        for bound in ("min", "max"):
+            v = bounds.get(bound)
+            if v is None or isinstance(v, bool):
+                continue
+            try:
+                iv = int(v)
+            except (TypeError, ValueError):
+                continue
+            # A floor of zero says nothing; a ceiling of zero says "none of these".
+            if iv < 0 or (bound == "min" and iv == 0):
+                continue
+            clean[bound] = iv
+        if not clean:
+            continue
+        # A floor above its own ceiling is unsatisfiable; the ceiling wins, as it
+        # does for the whole-crew band below.
+        if "min" in clean and "max" in clean and clean["min"] > clean["max"]:
+            clean.pop("min")
+        merged = out.setdefault(canon, {})
+        for bound, iv in clean.items():
+            # Two phrases naming the same profession: keep the tighter of each bound.
+            merged[bound] = (max(merged[bound], iv) if bound == "min" and bound in merged
+                             else min(merged[bound], iv) if bound in merged else iv)
+    return {k: v for k, v in out.items() if v}
 
 
 # (forbidden, required) key pairs that must not share a token — a craft can't
@@ -228,6 +401,15 @@ _CONFLICT_PAIRS = (
 )
 
 
+def resolve_conflicts(constraints: dict | None) -> dict | None:
+    """Public entry point for `_resolve_conflicts`, for callers that merge two
+    already-normalised constraint dicts (AI + heuristic) and can therefore create a
+    contradiction neither source contained. Mutates and returns `constraints`."""
+    if constraints:
+        _resolve_conflicts(constraints)
+    return constraints
+
+
 def _resolve_conflicts(constraints: dict) -> None:
     """Drop any token present in both a forbidden and required list (forbidden
     wins — an explicit ban is rarely a mistake, while a spurious requirement
@@ -238,6 +420,34 @@ def _resolve_conflicts(constraints: dict) -> None:
             constraints[require_key] = [
                 v for v in constraints.get(require_key, []) if v.lower() not in banned
             ]
+
+    # An impossible crew band (floor above ceiling) can only come from two phrases
+    # in one text being read as one rule — "fly it uncrewed" next to "rescue 2
+    # kerbals". The ceiling wins, for the same reason a ban beats a requirement:
+    # dropping the floor leaves a mission that can still be flown.
+    mx, mn = constraints.get("max_crew"), constraints.get("min_crew")
+    if mx is not None and mn is not None and mn > mx:
+        constraints.pop("min_crew", None)
+
+    # Same rule one level down: an uncrewed mission cannot also demand a pilot, and
+    # profession floors cannot add up to more than the whole-crew ceiling. Both come
+    # from one text describing two things, and both make the mission unflyable — so
+    # the floors go and the ceiling stands.
+    traits = constraints.get("crew_traits")
+    if traits:
+        if mx is not None:
+            for name, bounds in list(traits.items()):
+                if bounds.get("min", 0) > mx:
+                    bounds.pop("min", None)
+                if not bounds:
+                    traits.pop(name)
+            if sum(b.get("min", 0) for b in traits.values()) > mx:
+                for bounds in traits.values():
+                    bounds.pop("min", None)
+                traits = {k: v for k, v in traits.items() if v}
+        constraints["crew_traits"] = traits
+        if not traits:
+            constraints.pop("crew_traits")
 
 
 def _dedupe(items: list[str]) -> list[str]:
@@ -329,55 +539,268 @@ def extract_heuristic(text: str) -> dict:
     # Crew-aboard limits, e.g. "crew of 3" / "carry at least 2 kerbals" / "2-4 crew".
     _extract_crew(text, out)
 
+    # Per-profession crew, e.g. "two pilots and a scientist" / "no tourists".
+    _extract_crew_traits(text, out)
+
     return normalize(out)
+
+
+# Written-out counts accepted in crew phrases ("a crew of three", "üç kerbal").
+# They're rewritten to digits before matching, so every pattern below only has to
+# handle digits. Deliberately excludes Turkish "on" (10) and "bir" (1), which double
+# as the English preposition and the Turkish indefinite article, and English "a"/"an",
+# which would read "send a kerbal" as a hard count of one.
+_CREW_NUM_WORDS = {
+    "zero": 0, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6,
+    "seven": 7, "eight": 8, "nine": 9, "ten": 10, "eleven": 11, "twelve": 12,
+    "single": 1, "solo": 1, "lone": 1,
+    "sıfır": 0, "tek": 1, "iki": 2, "üç": 3, "dört": 4, "beş": 5,
+    "altı": 6, "yedi": 7, "sekiz": 8, "dokuz": 9,
+}
+
+# Phrases that mean "nobody aboard" — a crew ceiling of exactly 0.
+_UNCREWED_CUES = (
+    "uncrewed", "un-crewed", "unmanned", "crewless", "crew-less", "crewed by none",
+    "no crew", "without crew", "without a crew", "no kerbals", "without kerbals",
+    "zero crew", "0 crew", "probe only", "probe-only",
+    "mürettebatsız", "insansız", "kerbalsız", "mürettebat olmadan", "mürettebat yok",
+)
+
+# Words that, right before a crew mention, mean the count describes *other people* —
+# the kerbals to be rescued, not the crew the contractor flies with. Without this,
+# "rescue 2 stranded kerbals" would demand the rescue ship carry exactly 2.
+_CREW_ANTI_CUES = ("rescue", "rescuing", "save ", "saving", "stranded", "strand",
+                   "kurtar", "mahsur", "return ", "bring back", "pick up", "retrieve")
+
+
+def _crew_blocked(low: str, start: int) -> bool:
+    """True when a crew mention at `start` is about kerbals being collected rather
+    than kerbals aboard at launch."""
+    window = low[max(0, start - 28):start]
+    return any(cue in window for cue in _CREW_ANTI_CUES)
+
+
+# Bound words that, sitting just before a bare "N kerbals", mean the number is one
+# end of a range rather than an exact count — "at least 1 kerbal" is a floor, so the
+# exact-count pattern has to keep its hands off it.
+_CREW_QUALIFIERS = (
+    "at least", "at most", "no more than", "no fewer than", "no less than", "up to",
+    "max", "min", "more than", "less than", "fewer than", "greater than", "over",
+    "under", "above", "below", "between", "or ", "to ", "and ",
+    "en az", "en fazla", "en çok", "altında", "üzerinde", "ile ",
+)
+
+
+def _crew_qualified(low: str, start: int) -> bool:
+    """True when a bound word immediately precedes the count at `start`."""
+    return any(low[max(0, start - 18):start].rstrip().endswith(q.rstrip())
+               for q in _CREW_QUALIFIERS)
+
+
+def _digitize_counts(low: str) -> str:
+    """Rewrite the number words in `_CREW_NUM_WORDS` to digits, whole-token only."""
+    import re
+    alts = "|".join(sorted((re.escape(w) for w in _CREW_NUM_WORDS), key=len, reverse=True))
+    return re.sub(rf"(?<!\w)({alts})(?!\w)", lambda m: str(_CREW_NUM_WORDS[m.group(1)]), low)
 
 
 def _extract_crew(text: str, out: dict) -> None:
     """Detect min/max crew-aboard limits. Handles 'crew of N', 'carry N kerbals',
     'N crew', inclusive ('at most/least N crew') and strict ('more/fewer than N')
-    bounds, and ranges ('between 2 and 4 crew' / '2-4 kerbals'). Most restrictive
-    bound wins. A crew noun must be present so plain numbers don't trip it."""
+    bounds, ranges ('between 2 and 4 crew' / '2-4 kerbals'), exact counts written as
+    words ('a crew of three', 'tek kerbal'), the reverse word order ('crew size of
+    at least 2'), and uncrewed missions ('unmanned probe' => max_crew 0). Most
+    restrictive bound wins. A crew noun must be present so plain numbers don't trip
+    it, and a count that belongs to a rescue ('save 2 stranded kerbals') is ignored —
+    that's who's being fetched, not who's flying."""
     import re
-    low = text.lower()
+    low = _digitize_counts(text.lower())
     maxes: list[int] = []
     mins: list[int] = []
     # English crew/kerbal(s)/astronaut(s) or Turkish mürettebat/kerbal.
     K = r"(?:crew(?:\s*members?)?|kerbals?|astronauts?|mürettebat\w*)"
+    # "or fewer" after the noun turns what reads like a floor ("with 5 kerbals") into
+    # a ceiling, so the floor patterns refuse to fire in front of it.
+    # The \b matters: without it "kerbals" backtracks to "kerbal" and the lookahead
+    # then reads the leftover "s" instead of the " or fewer" it exists to catch.
+    NOT_CEIL = r"\b(?!\s*(?:or\s*(?:fewer|less)|veya\s*az))"
 
     def n(m, delta=0, gi=1):
         return int(m.group(gi)) + delta
 
-    # exactly N ("crew of 3", "exactly 2 kerbals")
+    def add(bucket: list[int], m, value: int) -> None:
+        if not _crew_blocked(low, m.start()):
+            bucket.append(value)
+
+    # Uncrewed: a ceiling of zero. Checked first — "no crew" must not also be read as
+    # a floor by anything below.
+    for cue in _UNCREWED_CUES:
+        idx = low.find(cue)
+        if idx < 0 or _crew_blocked(low, idx):
+            continue
+        # "uncrewed launches not allowed" says the opposite of "uncrewed" — and a
+        # wrong ceiling of zero fails every submission, so the doubt is worth the
+        # scan of what follows.
+        tail = low[idx + len(cue):idx + len(cue) + 26]
+        if any(neg in tail for neg in ("not allowed", "forbidden", "banned",
+                                       "yasak", "olmaz", "kabul edilmez")):
+            continue
+        maxes.append(0)
+        break
+
+    # exactly N ("crew of 3", "exactly 2 kerbals", "crew: 3")
     for m in re.finditer(rf"(?:crew\s*of|exactly|precisely|tam)\s*(\d+)\s*{K}?", low):
-        maxes.append(n(m)); mins.append(n(m))
+        add(maxes, m, n(m)); add(mins, m, n(m))
+    for m in re.finditer(rf"{K}\s*(?:size|count)?\s*[:=]\s*(\d+)", low):
+        add(maxes, m, n(m)); add(mins, m, n(m))
+    # adjectival exact counts: "a 3-kerbal lander", "3 kişilik mürettebat"
+    for m in re.finditer(rf"(\d+)\s*-\s*{K}\b", low):
+        add(maxes, m, n(m)); add(mins, m, n(m))
+    for m in re.finditer(r"(\d+)\s*kişilik", low):
+        add(maxes, m, n(m)); add(mins, m, n(m))
+    for m in re.finditer(rf"{K}\s*(\d+)\s*kişi", low):
+        add(maxes, m, n(m)); add(mins, m, n(m))
+    # bare "one/single/solo kerbal" (already digitised) — an exact count, since
+    # "send one kerbal to the Mun" is not satisfied by sending three.
+    for m in re.finditer(rf"(?<!\w)(1)\s*{K}(?!\s*(?:or|veya)\b)", low):
+        if _crew_qualified(low, m.start()):
+            continue
+        add(maxes, m, n(m)); add(mins, m, n(m))
     # range: "between N and M crew" / "N to M kerbals" / "N-M crew"
     for m in re.finditer(rf"(?:between\s*)?(\d+)\s*(?:and|to|-|–|ile)\s*(\d+)\s*{K}", low):
-        mins.append(int(m.group(1))); maxes.append(int(m.group(2)))
+        add(mins, m, int(m.group(1))); add(maxes, m, int(m.group(2)))
     # inclusive max
     for m in re.finditer(rf"(?:max(?:imum)?|no more than|at most|up to|no greater than|"
                          rf"en fazla|en çok)\s*(?:of\s*)?(\d+)\s*{K}", low):
-        maxes.append(n(m))
+        add(maxes, m, n(m))
     for m in re.finditer(rf"(\d+)\s*{K}\s*or\s*(?:fewer|less)", low):
-        maxes.append(n(m))
+        add(maxes, m, n(m))
     # strict max ("fewer/less than N crew" => N-1)
     for m in re.finditer(rf"(?:fewer than|less than|under|below|altında)\s*(\d+)\s*{K}", low):
-        maxes.append(max(1, n(m, -1)))
-    # inclusive min ("at least N crew", "carry N kerbals")
+        add(maxes, m, max(0, n(m, -1)))
+    # inclusive min ("at least N crew", "carry N kerbals", "fly 3 kerbals to the Mun").
+    # A transport verb reads as a floor, not an exact count, matching how "carry" has
+    # always been read — the mission is still done if a fourth seat is filled.
     for m in re.finditer(rf"(?:min(?:imum)?|at least|no fewer than|no less than|"
-                         rf"carry|with|en az)\s*(?:of\s*)?(\d+)\s*{K}", low):
-        mins.append(n(m))
+                         rf"carry|carrying|with|fly|flying|send|sending|take|taking|"
+                         rf"launch|launching|transport|deliver|"
+                         rf"en az|taşı\w*|götür\w*|gönder\w*)\s*(?:of\s*)?(\d+)\s*{K}{NOT_CEIL}", low):
+        add(mins, m, n(m))
     for m in re.finditer(rf"(\d+)\s*{K}\s*or\s*more", low):
-        mins.append(n(m))
+        add(mins, m, n(m))
     for m in re.finditer(rf"(\d+)\+\s*{K}", low):
-        mins.append(n(m))
+        add(mins, m, n(m))
     # strict min ("more than N crew" => N+1); "no " lookbehind avoids "no more than".
     for m in re.finditer(rf"(?<!no )(?:more than|over|greater than|above)\s*(\d+)\s*{K}", low):
-        mins.append(n(m, 1))
+        add(mins, m, n(m, 1))
+
+    # Reverse word order, where the bound follows the noun: "crew size of at least 2",
+    # "crew count under 4", "mürettebat en az 2".
+    CONN = r"(?:\s*(?:of|is|:|=)\s*|\s+)"
+    CS = rf"{K}\s*(?:size|count|say\w*)?"
+    for m in re.finditer(rf"{CS}{CONN}(?:at least|min(?:imum)?|no fewer than|no less than|en az)\s*(\d+)", low):
+        add(mins, m, n(m))
+    for m in re.finditer(rf"{CS}{CONN}(?<!no )(?:more than|over|greater than|above)\s*(\d+)", low):
+        add(mins, m, n(m, 1))
+    for m in re.finditer(rf"{CS}{CONN}(?:at most|max(?:imum)?|no more than|up to|no greater than|"
+                         rf"en fazla|en çok)\s*(\d+)", low):
+        add(maxes, m, n(m))
+    for m in re.finditer(rf"{CS}{CONN}(?:fewer than|less than|under|below|altında)\s*(\d+)", low):
+        add(maxes, m, max(0, n(m, -1)))
+
+    # "crewed / manned mission" with no number: at least somebody aboard. The \b in
+    # front keeps "uncrewed"/"unmanned" out (their "un" is a word character).
+    if not maxes or min(maxes) > 0:
+        for m in re.finditer(r"\b(?:crewed|manned|mürettebatlı|insanlı)\b", low):
+            add(mins, m, 1)
 
     if maxes:
         out["max_crew"] = min(maxes)
     if mins:
         out["min_crew"] = max(mins)
+
+
+# Nouns that can follow a profession word and mean something else entirely — a
+# pilot chute is hardware, not a kerbal. Only needed for the bare "a pilot" form;
+# a number in front ("2 pilots") is unambiguous.
+_TRAIT_NOT_A_KERBAL = ("chute", "light", "hole", "program", "wave")
+
+# Professions whose name is also an ordinary word for a *craft* — "send a scout to
+# Duna" is a probe, not a kerbal. These are only read from a counted phrase ("2
+# scouts"), never from a bare article, where the reading is a coin toss and a wrong
+# requirement rejects every submission.
+_TRAIT_ARTICLE_UNSAFE = ("scout", "scouts", "izci")
+
+
+def _extract_crew_traits(text: str, out: dict) -> None:
+    """Detect per-profession crew requirements — "send two pilots and a scientist",
+    "at least one engineer aboard", "no tourists", "en az 2 mühendis".
+
+    Same grammar as `_extract_crew`, applied to a profession noun instead of the
+    generic crew noun, and sharing its guards: counts written as words are already
+    digits by the time the patterns run, a bare count is a floor (asking for "2
+    pilots" is not a ban on a third), and a mention inside a rescue phrase ("bring
+    back 2 stranded scientists") describes who is being fetched, not who is flying.
+    """
+    import re
+    low = _digitize_counts(text.lower())
+    if not any(w in low for w in _TRAIT_ALIASES):
+        return
+
+    mins: dict[str, list[int]] = {}
+    maxes: dict[str, list[int]] = {}
+    # Longest first, so "bilim insanları" wins over "bilim insanı".
+    T = "|".join(re.escape(w) for w in sorted(_TRAIT_ALIASES, key=len, reverse=True))
+
+    def add(bucket: dict[str, list[int]], m, value: int, gi: int) -> None:
+        if _crew_blocked(low, m.start()):
+            return
+        canon = _TRAIT_ALIASES.get(m.group(gi))
+        if canon:
+            bucket.setdefault(canon, []).append(value)
+
+    # "no tourists" / "without an engineer" / "hiç turist" — a ceiling of zero.
+    for m in re.finditer(rf"\b(?:no|without(?:\s+an?)?|zero|hiç|hicbir|hiçbir)\s+({T})\b", low):
+        add(maxes, m, 0, 1)
+
+    # "exactly 2 pilots"
+    for m in re.finditer(rf"\b(?:exactly|precisely|tam)\s*(\d+)\s*({T})\b", low):
+        add(mins, m, int(m.group(1)), 2)
+        add(maxes, m, int(m.group(1)), 2)
+
+    # Inclusive and strict bounds, either side of the number.
+    for m in re.finditer(rf"\b(?:at least|min(?:imum)?|no fewer than|no less than|en az)\s*(\d+)\s*({T})\b", low):
+        add(mins, m, int(m.group(1)), 2)
+    for m in re.finditer(rf"\b(?<!no )(?:more than|over|greater than|above)\s*(\d+)\s*({T})\b", low):
+        add(mins, m, int(m.group(1)) + 1, 2)
+    for m in re.finditer(rf"\b(?:at most|max(?:imum)?|no more than|up to|en fazla|en çok)\s*(\d+)\s*({T})\b", low):
+        add(maxes, m, int(m.group(1)), 2)
+    for m in re.finditer(rf"\b(?:fewer than|less than|under|below|altında)\s*(\d+)\s*({T})\b", low):
+        add(maxes, m, max(0, int(m.group(1)) - 1), 2)
+
+    # Trailing bound: "2 pilots or fewer" is a ceiling wearing a bare count's clothes.
+    for m in re.finditer(rf"\b(\d+)\s*({T})\b\s*(?:or\s*(?:fewer|less)|veya\s*az)", low):
+        add(maxes, m, int(m.group(1)), 2)
+
+    # Bare count — a floor. Skipped when a bound word owns the number, or the
+    # phrase is "2 pilots or fewer", both of which the patterns above already read.
+    for m in re.finditer(rf"\b(\d+)\s*({T})\b(?!\s*(?:or\s*(?:fewer|less)|veya\s*az))", low):
+        if not _crew_qualified(low, m.start()):
+            add(mins, m, int(m.group(1)), 2)
+
+    # "with a pilot aboard" / "needs an engineer" / "bir mühendis" — a floor of one.
+    # "one pilot" is already a digit by now, so this only has to cover the article.
+    for m in re.finditer(rf"\b(?:a|an|bir)\s+({T})\b(?!\s+(?:{'|'.join(_TRAIT_NOT_A_KERBAL)}))", low):
+        if m.group(1) not in _TRAIT_ARTICLE_UNSAFE:
+            add(mins, m, 1, 1)
+
+    traits: dict[str, dict] = {}
+    for name, vals in mins.items():
+        traits.setdefault(name, {})["min"] = max(vals)
+    for name, vals in maxes.items():
+        traits.setdefault(name, {})["max"] = min(vals)
+    if traits:
+        out["crew_traits"] = traits
 
 
 def _extract_part_count(text: str, out: dict) -> None:
@@ -642,7 +1065,8 @@ def _part_match_sets(constraints: dict, kind: str) -> tuple[list[str], list[str]
 
 def verify_used_parts(constraints: dict | None, used_parts: list[dict],
                       delta_v: float | None = None,
-                      crew_count: int | None = None) -> list[str]:
+                      crew_count: int | None = None,
+                      crew_traits: dict | None = None) -> list[str]:
     """
     Compare the craft's actually-used parts against the constraints and return a
     list of human-readable violation messages (empty == passes).
@@ -668,6 +1092,7 @@ def verify_used_parts(constraints: dict | None, used_parts: list[dict],
     scalar_violations = _check_part_count(constraints, len(used_parts))
     scalar_violations += _check_delta_v(constraints, delta_v)
     scalar_violations += _check_crew(constraints, crew_count)
+    scalar_violations += _check_crew_traits(constraints, crew_traits)
 
     if not used_parts:
         return scalar_violations + _missing_required(constraints, [])
@@ -750,12 +1175,59 @@ def _check_part_count(constraints: dict, count: int) -> list[str]:
 _DV_TOLERANCE = 0.005
 
 
-def verify_crew(constraints: dict | None, crew_count: int | None) -> list[str]:
-    """Standalone crew-aboard check for missions that report telemetry but no parts
+def verify_crew(constraints: dict | None, crew_count: int | None,
+                crew_traits: dict | None = None) -> list[str]:
+    """Standalone crew check for missions that report telemetry but no parts
     list (e.g. active-vessel flights). Returns violation messages (empty == passes)."""
-    if is_empty(constraints) or crew_count is None:
+    if is_empty(constraints):
         return []
-    return _check_crew(constraints, crew_count)
+    return _check_crew(constraints, crew_count) + _check_crew_traits(constraints, crew_traits)
+
+
+def _check_crew_traits(constraints: dict, crew_traits: dict | None) -> list[str]:
+    """Per-profession crew floors/ceilings, against the profession head-count the
+    client reports ({"Pilot": 2, "Engineer": 1}).
+
+    Skipped when the client reported nothing, like Δv — an older client that doesn't
+    send the field must not have every submission rejected. A client that *did*
+    report is trusted for who was aboard exactly as it is for crew_count; this is a
+    rule check, not an anti-cheat.
+
+    The violation lines match `ContractConstraints.CheckCrewTraits` word for word, so
+    the client's pre-flight and this re-check don't read as two different problems.
+    The mod-naming hint below is the twin of the client's "no mod installed here
+    defines this profession" line, worded for what each end knows: the client can
+    test its own install, this end can only say which mod the profession comes from.
+    """
+    required = constraints.get("crew_traits") or {}
+    if not required or crew_traits is None:
+        return []
+
+    have: dict[str, int] = {}
+    if isinstance(crew_traits, dict):
+        for name, count in crew_traits.items():
+            try:
+                have[str(name).strip().lower()] = int(count)
+            except (TypeError, ValueError):
+                continue
+
+    out: list[str] = []
+    for trait, bounds in required.items():
+        aboard = have.get(str(trait).lower(), 0)
+        mn, mx = bounds.get("min"), bounds.get("max")
+        if mn and aboard < mn:
+            out.append(f"Too few {trait}s aboard: {aboard} (need {mn}).")
+            # None aboard of a modded profession is usually a missing mod rather than
+            # a crewing mistake, and "0 (need 2)" on its own is true but unactionable
+            # when no kerbal in the save could ever have been one.
+            mod = trait_mod(trait)
+            if aboard == 0 and mod:
+                out.append(f"The '{trait}' profession comes from {mod} — an install "
+                           "without it cannot field one.")
+        if mx is not None and aboard > mx:
+            out.append(f"No {trait} may fly this mission: {aboard} aboard." if mx == 0
+                       else f"Too many {trait}s aboard: {aboard} (max {mx}).")
+    return out
 
 
 def _check_crew(constraints: dict, crew_count: int | None) -> list[str]:
@@ -766,8 +1238,9 @@ def _check_crew(constraints: dict, crew_count: int | None) -> list[str]:
         return out
     mx = constraints.get("max_crew")
     mn = constraints.get("min_crew")
-    if mx and crew_count > mx:
-        out.append(f"Too many crew aboard: {crew_count} (max {mx}).")
+    if mx is not None and crew_count > mx:
+        out.append(f"This mission must fly uncrewed: {crew_count} crew aboard." if mx == 0
+                   else f"Too many crew aboard: {crew_count} (max {mx}).")
     if mn and crew_count < mn:
         out.append(f"Too few crew aboard: {crew_count} (min {mn}).")
     return out
@@ -814,8 +1287,30 @@ def summary_line(constraints: dict | None) -> str | None:
         bits.append(f"max {constraints['max_dv']:.0f} m/s Δv")
     if constraints.get("min_dv"):
         bits.append(f"min {constraints['min_dv']:.0f} m/s Δv")
-    if constraints.get("max_crew"):
-        bits.append(f"max {constraints['max_crew']} crew")
+    if constraints.get("max_crew") is not None:
+        bits.append("uncrewed" if constraints["max_crew"] == 0
+                    else f"max {constraints['max_crew']} crew")
     if constraints.get("min_crew"):
         bits.append(f"min {constraints['min_crew']} crew")
+    bits.extend(crew_trait_phrases(constraints))
     return "; ".join(bits) or None
+
+
+def crew_trait_phrases(constraints: dict | None) -> list[str]:
+    """One short phrase per profession requirement ("2× Pilot", "no Tourist"), for
+    the log line, the Discord embed and anything else that has to say it out loud."""
+    out: list[str] = []
+    for trait, bounds in ((constraints or {}).get("crew_traits") or {}).items():
+        mn, mx = bounds.get("min"), bounds.get("max")
+        if mx == 0:
+            out.append(f"no {trait}")
+        elif mn and mx and mn == mx:
+            out.append(f"exactly {mn}× {trait}")
+        elif mn and mx:
+            out.append(f"{mn}–{mx}× {trait}")
+        elif mx:
+            out.append(f"up to {mx}× {trait}")
+        elif mn:
+            article = "an" if trait[:1].upper() in "AEIOU" else "a"
+            out.append(f"{mn}× {trait}" if mn > 1 else f"{article} {trait}")
+    return out

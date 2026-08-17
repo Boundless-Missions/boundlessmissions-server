@@ -34,16 +34,31 @@ _LS_NAMES = {"usi": "USI-LS", "tac": "TAC-LS", "snacks": "Snacks", "kerbalism": 
 
 
 def _crew_requirement_text(constraints: dict) -> str | None:
-    """Human phrase for a contract's min/max crew-aboard requirement, or None."""
+    """Human phrase for a contract's crew-aboard requirement — the head count, the
+    professions it names, or both — or None.
+
+    A profession from a mod gets the mod named on a second line. Nothing else in the
+    embed can say it: `modlist` is the craft's parts, and a profession has no part to
+    trace, so a contractor reading "2× Kolonist" would otherwise have to already know
+    where Kolonists come from to know whether they can take the contract at all.
+    """
     mn = constraints.get("min_crew")
     mx = constraints.get("max_crew")
-    if mn and mx:
-        return f"exactly {mn} aboard" if mn == mx else f"{mn}–{mx} aboard"
-    if mx:
-        return f"up to {mx} aboard"
-    if mn:
-        return f"at least {mn} aboard"
-    return None
+    traits = ", ".join(mc.crew_trait_phrases(constraints))
+    mods = mc.crew_trait_mod_requirements(constraints)
+    mod_line = "\n🧩 needs " + "; ".join(mods) if mods else ""
+
+    if mx == 0:
+        count = "uncrewed — nobody aboard"
+    elif mn and mx:
+        count = f"exactly {mn} aboard" if mn == mx else f"{mn}–{mx} aboard"
+    elif mx:
+        count = f"up to {mx} aboard"
+    elif mn:
+        count = f"at least {mn} aboard"
+    else:
+        return (traits + mod_line) if traits else None
+    return (f"{count} ({traits})" if traits else count) + mod_line
 
 
 def _ls_endurance_text(c: dict, constraints: dict) -> str | None:
@@ -62,6 +77,9 @@ def _ls_endurance_text(c: dict, constraints: dict) -> str | None:
     if per_kerbal <= 0:
         return f"{name} · endurance n/a"
     cap = int(c.get("ls_crew_capacity") or 0)
+    # An uncrewed contract has no endurance to report — nobody is eating.
+    if constraints.get("max_crew") == 0:
+        return None
     lo = constraints.get("min_crew") or 1
     hi = constraints.get("max_crew") or cap or lo
     lo, hi = max(1, min(lo, hi)), max(1, max(lo, hi))

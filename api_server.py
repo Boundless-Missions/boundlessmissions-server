@@ -154,6 +154,24 @@ async def _read_upload(f: UploadFile, limit: int = MAX_UPLOAD_BYTES) -> bytes:
     return b"".join(chunks)
 
 
+def _trim_log(log_bytes: bytes | None) -> bytes | None:
+    """Cap a KSP.log to a Discord-friendly attachment size. Keeps both ends: the
+    head carries the loaded-assembly/mod list and system specs, the tail carries the
+    most recent events. Only the middle is dropped, and the cut is marked.
+
+    The KSP client already trims to the same head/tail before uploading, so this is
+    normally a no-op — it stays as the backstop for a client that didn't (an older
+    one, or a device report, which uploads the whole file)."""
+    if not log_bytes or len(log_bytes) <= _LOG_HEAD_BYTES + _LOG_TAIL_BYTES:
+        return log_bytes
+    head, tail = log_bytes[:_LOG_HEAD_BYTES], log_bytes[-_LOG_TAIL_BYTES:]
+    dropped = len(log_bytes) - _LOG_HEAD_BYTES - _LOG_TAIL_BYTES
+    marker = (f"\n\n... [GeneKerman: {dropped:,} bytes of log omitted "
+              f"between the first {_LOG_HEAD_BYTES // 1_000_000} MB and "
+              f"last {_LOG_TAIL_BYTES // 1_000_000} MB] ...\n\n").encode("utf-8")
+    return head + marker + tail
+
+
 def _safe_gunzip(raw: bytes, limit: int = MAX_DECOMPRESSED_BYTES) -> bytes:
     """gzip-decompress with a hard cap on the *decompressed* size, defusing a
     decompression bomb (a few KB that expands to gigabytes). Reads at most
@@ -650,19 +668,85 @@ async def device_report(report_id: str,
     log.info("Device report %s received from user %s (mac=%s, log=%d bytes)",
              report_id, user.get("user_id"), "yes" if mac else "no",
              len(log_bytes) if log_bytes else 0)
-    # Cap the log to a Discord-friendly size. Keep both ends: the head carries the
-    # loaded-assembly/mod list and system specs (key for moderation), the tail carries
-    # the most recent events. Drop only the middle, marking where it was cut.
-    if log_bytes and len(log_bytes) > _LOG_HEAD_BYTES + _LOG_TAIL_BYTES:
-        head, tail = log_bytes[:_LOG_HEAD_BYTES], log_bytes[-_LOG_TAIL_BYTES:]
-        dropped = len(log_bytes) - _LOG_HEAD_BYTES - _LOG_TAIL_BYTES
-        marker = (f"\n\n... [GeneKerman: {dropped:,} bytes of log omitted "
-                  f"between the first {_LOG_HEAD_BYTES // 1_000_000} MB and "
-                  f"last {_LOG_TAIL_BYTES // 1_000_000} MB] ...\n\n").encode("utf-8")
-        log_bytes = head + marker + tail
-    await _post_device_report(target, mac, log_bytes)
+    await _post_device_report(target, mac, _trim_log(log_bytes))
     mark_report_done(target["_doc_id"])
     return {"success": True}
+
+
+# ── Bug reports ───────────────────────────────────────────────────────────────
+#
+# Filed from the mod's Tools tab, with the player's KSP.log optionally attached —
+# which is the whole point of doing this in-game rather than asking for a Discord
+# message: the one artefact that makes a KSP bug diagnosable is the log, and no
+# player is going to find, trim and upload a 40 MB file by hand.
+#
+# It opens a normal ticket (so the reporter can be replied to in a private channel
+# they can see) but pings the `bug_report` role rather than the mods — see
+# cogs/tickets.create_ticket's `notify_role_key`.
+
+_BUG_SUMMARY_MAX = 200
+_BUG_DETAILS_MAX = 1500
+
+
+@app.post("/api/v1/bugreport")
+async def bug_report(summary: str = Form(...),
+                     details: str = Form(default=""),
+                     mod_version: str = Form(default=""),
+                     ksp_log: UploadFile = File(default=None),
+                     user: dict = Depends(get_current_user)):
+    """File an in-game bug report as a ticket, with the client's KSP.log attached."""
+    uid = int(user["user_id"])
+    gid = int(user["guild_id"])
+    # Deliberately tight: a bug report is a human writing prose, and each one costs
+    # a channel plus a log upload. Three an hour is more than anyone reports in
+    # good faith, and the cap is per user rather than per IP because a ticket is
+    # attributable to an account.
+    _rate_limit(f"bugreport:{uid}", max_hits=3, window=3600.0)
+
+    summary = (summary or "").strip()[:_BUG_SUMMARY_MAX]
+    details = (details or "").strip()[:_BUG_DETAILS_MAX]
+    if not summary:
+        raise HTTPException(status_code=400, detail="A summary is required.")
+
+    log_bytes = _trim_log(await _read_upload(ksp_log, MAX_LOG_BYTES)) if ksp_log is not None else None
+    log.info("Bug report from user %s (%s): %r (log=%d bytes)",
+             uid, user.get("username"), summary[:80], len(log_bytes) if log_bytes else 0)
+
+    if not _bot_instance:
+        return {"success": False, "message": "The bot is not available right now."}
+    guild = _bot_instance.get_guild(gid)
+    if guild is None:
+        return {"success": False, "message": "Your Discord server is not reachable right now."}
+
+    import discord
+    from cogs.tickets import create_ticket
+
+    desc = f"**Summary**\n{summary}\n\n**Details**\n{details or '_none given_'}"
+    e = discord.Embed(
+        title="🖥️ Client",
+        description=(f"**Mod version:** `{mod_version or 'unknown'}`\n"
+                     f"**KSP.log:** {'attached below' if log_bytes else '⚠️ not attached'}"),
+        color=discord.Color.blurple(),
+    )
+    files = [discord.File(io.BytesIO(log_bytes), filename="KSP.log")] if log_bytes else []
+
+    channel = await create_ticket(
+        _bot_instance, guild,
+        opener_id=uid,
+        kind="bug",
+        title="Bug report (in-game)",
+        description=desc,
+        color=discord.Color.orange(),
+        extra_embeds=[e],
+        files=files,
+        ping_mods=False,             # bug reports are not a moderation matter
+        notify_role_key="bug_report",
+    )
+    if channel is None:
+        return {"success": False,
+                "message": "Couldn't open a ticket — the server's ticket system isn't set up."}
+    return {"success": True,
+            "message": f"Reported. A private ticket (#{channel.name}) is open in Discord."}
 
 
 @app.get("/api/v1/auth/verify", response_model=UserProfile)
@@ -1128,6 +1212,17 @@ def _classify_text_heuristic(mission_text: str) -> dict:
 _PART_CATALOGS: dict[str, dict] = {}        # "gid:uid" -> {"hash":..., "parts":[...]}
 _RESOLVE_CACHE: dict[tuple, str | None] = {}  # (catalog_hash, loose_lower) -> name|None
 
+# Names that look like parts in a listing's `parts` but never are. A .craft PART node
+# carries a `partName` field holding the Unity component class, not a part: "Part" on
+# every part there is, "CompoundPart" on struts and fuel lines, and legacy class names
+# in pre-1.0 files. Clients before the CkanGenerator fix scanned that field flat and
+# shipped those with every listing, so every craft looked like it needed a part nobody
+# on earth has installed. Fixed at the source in the mod; this keeps listings made by
+# an older client (and any still in Firestore) from raising the same false alarm.
+# Part/CompoundPart are the whole Part class hierarchy in KSP 1.12; the other three are
+# what pre-1.0 craft files still on disk write in that field.
+_NOT_PART_NAMES = frozenset({"Part", "CompoundPart", "Strut", "Winglet", "ControlSurface"})
+
 
 def _catalog_key(gid: int, uid: int) -> str:
     return f"{gid}:{uid}"
@@ -1169,7 +1264,8 @@ def _craft_compatibility(gid: int, uid: int, listing: dict) -> CraftCompatibilit
     """
     from data.part_aliases import equivalents
 
-    craft_parts = [str(p) for p in (listing.get("parts") or []) if p]
+    craft_parts = [str(p) for p in (listing.get("parts") or []) if p
+                   and str(p) not in _NOT_PART_NAMES]
     if not craft_parts:
         return CraftCompatibility(
             known=False, reason="This listing was made before crafts recorded their parts."
@@ -1329,7 +1425,22 @@ async def _classify_single_contract(gid: int, contract_id: str, mission_text: st
             "min_dv 3000; 'no more than 5000 m/s dv' => max_dv 5000.\n"
             "   - max_crew / min_crew: crew-aboard limits, or null. 'crew of 3' => "
             "min_crew 3 and max_crew 3; 'at least 2 kerbals' => min_crew 2; "
-            "'2-4 crew' => min_crew 2, max_crew 4.\n\n"
+            "'2-4 crew' => min_crew 2, max_crew 4; 'send one kerbal' => min_crew 1 and "
+            "max_crew 1. An uncrewed mission ('unmanned/uncrewed probe', 'no crew aboard') "
+            "=> max_crew 0 — 0 is a real limit here, not 'no limit', so use null (never 0) "
+            "when the text says nothing about crew. A crewed mission with no number "
+            "('a crewed flyby') => min_crew 1. Kerbals to be *rescued or returned* are not "
+            "crew limits: 'rescue 2 stranded kerbals' sets neither bound.\n"
+            "   - crew_traits: per-profession crew requirements, or {}. An object keyed by "
+            "KSP profession name with {\"min\": N} and/or {\"max\": N}: 'send two pilots and "
+            "a scientist' => {\"Pilot\": {\"min\": 2}, \"Scientist\": {\"min\": 1}}; "
+            "'at most one tourist' => {\"Tourist\": {\"max\": 1}}; 'no tourists' => "
+            "{\"Tourist\": {\"max\": 0}}; 'exactly 2 engineers' => "
+            "{\"Engineer\": {\"min\": 2, \"max\": 2}}. Stock professions are Pilot, Engineer, "
+            "Scientist, Tourist; modded ones (Kolonist, Miner, Medic, Scout, Biologist, "
+            "Quartermaster, Technician, Mechanic, Geologist, Botanist, Chemist, Farmer) are "
+            "allowed, spelled exactly like that. A bare count is a floor, not an exact "
+            "count. Kerbals to be rescued are not crew_traits either.\n\n"
             "Constraint rules:\n"
             "- 'must use / only / powered by X' => required_*. "
             "'can't use / doesn't use / does not use / no / without / X-less' => forbidden_*.\n"
@@ -1352,7 +1463,8 @@ async def _classify_single_contract(gid: int, contract_id: str, mission_text: st
             '"forbidden_propellants": [], "required_propellants": [], '
             '"forbidden_engine_categories": [], "required_engine_categories": [], '
             '"forbidden_part_categories": [], "required_part_categories": [], '
-            '"max_parts": null, "min_parts": null, "max_dv": null, "min_dv": null}}'
+            '"max_parts": null, "min_parts": null, "max_dv": null, "min_dv": null, '
+            '"max_crew": null, "min_crew": null, "crew_traits": {}}}'
         )
 
         try:
@@ -1382,13 +1494,25 @@ async def _classify_single_contract(gid: int, contract_id: str, mission_text: st
         result = _classify_text_heuristic(mission_text)
         result["constraints"] = mc.extract_heuristic(mission_text)
 
-    # Crew-aboard limits ("crew of 3", "2–4 kerbals") aren't in the AI prompt's
-    # vocabulary, so always derive them heuristically and merge in without overriding
-    # any explicit AI value. This keeps min/max-crew working whether or not AI ran.
+    # Crew-aboard limits ("crew of 3", "2–4 kerbals", "unmanned probe") are the one
+    # rule derived both ways: the heuristic runs even when the AI answered, and fills
+    # only the bounds the AI left unset. Presence is tested with `is not None`, since
+    # max_crew 0 (uncrewed) is a limit and would otherwise read as "the AI said
+    # nothing" — and then be overwritten by nothing, or overwrite a real AI answer.
     _crew = mc.extract_heuristic(mission_text)
     for _k in ("min_crew", "max_crew"):
-        if _crew.get(_k) and not result["constraints"].get(_k):
+        if _crew.get(_k) is not None and result["constraints"].get(_k) is None:
             result["constraints"][_k] = _crew[_k]
+    # Per-profession crew is filled the same way, but per profession rather than
+    # wholesale: the AI naming one ("a scientist") is no reason to drop another the
+    # text also named, and whichever source spoke first about a given profession is
+    # the one that keeps it.
+    _ai_traits = result["constraints"].setdefault("crew_traits", {})
+    for _trait, _bounds in (_crew.get("crew_traits") or {}).items():
+        _ai_traits.setdefault(_trait, _bounds)
+    if not _ai_traits:
+        result["constraints"].pop("crew_traits", None)
+    mc.resolve_conflicts(result["constraints"])
 
     # Cache result back to the contract document
     try:
@@ -1636,6 +1760,7 @@ async def get_active_contracts(user: dict = Depends(get_current_user)):
             rescue_kerbals = []
             is_modded_target = False
             rescue_vessel_node_url = None
+            rescue_pid = None
             if c.get("mission_type") == cdb.RESCUE:
                 rt = _summary_rescue_target(c, uid) or {}
                 rescue_target = RescueTarget(**rt) if rt else None
@@ -1645,6 +1770,10 @@ async def get_active_contracts(user: dict = Depends(get_current_user)):
                 # can spawn/respawn the stranded vessel on demand after accepting.
                 if c.get("contractor_id") == uid:
                     rescue_vessel_node_url = c.get("rescue_vessel_node_url")
+                # Mirror of the above for the issuer: the id of the craft they gave
+                # away, so their client can confirm it really left their save.
+                if c.get("issuer_id") == uid:
+                    rescue_pid = c.get("rescue_pid")
 
             contracts.append(ContractSummary(
                 contract_id=c["contract_id"],
@@ -1667,6 +1796,7 @@ async def get_active_contracts(user: dict = Depends(get_current_user)):
                 rescue_kerbals=rescue_kerbals,
                 is_modded_target=is_modded_target,
                 rescue_vessel_node_url=rescue_vessel_node_url,
+                rescue_pid=rescue_pid,
                 flag_preview_url=c.get("flag_preview_url"),
                 life_support=c.get("life_support", "none") or "none",
                 ls_endurance_days=float(c.get("ls_endurance_days") or 0.0),
@@ -2073,13 +2203,18 @@ async def create_auction_from_ksp(req: AuctionCreateRequest, user: dict = Depend
     if not _bot_instance:
         return ContractAcceptResponse(success=False, message="Bot is offline. Try again shortly.")
 
-    # Only the build/active types carry through to the winner's contract.
-    mission_type = req.contract_type if req.contract_type in ("craft_build", "active_vessel") else None
+    # Build / active / flag types carry through to the winner's contract; anything
+    # else (including "auto" and "rescue", which is a different endpoint) leaves it
+    # untyped. A flag design has no in-game build step, so a part restriction on one
+    # would mean nothing — dropped here as well as in the clients that send it.
+    mission_type = req.contract_type if req.contract_type in (
+        "craft_build", "active_vessel", cdb.FLAG_DESIGN) else None
+    modlist = None if mission_type == cdb.FLAG_DESIGN else req.modlist
     try:
         from cogs.auctions import open_auction
         a = await open_auction(
             _bot_instance, gid, uid, user["username"], req.mission,
-            req.start_value, req.fine, req.due_date, req.duration_hours, req.modlist,
+            req.start_value, req.fine, req.due_date, req.duration_hours, modlist,
             mission_type=mission_type,
         )
     except ValueError:
@@ -2602,6 +2737,10 @@ async def submit_contract(
     # Crew aboard, read from the submitted telemetry (active-vessel snapshot). Used by
     # the min/max-crew limit; None when no telemetry was sent (e.g. craft-build).
     crew_count = None
+    # Who was aboard by profession ({"Pilot": 2, ...}), for the per-trait rule. None
+    # when the client is too old to report it, which skips that check rather than
+    # failing it — the same contract must not start rejecting existing clients.
+    crew_traits = None
     if vessel_data:
         import json
         try:
@@ -2609,8 +2748,11 @@ async def submit_contract(
             _snap = _vd_crew.get("active_vessel") or _vd_crew
             _cc = _snap.get("crew_count")
             crew_count = int(_cc) if _cc is not None else None
+            _ct = _snap.get("crew_traits")
+            crew_traits = _ct if isinstance(_ct, dict) else None
         except Exception:
             crew_count = None
+            crew_traits = None
 
     constraint_checked = False
     if not mc.is_empty(constraints) and (used_parts or delta_v_vac):
@@ -2631,7 +2773,8 @@ async def submit_contract(
         if isinstance(parsed_parts, list):
             constraint_checked = True
             violations = mc.verify_used_parts(constraints, parsed_parts, delta_v=dv,
-                                              crew_count=crew_count)
+                                              crew_count=crew_count,
+                                              crew_traits=crew_traits)
             if violations:
                 log.info("Submission rejected for contract %s: constraint violations %s",
                          contract_id, violations)
@@ -2641,9 +2784,9 @@ async def submit_contract(
                 )
 
     # Active-vessel missions may report telemetry but no parts list; still enforce the
-    # crew-aboard limit in that case (the parts check above already covers crew when it ran).
-    if not constraint_checked and crew_count is not None:
-        crew_violations = mc.verify_crew(constraints, crew_count)
+    # crew limits in that case (the parts check above already covers crew when it ran).
+    if not constraint_checked and (crew_count is not None or crew_traits is not None):
+        crew_violations = mc.verify_crew(constraints, crew_count, crew_traits)
         if crew_violations:
             log.info("Submission rejected for contract %s: crew violations %s",
                      contract_id, crew_violations)

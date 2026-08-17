@@ -17,6 +17,15 @@ def _env_float(key: str, default: float) -> float:
         return default
 
 
+def _env_id(key: str) -> int | None:
+    """Read a Discord snowflake from .env; None when unset/blank/unparseable."""
+    raw = _os.getenv(key, "")
+    try:
+        return int(raw) if raw.strip() else None
+    except ValueError:
+        return None
+
+
 # ── Blueprint render scale ───────────────────────────────────────────────────
 #
 # The KSP mod renders vessel "blueprint" images at a fixed base size of
@@ -70,6 +79,15 @@ STORAGE_UPLOAD_USD_PER_GB: float = _env_float("STORAGE_UPLOAD_USD_PER_GB", 0.0)
 # Role ID that grants access to moderation commands (/kick, /ban, /gk setchannel, etc.)
 # If set to None, users must have Discord's built-in Kick Members or Admin permissions.
 MOD_ROLE_ID: int | None = 1492234876273823916
+
+# Role notified when an in-game bug report opens a ticket. A bug report is for
+# whoever maintains the bot and the KSP mod, which is not the same team as
+# moderation — so it is a separate role, and the mods are deliberately NOT pinged
+# for one. Read from .env because that team differs per deployment; it can also be
+# mapped per guild with `/admin setrole`. Unset (or unresolvable in the guild)
+# falls back to pinging MOD_ROLE_ID — an unread report is worse than one that
+# reached the wrong inbox.
+BUG_REPORT_ROLE_ID: int | None = _env_id("BUG_REPORT_ROLE_ID")
 
 # ── Tickets ──────────────────────────────────────────────────────────────────
 

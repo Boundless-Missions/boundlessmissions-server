@@ -32,7 +32,12 @@ S.update({
     "auc.title_open":      {"en": "🔨 Reverse Auction"},
     "auc.title_closed":    {"en": "🔨 Auction Closed"},
     "auc.title_cancelled": {"en": "🔨 Auction Cancelled"},
+    "auc.title_flag_open": {"en": "🚩 Flag Design Auction"},
     "auc.mission":         {"en": "📋 Mission"},
+    "auc.work":            {"en": "🛠️ Work"},
+    "auc.work_craft":      {"en": "Craft build — submit a blueprint from the VAB/SPH"},
+    "auc.work_active":     {"en": "Active mission — fly a craft to the target"},
+    "auc.work_flag":       {"en": "Flag design — submitted and reviewed here in Discord"},
     "auc.issuer":          {"en": "👤 Issuer"},
     "auc.start":           {"en": "🏷️ Starting Price"},
     "auc.current":         {"en": "📉 Lowest Bid"},
@@ -76,6 +81,17 @@ S.update({
 })
 
 
+# The work types an auction can pin for the winner's contract, and the line that
+# describes each on the auction card. Same set the KSP mod and the browser UI offer
+# (api_server's /auctions/create allow-list); a rescue is never auctioned, because
+# issuing one destroys the issuer's vessel for a contractor who is not known yet.
+_WORK_KEYS = {
+    "craft_build": "auc.work_craft",
+    "active_vessel": "auc.work_active",
+    cdb.FLAG_DESIGN: "auc.work_flag",
+}
+
+
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
 def _epoch(iso: str) -> int:
@@ -83,11 +99,20 @@ def _epoch(iso: str) -> int:
     return int(datetime.fromisoformat(iso).replace(tzinfo=timezone.utc).timestamp())
 
 
+def _work_line(a: dict, gid: int) -> str | None:
+    """What the winner will actually have to do, when the auction pins it. Untyped
+    auctions (the default) say nothing — there is nothing to say."""
+    key = _WORK_KEYS.get(a.get("mission_type"))
+    return t(gid, key) if key else None
+
+
 def _auction_embed(a: dict, gid: int) -> discord.Embed:
     sym = settings.CURRENCY_SYMBOL
     status = a.get("status", adb.OPEN)
+    is_flag = a.get("mission_type") == cdb.FLAG_DESIGN
     if status == adb.OPEN:
-        title, color = t(gid, "auc.title_open"), discord.Color.gold()
+        title = t(gid, "auc.title_flag_open") if is_flag else t(gid, "auc.title_open")
+        color = discord.Color.gold()
     elif status == adb.CLOSED:
         title, color = t(gid, "auc.title_closed"), discord.Color.green()
     else:
@@ -95,6 +120,11 @@ def _auction_embed(a: dict, gid: int) -> discord.Embed:
 
     e = discord.Embed(title=title, color=color)
     e.add_field(name=t(gid, "auc.mission"), value=a["mission"], inline=False)
+    # Bidders price the job, so the kind of job has to be on the card — a flag design
+    # is not bid the way a craft build is, and it is submitted somewhere else.
+    work = _work_line(a, gid)
+    if work:
+        e.add_field(name=t(gid, "auc.work"), value=work, inline=False)
     e.add_field(name=t(gid, "auc.issuer"), value=a["issuer_name"], inline=True)
     e.add_field(name=t(gid, "auc.start"), value=f"**{a['start_value']}** {sym}", inline=True)
 
@@ -414,11 +444,18 @@ class Auctions(commands.Cog, name="Auctions"):
         duration_hours="How many hours the auction runs",
         fine="Fine if the winner breaches the contract (default 0)",
         mods="Mods required / limited to (optional)",
+        work="What the winner has to deliver (default: let the server classify it)",
     )
+    @app_commands.choices(work=[
+        app_commands.Choice(name="Craft build", value="craft_build"),
+        app_commands.Choice(name="Active mission", value="active_vessel"),
+        app_commands.Choice(name="Flag design", value=cdb.FLAG_DESIGN),
+    ])
     async def auction(
         self, interaction: discord.Interaction,
         mission: str, start_value: int, date_due: str, duration_hours: int,
         fine: int = 0, mods: str | None = None,
+        work: app_commands.Choice[str] | None = None,
     ):
         gid, uid = interaction.guild_id, interaction.user.id
         sym = settings.CURRENCY_SYMBOL
@@ -458,10 +495,17 @@ class Auctions(commands.Cog, name="Auctions"):
                 tp(gid, uid, "auc.err_limit", max=settings.MAX_ACTIVE_CONTRACTS_PER_USER), ephemeral=True)
             return
 
+        # A flag has no in-game build step, so a part restriction on one would mean
+        # nothing — dropped rather than carried onto the winner's contract unused.
+        mission_type = work.value if work else None
+        if mission_type == cdb.FLAG_DESIGN:
+            mods = None
+
         # Escrow + create + post (leftover escrow is refunded when the auction closes).
         try:
             a = await open_auction(self.bot, gid, uid, interaction.user.display_name,
-                                   mission, start_value, fine, date_due, duration_hours, mods)
+                                   mission, start_value, fine, date_due, duration_hours, mods,
+                                   mission_type=mission_type)
         except Exception as exc:
             log.error("Failed to post auction: %s", exc)
             await interaction.followup.send(tp(gid, uid, "auc.err_post"), ephemeral=True)

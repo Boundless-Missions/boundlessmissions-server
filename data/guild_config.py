@@ -62,6 +62,8 @@ def role_label(key: str) -> str:
         return "🔔 Notifications (self-assign ping role)"
     if key == "mod":
         return "🛡️ Moderator role"
+    if key == "bug_report":
+        return "🐛 Bug-report role (pinged by in-game bug reports)"
     if key.startswith("level_"):
         try:
             lvl = int(key.split("_", 1)[1])
@@ -78,6 +80,7 @@ def all_role_keys() -> list[str]:
     keys = [_level_role_key(lvl) for lvl in sorted(settings.LEVEL_ROLES)]
     keys.append("notifications")
     keys.append("mod")
+    keys.append("bug_report")
     return keys
 
 
@@ -112,6 +115,8 @@ def _channel_default(key: str) -> int | None:
 def _role_default(key: str) -> int | None:
     if key == "mod":
         return settings.MOD_ROLE_ID
+    if key == "bug_report":
+        return settings.BUG_REPORT_ROLE_ID
     if key.startswith("level_"):
         try:
             lvl = int(key.split("_", 1)[1])
