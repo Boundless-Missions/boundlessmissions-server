@@ -108,6 +108,13 @@ class _GuardedRef:
 
         return method
 
+    def __setattr__(self, name, value):
+        # See _GuardedBlob.__setattr__: a __slots__-only proxy with no __setattr__
+        # turns every attribute write into a confusing AttributeError about the
+        # proxy rather than passing it to the wrapped object. Nothing assigns
+        # through this proxy today; this is here so nothing has to discover that.
+        setattr(self._obj, name, value)
+
     # Delegate the handful of dunders Firestore objects rely on.
     def __eq__(self, other):
         other = other._obj if isinstance(other, _GuardedRef) else other
@@ -151,6 +158,16 @@ class _GuardedBlob:
 
         return method
 
+    def __setattr__(self, name, value):
+        # Blob metadata (content_disposition, cache_control, content_type, …) is
+        # set by plain attribute assignment before the upload. This proxy is
+        # __slots__-only and __getattr__ covers reads alone, so without this the
+        # write would try to land on the proxy itself and raise AttributeError
+        # rather than reach the blob. Nothing is gated or metered here: the write
+        # is local, and the network round-trip it prepares (upload_*/patch) is
+        # already gated above.
+        setattr(self._blob, name, value)
+
 
 class _GuardedBucket:
     """Proxy over a Storage Bucket so every .blob() is metered/gated."""
@@ -167,6 +184,11 @@ class _GuardedBucket:
                 return _GuardedBlob(attr(*args, **kwargs))
             return blob
         return attr
+
+    def __setattr__(self, name, value):
+        # Same reason as _GuardedBlob.__setattr__ — writes must reach the bucket
+        # instead of dying on the __slots__-only proxy.
+        setattr(self._bucket, name, value)
 
     def __bool__(self):
         return self._bucket is not None

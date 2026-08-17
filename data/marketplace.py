@@ -129,6 +129,12 @@ def list_by_buyer(buyer_id: int) -> list[ListingData]:
     ]
 
 
+def list_all() -> list[ListingData]:
+    """Every listing regardless of status or seller — the owner admin console's
+    view (it must see delisted crafts to be able to moderate them)."""
+    return [doc.to_dict() for doc in _col().stream()]
+
+
 def delete_listing(listing_id: str) -> None:
     """Permanently remove a listing: its Storage files (craft + blueprint, the whole
     marketplace/{id}/ prefix) and the Firestore document. Best-effort on Storage so a

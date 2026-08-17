@@ -25,6 +25,7 @@ from fastapi import (
 )
 from fastapi.middleware.cors import CORSMiddleware
 from firebase_admin import firestore
+from pydantic import BaseModel
 
 import settings
 from config import cfg
@@ -3779,6 +3780,7 @@ async def web_profile(user: dict = Depends(get_user_token_only)):
         messages=u.get("messages", 0),
         unlocked_levels=u.get("unlocked_levels", []),
         currency_name=settings.CURRENCY_NAME,
+        is_owner=_is_owner_id(user["user_id"]),
     )
 
 
@@ -4273,6 +4275,541 @@ async def web_marketplace_delete(listing_id: str, user: dict = Depends(get_user_
 
     mkt.delete_listing(listing_id)
     return MarketplaceListResult(success=True, message="Craft permanently deleted.", listing_id=listing_id)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Owner Admin API (/api/v1/web/admin/...)
+#
+#  The website's developer console. Every endpoint here is gated on the single
+#  BOT_OWNER_ID from .env — the same one person cogs/perms.is_owner trusts — and
+#  answers 404 (not 403) to anyone else, so the surface is invisible to a probing
+#  non-owner with a valid session. The website only *hides* the tab client-side;
+#  this dependency is the actual gate.
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _is_owner_id(user_id) -> bool:
+    """True only when this is the configured owner. OWNER_ID=0 (unset) matches
+    nobody — an unconfigured bot has no admin, not an open one."""
+    return bool(cfg.OWNER_ID) and str(user_id) == str(cfg.OWNER_ID)
+
+
+async def get_owner(user: dict = Depends(get_user_token_only)) -> dict:
+    if not _is_owner_id(user.get("user_id")):
+        raise HTTPException(status_code=404, detail="Not found")
+    _rate_limit(f"admin:{user['user_id']}", max_hits=240, window=60.0)
+    return user
+
+
+def _require_bot():
+    """The live discord.py Bot, or 503 — most admin actions act through Discord."""
+    if _bot_instance is None:
+        raise HTTPException(status_code=503, detail="The Discord bot is not connected yet. Try again in a moment.")
+    return _bot_instance
+
+
+def _admin_audit(user: dict, action: str, detail: str = ""):
+    """One log line per admin action; the audit trail for the master console."""
+    log.warning("ADMIN[%s]: %s %s", user.get("username", user.get("user_id")), action, detail)
+
+
+# ── Request bodies (admin-only; kept local rather than in api_models) ─────────
+
+class AdminListingEdit(BaseModel):
+    craft_name: Optional[str] = None
+    price: Optional[int] = None
+    seller_name: Optional[str] = None
+    status: Optional[str] = None  # "active" | "delisted"
+
+class AdminUserAdjust(BaseModel):
+    balance_delta: Optional[int] = None
+    balance_set: Optional[int] = None
+    xp_set: Optional[int] = None
+
+class AdminDirectMessage(BaseModel):
+    user_id: str
+    title: str = ""
+    content: str
+
+class AdminAnnounce(BaseModel):
+    guild_id: str
+    channel_id: Optional[str] = None
+    role_id: Optional[str] = None
+    title: str
+    content: str
+    # False → one embed in channel_id (mentioning role_id if given).
+    # True  → open a private ticket per member of role_id carrying the message.
+    open_tickets: bool = False
+
+class AdminChannelLock(BaseModel):
+    guild_id: str
+    locked: bool
+    reason: str = ""
+
+class AdminControls(BaseModel):
+    version_check_enabled: Optional[bool] = None
+    device_binding_enabled: Optional[bool] = None
+
+class AdminPolicyBump(BaseModel):
+    summary: str = ""
+    privacy_url: Optional[str] = None
+    terms_url: Optional[str] = None
+
+
+@app.get("/api/v1/web/admin/whoami")
+async def admin_whoami(user: dict = Depends(get_owner)):
+    """200 only for the owner (404 for everyone else) — the website's cheap
+    'should I draw the Admin tab' probe."""
+    return {"is_owner": True, "user_id": user["user_id"], "username": user["username"]}
+
+
+@app.get("/api/v1/web/admin/overview")
+async def admin_overview(user: dict = Depends(get_owner)):
+    """Dashboard numbers: community size, market size, gate + version state."""
+    bot = _bot_instance
+    guilds = []
+    if bot is not None:
+        for g in bot.guilds:
+            guilds.append({"id": str(g.id), "name": g.name,
+                           "member_count": g.member_count or 0})
+    listings = mkt.list_all()
+    mv = mver.get_config()
+    return {
+        "users": len(store.get_all_users(0)),
+        "listings_active": sum(1 for l in listings if l.get("status") == mkt.ACTIVE),
+        "listings_delisted": sum(1 for l in listings if l.get("status") != mkt.ACTIVE),
+        "guilds": guilds,
+        "mod_version": {
+            "latest_version": mv.get("latest_version"),
+            "latest_hash": mv.get("latest_hash"),
+            "has_dll": bool(mv.get("has_dll")),
+            "updated_at": mv.get("updated_at"),
+        },
+        "policy_version": policy.get_version(),
+        "version_check_enabled": cfg.KSP_VERSION_CHECK_ENABLED,
+        "device_binding_enabled": cfg.KSP_DEVICE_BINDING_ENABLED,
+    }
+
+
+# ── Marketplace moderation ────────────────────────────────────────────────────
+
+@app.get("/api/v1/web/admin/listings")
+async def admin_listings(q: str = "", user: dict = Depends(get_owner)):
+    """Every listing, any seller, any status — newest first."""
+    items = mkt.list_all()
+    if q.strip():
+        needle = q.strip().lower()
+        items = [l for l in items
+                 if needle in (l.get("craft_name", "") or "").lower()
+                 or needle in (l.get("seller_name", "") or "").lower()
+                 or needle in (l.get("listing_id", "") or "").lower()
+                 or needle == str(l.get("seller_id", ""))]
+    items.sort(key=lambda l: l.get("created_at") or "", reverse=True)
+    return {"listings": [_listing_to_model(l).model_dump() for l in items]}
+
+
+async def _admin_refresh_mirrors(listing: dict, listing_id: str, verb: str):
+    """Best-effort re-render of the listing's Discord mirror messages."""
+    if _bot_instance is None:
+        return
+    try:
+        from cogs.marketplace import edit_all_mirrors
+        await edit_all_mirrors(_bot_instance, listing)
+    except Exception as exc:
+        log.warning("admin %s: could not update mirrors for %s: %s", verb, listing_id, exc)
+
+
+@app.patch("/api/v1/web/admin/listings/{listing_id}")
+async def admin_edit_listing(listing_id: str, req: AdminListingEdit,
+                             user: dict = Depends(get_owner)):
+    """Edit any listing's name / price / status regardless of who owns it."""
+    listing = mkt.get_listing(0, listing_id)
+    if not listing:
+        raise HTTPException(status_code=404, detail="Listing not found")
+
+    fields: dict = {}
+    if req.craft_name is not None and req.craft_name.strip():
+        fields["craft_name"] = req.craft_name.strip()[:100]
+    if req.price is not None:
+        if req.price < 0:
+            raise HTTPException(status_code=422, detail="Price cannot be negative.")
+        fields["price"] = int(req.price)
+    if req.seller_name is not None and req.seller_name.strip():
+        fields["seller_name"] = req.seller_name.strip()[:100]
+    if req.status is not None:
+        if req.status not in (mkt.ACTIVE, mkt.DELISTED):
+            raise HTTPException(status_code=422, detail="Status must be 'active' or 'delisted'.")
+        fields["status"] = req.status
+    if not fields:
+        raise HTTPException(status_code=422, detail="Nothing to change.")
+
+    mkt.update_listing(0, listing_id, **fields)
+    listing.update(fields)
+    _admin_audit(user, "edit-listing", f"{listing_id} {fields}")
+    await _admin_refresh_mirrors(listing, listing_id, "edit-listing")
+    return {"success": True, "listing": _listing_to_model(listing).model_dump()}
+
+
+@app.delete("/api/v1/web/admin/listings/{listing_id}")
+async def admin_delete_listing(listing_id: str, user: dict = Depends(get_owner)):
+    """Permanently delete any listing: Discord mirrors, Storage files, document."""
+    listing = mkt.get_listing(0, listing_id)
+    if not listing:
+        raise HTTPException(status_code=404, detail="Listing not found")
+    if _bot_instance is not None:
+        try:
+            from cogs.marketplace import delete_all_mirrors
+            await delete_all_mirrors(_bot_instance, listing)
+        except Exception as exc:
+            log.warning("admin delete-listing: could not remove mirrors for %s: %s", listing_id, exc)
+    mkt.delete_listing(listing_id)
+    _admin_audit(user, "delete-listing", f"{listing_id} ({listing.get('craft_name')})")
+    return {"success": True}
+
+
+# ── User accounts ─────────────────────────────────────────────────────────────
+
+def _admin_user_row(uid: str, u: dict) -> dict:
+    name = u.get("username", "")
+    if not name and _bot_instance is not None:
+        du = _bot_instance.get_user(int(uid)) if uid.isdigit() else None
+        name = str(du) if du else ""
+    return {
+        "user_id": uid,
+        "username": name,
+        "xp": u.get("xp", 0),
+        "level": u.get("level", 0),
+        "balance": u.get("balance", 0),
+        "messages": u.get("messages", 0),
+        "rescues": u.get("rescues", 0),
+        "joined_at": u.get("joined_at", ""),
+    }
+
+
+@app.get("/api/v1/web/admin/users")
+async def admin_users(q: str = "", limit: int = 50, user: dict = Depends(get_owner)):
+    """Search the global wallet store by id or name; no query → richest first."""
+    needle = q.strip().lower()
+    rows = []
+    for uid, u in store.get_all_users(0).items():
+        row = _admin_user_row(uid, u)
+        if needle and needle not in uid and needle not in row["username"].lower():
+            continue
+        rows.append(row)
+    rows.sort(key=lambda r: r["balance"], reverse=True)
+    return {"users": rows[:max(1, min(limit, 200))], "total": len(rows)}
+
+
+@app.post("/api/v1/web/admin/users/{user_id}/adjust")
+async def admin_user_adjust(user_id: str, req: AdminUserAdjust,
+                            user: dict = Depends(get_owner)):
+    """Set or shift a user's balance / XP. balance_set wins over balance_delta."""
+    if not user_id.isdigit():
+        raise HTTPException(status_code=422, detail="user_id must be a Discord id.")
+    # Only touch users that exist — get_user() would mint a default record for a
+    # typo'd id and the auto-save would then persist the ghost.
+    if user_id not in store.get_all_users(0):
+        raise HTTPException(status_code=404, detail="No such user in the store.")
+    uid = int(user_id)
+    u = store.get_user(0, uid)
+
+    if req.balance_set is not None:
+        await store.add_balance(0, uid, int(req.balance_set) - u.get("balance", 0))
+    elif req.balance_delta:
+        await store.add_balance(0, uid, int(req.balance_delta))
+    if req.xp_set is not None:
+        await store.set_xp(0, uid, max(0, int(req.xp_set)))
+
+    _admin_audit(user, "adjust-user",
+                 f"{user_id} balance_set={req.balance_set} balance_delta={req.balance_delta} xp_set={req.xp_set}")
+    return {"success": True, "user": _admin_user_row(user_id, store.get_user(0, uid))}
+
+
+@app.post("/api/v1/web/admin/users/{user_id}/logout_all")
+async def admin_user_logout_all(user_id: str, user: dict = Depends(get_owner)):
+    """Revoke every session token the user holds (KSP clients + website)."""
+    version = logout_all_devices(user_id)
+    _admin_audit(user, "logout-all", user_id)
+    return {"success": True, "token_version": version}
+
+
+@app.delete("/api/v1/web/admin/users/{user_id}")
+async def admin_user_delete(user_id: str, user: dict = Depends(get_owner)):
+    """Erase a user's global record (XP, balance, levels) and revoke all their
+    sessions. The owner cannot delete their own account from here — that would
+    orphan the console mid-request."""
+    if not user_id.isdigit():
+        raise HTTPException(status_code=422, detail="user_id must be a Discord id.")
+    if _is_owner_id(user_id):
+        raise HTTPException(status_code=422, detail="Refusing to delete the owner account.")
+    existed = await store.delete_user(0, int(user_id))
+    try:
+        logout_all_devices(user_id)
+    except Exception as exc:
+        log.warning("admin delete-user: could not revoke sessions for %s: %s", user_id, exc)
+    _admin_audit(user, "delete-user", f"{user_id} existed={existed}")
+    return {"success": True, "existed": existed}
+
+
+# ── Messaging ─────────────────────────────────────────────────────────────────
+
+@app.post("/api/v1/web/admin/message")
+async def admin_direct_message(req: AdminDirectMessage, user: dict = Depends(get_owner)):
+    """DM a player from the bot account (an official-channel message)."""
+    import discord
+    bot = _require_bot()
+    if not req.content.strip():
+        raise HTTPException(status_code=422, detail="Message content is empty.")
+    if not req.user_id.isdigit():
+        raise HTTPException(status_code=422, detail="user_id must be a Discord id.")
+    try:
+        target = bot.get_user(int(req.user_id)) or await bot.fetch_user(int(req.user_id))
+        embed = discord.Embed(
+            title=req.title.strip() or "📣 Message from the Boundless Missions team",
+            description=req.content.strip()[:3900],
+            color=discord.Color.blurple(),
+        )
+        embed.set_footer(text="Sent by the community administrator")
+        await target.send(embed=embed)
+    except discord.NotFound:
+        raise HTTPException(status_code=404, detail="No Discord user with that id.")
+    except discord.Forbidden:
+        raise HTTPException(status_code=409, detail="That user does not accept DMs from the bot.")
+    _admin_audit(user, "dm", req.user_id)
+    return {"success": True}
+
+
+async def _announce_via_tickets(bot, guild, role, title: str, content: str, admin_name: str):
+    """Open one private ticket per role member carrying the announcement. Runs as
+    a background task: channel creation is heavily rate-limited by Discord, so a
+    big role takes minutes — the HTTP request must not wait for it."""
+    import discord
+    from cogs.tickets import create_ticket
+    opened = 0
+    for member in list(role.members):
+        if member.bot:
+            continue
+        try:
+            ch = await create_ticket(
+                bot, guild,
+                opener_id=member.id,
+                kind="announcement",
+                title=title,
+                description=content,
+                color=discord.Color.gold(),
+                ping_mods=False,
+            )
+            if ch is not None:
+                opened += 1
+        except Exception as exc:
+            log.warning("announce ticket for %s failed: %s", member.id, exc)
+        await asyncio.sleep(1.5)  # stay far under the channel-create rate limit
+    log.warning("ADMIN[%s]: announce-tickets done — %d/%d tickets opened for role %s",
+                admin_name, opened, len(role.members), role.name)
+
+
+@app.post("/api/v1/web/admin/announce")
+async def admin_announce(req: AdminAnnounce, user: dict = Depends(get_owner)):
+    """Announce to a channel (optionally pinging a role), or — open_tickets —
+    open a private ticket panel per member of the role with the message."""
+    import discord
+    bot = _require_bot()
+    guild = bot.get_guild(int(req.guild_id)) if req.guild_id.isdigit() else None
+    if guild is None:
+        raise HTTPException(status_code=404, detail="The bot is not in that guild.")
+    if not req.content.strip():
+        raise HTTPException(status_code=422, detail="Announcement content is empty.")
+
+    role = None
+    if req.role_id and req.role_id.isdigit():
+        role = guild.get_role(int(req.role_id))
+        if role is None:
+            raise HTTPException(status_code=404, detail="No such role in that guild.")
+
+    if req.open_tickets:
+        if role is None:
+            raise HTTPException(status_code=422, detail="Opening tickets needs a role.")
+        members = [m for m in role.members if not m.bot]
+        if not members:
+            raise HTTPException(status_code=422, detail="That role has no (non-bot) members the bot can see.")
+        if len(members) > 200:
+            raise HTTPException(status_code=422,
+                                detail=f"Refusing to open {len(members)} tickets at once (cap is 200).")
+        asyncio.create_task(_announce_via_tickets(
+            bot, guild, role, req.title.strip() or "📣 Announcement",
+            req.content.strip(), user.get("username", "owner")))
+        _admin_audit(user, "announce-tickets", f"guild={req.guild_id} role={req.role_id} members={len(members)}")
+        return {"success": True, "mode": "tickets", "targets": len(members)}
+
+    if not req.channel_id or not req.channel_id.isdigit():
+        raise HTTPException(status_code=422, detail="A channel is required for a channel announcement.")
+    channel = guild.get_channel(int(req.channel_id))
+    if not isinstance(channel, discord.TextChannel):
+        raise HTTPException(status_code=404, detail="No such text channel in that guild.")
+
+    embed = discord.Embed(
+        title=req.title.strip() or "📣 Announcement",
+        description=req.content.strip()[:3900],
+        color=discord.Color.gold(),
+    )
+    embed.set_footer(text="Official announcement")
+    try:
+        await channel.send(content=role.mention if role else None, embed=embed)
+    except discord.Forbidden:
+        raise HTTPException(status_code=409, detail="The bot cannot post in that channel.")
+    _admin_audit(user, "announce", f"guild={req.guild_id} channel={req.channel_id} role={req.role_id}")
+    return {"success": True, "mode": "channel"}
+
+
+# ── Guild structure (pickers) + channel locks ────────────────────────────────
+
+@app.get("/api/v1/web/admin/guilds")
+async def admin_guilds(user: dict = Depends(get_owner)):
+    """Guilds with their text channels and roles — feeds the console's pickers.
+    A channel is 'locked' when @everyone's send_messages overwrite is False."""
+    import discord
+    bot = _require_bot()
+    out = []
+    for g in bot.guilds:
+        channels = []
+        for ch in g.text_channels:
+            ow = ch.overwrites_for(g.default_role)
+            channels.append({
+                "id": str(ch.id), "name": ch.name,
+                "category": ch.category.name if ch.category else None,
+                "locked": ow.send_messages is False,
+            })
+        roles = [{"id": str(r.id), "name": r.name, "members": len(r.members)}
+                 for r in g.roles if not r.is_default() and not r.managed]
+        roles.reverse()  # highest role first, matches Discord's own ordering
+        out.append({"id": str(g.id), "name": g.name,
+                    "member_count": g.member_count or 0,
+                    "channels": channels, "roles": roles})
+    return {"guilds": out}
+
+
+@app.post("/api/v1/web/admin/channels/{channel_id}/lock")
+async def admin_channel_lock(channel_id: str, req: AdminChannelLock,
+                             user: dict = Depends(get_owner)):
+    """Lock (or unlock) a text channel by flipping @everyone's send permission.
+    Unlock resets the overwrite to neutral rather than forcing True, so category
+    and role permissions come back exactly as they were."""
+    import discord
+    bot = _require_bot()
+    guild = bot.get_guild(int(req.guild_id)) if req.guild_id.isdigit() else None
+    if guild is None:
+        raise HTTPException(status_code=404, detail="The bot is not in that guild.")
+    channel = guild.get_channel(int(channel_id)) if channel_id.isdigit() else None
+    if not isinstance(channel, discord.TextChannel):
+        raise HTTPException(status_code=404, detail="No such text channel in that guild.")
+
+    overwrite = channel.overwrites_for(guild.default_role)
+    overwrite.send_messages = False if req.locked else None
+    overwrite.create_public_threads = False if req.locked else None
+    overwrite.create_private_threads = False if req.locked else None
+    if overwrite.is_empty():
+        overwrite = None
+    try:
+        await channel.set_permissions(
+            guild.default_role, overwrite=overwrite,
+            reason=req.reason or f"Remote {'lock' if req.locked else 'unlock'} from the admin console")
+        if req.locked:
+            embed = discord.Embed(
+                description="🔒 This channel has been locked by an administrator.",
+                color=discord.Color.red())
+            await channel.send(embed=embed)
+    except discord.Forbidden:
+        raise HTTPException(status_code=409, detail="The bot lacks permission to edit that channel.")
+    _admin_audit(user, "channel-lock" if req.locked else "channel-unlock",
+                 f"guild={req.guild_id} channel={channel_id} reason={req.reason!r}")
+    return {"success": True, "locked": req.locked}
+
+
+# ── Mod version / DLL publishing ─────────────────────────────────────────────
+
+@app.get("/api/v1/web/admin/modversion")
+async def admin_modversion(user: dict = Depends(get_owner)):
+    return {"config": mver.get_config()}
+
+
+@app.post("/api/v1/web/admin/modversion/publish")
+async def admin_publish_version(
+    version: str = Form(...),
+    download_url: str = Form(""),
+    set_latest: bool = Form(True),
+    sha256: str = Form(""),
+    dll: UploadFile | None = File(None),
+    user: dict = Depends(get_owner),
+):
+    """Publish a mod version from the website — the web twin of /publishversion.
+    Upload the DLL itself (preferred: enables challenge-response attestation and
+    auto-computes the hash) or provide a bare sha256."""
+    if not version.strip():
+        raise HTTPException(status_code=422, detail="A version label is required.")
+    dll_bytes = None
+    digest = sha256.strip().lower()
+    if dll is not None:
+        dll_bytes = await dll.read()
+        if not dll_bytes:
+            raise HTTPException(status_code=422, detail="The uploaded DLL is empty.")
+        if len(dll_bytes) > 20 * 1024 * 1024:
+            raise HTTPException(status_code=413, detail="That file is too large to be GeneKerman.dll.")
+        digest = hashlib.sha256(dll_bytes).hexdigest()
+    if not digest:
+        raise HTTPException(status_code=422, detail="Provide either a DLL upload or a sha256 hash.")
+
+    record = await asyncio.to_thread(
+        mver.publish_version, version, digest, download_url, set_latest,
+        f"{user['username']} (web console)", dll_bytes)
+    if set_latest or record.get("latest_version") == version.strip():
+        broadcast_version_update()
+    _admin_audit(user, "publish-version",
+                 f"{version} sha256={digest[:12]} latest={set_latest} dll={'yes' if dll_bytes else 'no'}")
+    return {"success": True, "config": record}
+
+
+# ── Master controls ──────────────────────────────────────────────────────────
+
+@app.get("/api/v1/web/admin/controls")
+async def admin_controls(user: dict = Depends(get_owner)):
+    return {
+        "version_check_enabled": cfg.KSP_VERSION_CHECK_ENABLED,
+        "device_binding_enabled": cfg.KSP_DEVICE_BINDING_ENABLED,
+        "policy": policy.get_config(),
+        "policy_version": policy.get_version(),
+    }
+
+
+@app.post("/api/v1/web/admin/controls")
+async def admin_set_controls(req: AdminControls, user: dict = Depends(get_owner)):
+    """Flip the runtime gates. These change the running process only — .env is
+    the boot-time source of truth, so a restart reverts them (said in the reply,
+    so the console can show it)."""
+    if req.version_check_enabled is not None:
+        cfg.KSP_VERSION_CHECK_ENABLED = bool(req.version_check_enabled)
+        broadcast_version_update()
+    if req.device_binding_enabled is not None:
+        cfg.KSP_DEVICE_BINDING_ENABLED = bool(req.device_binding_enabled)
+    _admin_audit(user, "controls",
+                 f"version_check={req.version_check_enabled} device_binding={req.device_binding_enabled}")
+    return {
+        "success": True,
+        "persisted": False,
+        "version_check_enabled": cfg.KSP_VERSION_CHECK_ENABLED,
+        "device_binding_enabled": cfg.KSP_DEVICE_BINDING_ENABLED,
+    }
+
+
+@app.post("/api/v1/web/admin/policy/bump")
+async def admin_policy_bump(req: AdminPolicyBump, user: dict = Depends(get_owner)):
+    """Raise the policy version by one: every KSP client that accepted an older
+    version re-raises its consent gate and stops transmitting until re-accepted."""
+    new_version = policy.get_version() + 1
+    doc = await asyncio.to_thread(
+        policy.set_version, new_version, f"{user['username']} (web console)",
+        req.summary or None, req.privacy_url, req.terms_url)
+    broadcast_policy_update()
+    _admin_audit(user, "policy-bump", f"→ v{new_version}")
+    return {"success": True, "policy": doc}
 
 
 # ── Checkpoint Hero Shots ─────────────────────────────────────────────────────

@@ -95,6 +95,9 @@ class UserProfile(BaseModel):
     messages: int = 0
     unlocked_levels: list[int] = []
     currency_name: str = "KCoins"
+    # True only for the single BOT_OWNER_ID account. The website uses it to decide
+    # whether to draw the Admin tab; every admin endpoint re-checks server-side.
+    is_owner: bool = False
 
 
 # ── Missions ─────────────────────────────────────────────────────────────────
