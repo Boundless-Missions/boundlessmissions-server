@@ -48,6 +48,7 @@ from api_models import (
     Notification, NotificationsResponse,
     MarketplaceListResult, MarketplaceListing, MarketplaceListingsResponse,
     MarketplaceListingsPage, WebBuyResult, CraftCompatibility,
+    VoteRequest, VoteResult, MyVotesResponse, ReportRequest, ReportResult,
     VersionCheckResponse,
     AttestChallenge, AttestRespondRequest, AttestResult,
 )
@@ -3398,6 +3399,12 @@ async def craft_imports_pending(user: dict = Depends(get_current_user)):
 
     imports = []
     for e in imp.list_pending(gid, uid):
+        # A friend quicksend awaiting the recipient's accept/decline is not in the
+        # auto-import queue yet — it only joins once accepted (status → "queued").
+        # Entries written before the status field existed have none and auto-import
+        # as they always did.
+        if (e.get("status") or "queued") == "offered":
+            continue
         # dedup_key lets the mod skip an entry it already processed into this save.
         dedup = e["ref_id"] if e.get("source") == "contract" else f"{e.get('source')}:{e['ref_id']}"
         imports.append({**e, "dedup_key": dedup})
@@ -3415,9 +3422,71 @@ async def craft_import_done(import_id: str, user: dict = Depends(get_current_use
     return {"success": deleted}
 
 
+# ── Friend-quicksend offers ───────────────────────────────────────────────────
+# A quicksent craft is an unsolicited push into someone's save, so unlike the
+# imports the player queued themselves (contract/market/library — already an
+# explicit request in Discord) it waits here for an in-game accept or decline.
+
+
+@app.get("/api/v1/craft/gifts/pending")
+async def craft_gifts_pending(user: dict = Depends(get_current_user)):
+    """Quicksent crafts awaiting this player's accept/decline decision."""
+    gid = int(user["guild_id"])
+    uid = int(user["user_id"])
+    gifts = [e for e in imp.list_pending(gid, uid)
+             if (e.get("status") or "queued") == "offered"]
+    gifts.sort(key=lambda x: x.get("created_at") or "")
+    return {"gifts": gifts}
+
+
+@app.post("/api/v1/craft/gifts/{import_id}/accept")
+async def craft_gift_accept(import_id: str, user: dict = Depends(get_current_user)):
+    """Accept an offered gift: it joins the normal auto-import queue.
+
+    The client usually imports it on the spot from the returned entry; the queue
+    is the fallback for the scenes where a live vessel can't spawn (the accept
+    happened in the VAB, say) — the next poll in a safe scene delivers it.
+    """
+    gid = int(user["guild_id"])
+    uid = int(user["user_id"])
+    entry = imp.get(gid, uid, import_id)
+    if entry is None or (entry.get("status") or "queued") != "offered":
+        return {"success": False, "message": "That offer is no longer there."}
+
+    imp.set_status(gid, uid, import_id, "queued")
+    entry["status"] = "queued"
+    entry["dedup_key"] = f"{entry.get('source')}:{entry['ref_id']}"
+    return {"success": True, "entry": entry}
+
+
+@app.post("/api/v1/craft/gifts/{import_id}/reject")
+async def craft_gift_reject(import_id: str, user: dict = Depends(get_current_user)):
+    """Decline an offered gift: the entry and its files go away, the sender hears."""
+    gid = int(user["guild_id"])
+    uid = int(user["user_id"])
+    entry = imp.get(gid, uid, import_id)
+    if entry is None or (entry.get("status") or "queued") != "offered":
+        return {"success": False, "message": "That offer is no longer there."}
+
+    imp.delete(gid, uid, import_id)
+    await asyncio.to_thread(imp.delete_gift_files, entry["ref_id"])
+
+    sender_id = entry.get("sender_id")
+    if sender_id:
+        _create_notification(
+            gid, int(sender_id), "craft_gift_declined",
+            "📪 Craft Declined",
+            f"{user['username']} declined the craft you sent: "
+            f"{entry.get('craft_name') or 'Craft'}.",
+            {"craft_name": entry.get("craft_name") or ""},
+        )
+    return {"success": True, "message": "Declined."}
+
+
 @app.post("/api/v1/craft/send")
 async def craft_send_to_friend(
     file: UploadFile = File(...),
+    blueprint: Optional[UploadFile] = File(None),
     recipient_id: str = Form(...),
     kind: str = Form("craft"),
     craft_name: str = Form("Craft"),
@@ -3426,10 +3495,12 @@ async def craft_send_to_friend(
     """Quicksend a craft/vessel from the KSP mod's Tools tab to another player.
 
     kind="vessel" delivers a LIVE vessel (the recipient's client spawns it in their
-    save); kind="craft" delivers a .craft blueprint into their Ships folder. Both
-    ride the per-user craft-import queue the mod already polls, so the recipient
-    receives it automatically the next time they're at the Space Center. The payload
-    arrives gzip-compressed (like submissions/listings); we store it decompressed.
+    save); kind="craft" delivers a .craft blueprint into their Ships folder. The
+    entry is created as an OFFER (status "offered"): the recipient's client shows
+    it — with the rendered `blueprint` preview when the sender's client managed
+    one — and only an explicit accept moves it into the auto-import queue; a
+    decline deletes it and tells the sender. The payload arrives gzip-compressed
+    (like submissions/listings); we store it decompressed.
     """
     import gzip
     from cogs.corps import _get_corp
@@ -3481,24 +3552,37 @@ async def craft_send_to_friend(
         log.error("Quicksend upload failed: %s", exc)
         return {"success": False, "message": "Failed to upload the craft."}
 
+    # Rendered blueprint preview — what the recipient judges the offer by.
+    # Optional: a failed render client-side still sends, just without a picture.
+    bp_url = None
+    if blueprint is not None:
+        try:
+            bp_data = await _read_upload(blueprint)
+            bp_url = await asyncio.to_thread(imp.upload_gift_blueprint, iid, bp_data)
+        except Exception as exc:
+            log.error("Quicksend blueprint upload failed: %s", exc)
+
     if kind == "vessel":
         imp.enqueue(
             gid, rid, source="gift_vessel", ref_id=iid, craft_name=craft_name,
             vessel_node_url=url, owner_name=user["username"],
+            blueprint_url=bp_url, sender_id=uid, status="offered",
         )
         kind_label = "a live vessel"
     else:
         imp.enqueue(
             gid, rid, source="gift_craft", ref_id=iid, craft_name=craft_name,
             craft_url=url, craft_filename=filename, owner_name=user["username"],
+            blueprint_url=bp_url, sender_id=uid, status="offered",
         )
         kind_label = "a craft"
 
     _create_notification(
         gid, rid, "craft_gift",
-        "🎁 Craft Received",
+        "🎁 Craft Offered",
         f"{user['username']} sent you {kind_label}: {craft_name}. "
-        f"Visit the Space Center in KSP to receive it.",
+        f"Accept or decline it in KSP (any scene with the sidebar — Space Center, "
+        f"VAB/SPH or flight).",
         {"craft_name": craft_name},
     )
 
@@ -3507,6 +3591,16 @@ async def craft_send_to_friend(
 
 
 # ── Marketplace ────────────────────────────────────────────────────────────────
+
+def _fmt_wait(seconds: float) -> str:
+    """A cooldown remainder as '5h 12m' / '12m' / 'under a minute', for a one-line
+    status in the game (nothing here is precise enough to be worth showing seconds)."""
+    total = max(0, int(seconds))
+    hours, minutes = total // 3600, (total % 3600) // 60
+    if hours:
+        return f"{hours}h {minutes}m" if minutes else f"{hours}h"
+    return f"{minutes}m" if minutes else "under a minute"
+
 
 @app.post("/api/v1/marketplace/list", response_model=MarketplaceListResult)
 async def marketplace_list_craft(
@@ -3612,6 +3706,28 @@ async def marketplace_list_craft(
         except Exception as exc:
             log.error("Marketplace thumbnail upload failed: %s", exc)
 
+    # Complexity bonus. Counted in distinct part types (part_list), not part_count —
+    # 300 copies of one girder is not a design. Claimed once per cooldown window;
+    # the listing itself is never gated by it, so a second qualifying craft today
+    # still lists, it just doesn't pay. A client too old to send `parts` sends an
+    # empty list and so never qualifies: there is nothing here to judge complexity by.
+    reward = 0
+    reward_note = ""
+    if len(part_list) > settings.MARKETPLACE_UPLOAD_REWARD_MIN_PARTS:
+        granted, wait = await store.try_claim_timed_reward(
+            gid, uid, "marketplace_upload",
+            settings.MARKETPLACE_UPLOAD_REWARD,
+            settings.MARKETPLACE_UPLOAD_REWARD_COOLDOWN,
+        )
+        if granted:
+            reward = settings.MARKETPLACE_UPLOAD_REWARD
+            reward_note = (f"+{reward:,} KCoins for a {len(part_list)}-part design.")
+            log.info("KSP: %s earned %d KCoins for listing '%s' (%d distinct parts)",
+                     user["username"], reward, craft_name, len(part_list))
+        else:
+            reward_note = ("Complexity bonus already claimed today — "
+                           f"the next one is in {_fmt_wait(wait)}.")
+
     # Mirror the listing into every server's marketplace channel (bot loop).
     try:
         from cogs.marketplace import post_listing
@@ -3624,8 +3740,10 @@ async def marketplace_list_craft(
              user["username"], craft_name, price, listing["listing_id"])
     return MarketplaceListResult(
         success=True,
-        message="Your craft is now for sale!",
+        message=("Your craft is now for sale!" + (f" {reward_note}" if reward_note else "")),
         listing_id=listing["listing_id"],
+        reward=reward,
+        reward_note=reward_note,
     )
 
 
@@ -3713,10 +3831,43 @@ def _listing_to_model(l: dict) -> MarketplaceListing:
         life_support=l.get("life_support", "none") or "none",
         ls_endurance_days=l.get("ls_endurance_days", 0.0) or 0.0,
         ls_crew_capacity=l.get("ls_crew_capacity", 0) or 0,
+        likes=int(l.get("likes", 0) or 0),
+        dislikes=int(l.get("dislikes", 0) or 0),
     )
 
 
 WEB_PAGE_SIZE = 25
+
+# "Recommended" is a *discovery* sort: it is there so a craft uploaded this week can
+# be found at all, which sorting by likes alone never allows — a listing that has been
+# up for a year outvotes a good one from Tuesday no matter how well the new one is
+# received. So the window is what makes it work, not a detail of it.
+RECOMMENDED_WINDOW_DAYS = 15
+
+
+def _listing_age_days(l: dict, now: datetime) -> float:
+    """Age of a listing in days. A listing with no/unparseable created_at is treated
+    as ancient rather than brand new, so a broken timestamp can't win a rate sort."""
+    raw = l.get("created_at") or ""
+    try:
+        # created_at is written by data/marketplace.py as a naive UTC isoformat.
+        return max(0.0, (now - datetime.fromisoformat(raw)).total_seconds() / 86400.0)
+    except (TypeError, ValueError):
+        return float(RECOMMENDED_WINDOW_DAYS * 100)
+
+
+def _net_likes(l: dict) -> int:
+    return int(l.get("likes", 0) or 0) - int(l.get("dislikes", 0) or 0)
+
+
+def _recommend_rate(l: dict, now: datetime) -> float:
+    """Net likes per day of existence, damped by a day.
+
+    The +1 is what stops an hours-old listing with a single like from sitting at the
+    top of the page forever: without it, dividing by a near-zero age makes the first
+    vote worth more than every later one put together.
+    """
+    return _net_likes(l) / (_listing_age_days(l, now) + 1.0)
 
 
 @app.post("/api/v1/web/auth/link", response_model=LinkResponse)
@@ -3851,6 +4002,22 @@ async def web_marketplace_listings(
         items.sort(key=lambda l: l.get("price", 0), reverse=True)
     elif sort == "sales":
         items.sort(key=lambda l: l.get("sales_count", 0), reverse=True)
+    elif sort == "likes":
+        items.sort(key=lambda l: (_net_likes(l), int(l.get("likes", 0) or 0),
+                                  l.get("created_at") or ""), reverse=True)
+    elif sort == "recommended":
+        # Fresh crafts (< RECOMMENDED_WINDOW_DAYS old) ranked by how fast they are
+        # collecting likes, then everything else by net likes. The older half is a
+        # *tail*, not a second ranking: without it a quiet fortnight would leave the
+        # tab all but empty, which is worse than showing well-liked older crafts
+        # below the new ones.
+        now = datetime.utcnow()
+        fresh = [l for l in items if _listing_age_days(l, now) <= RECOMMENDED_WINDOW_DAYS]
+        rest = [l for l in items if _listing_age_days(l, now) > RECOMMENDED_WINDOW_DAYS]
+        fresh.sort(key=lambda l: (_recommend_rate(l, now), l.get("created_at") or ""),
+                   reverse=True)
+        rest.sort(key=lambda l: (_net_likes(l), l.get("created_at") or ""), reverse=True)
+        items = fresh + rest
     else:  # "new"
         items.sort(key=lambda l: l.get("created_at") or "", reverse=True)
 
@@ -3950,6 +4117,136 @@ async def web_marketplace_compatibility(listing_id: str,
     if not listing:
         raise HTTPException(status_code=404, detail="No such listing.")
     return _craft_compatibility(int(user["guild_id"]), int(user["user_id"]), listing)
+
+
+# ── Website: votes & reports ─────────────────────────────────────────────────
+#
+# All three endpoints below are token-only authed, and that is the point: a vote or
+# a report is attributable to a linked Discord account or it is worthless. Browsing
+# stays public (the catalog is mirrored to public Discord channels anyway), so an
+# anonymous visitor sees the tallies and is asked to sign in to move them.
+
+_REPORT_REASON_MAX = 1500
+
+
+@app.get("/api/v1/web/marketplace/votes", response_model=MyVotesResponse)
+async def web_marketplace_my_votes(user: dict = Depends(get_user_token_only)):
+    """Every vote the caller has cast, so the grid can show which crafts they've
+    already voted on. One document read for the whole marketplace."""
+    return MyVotesResponse(votes=mkt.get_user_votes(int(user["user_id"])))
+
+
+@app.post("/api/v1/web/marketplace/{listing_id}/vote", response_model=VoteResult)
+async def web_marketplace_vote(listing_id: str, req: VoteRequest,
+                               user: dict = Depends(get_user_token_only)):
+    """Like (1), dislike (-1) or clear (0) the caller's vote on a listing."""
+    uid = int(user["user_id"])
+    # Generous, because changing your mind is normal and toggling costs one small
+    # write; tight enough that a script can't inflate the "recommended" sort by
+    # racing a listing's counter with a rented account.
+    _rate_limit(f"mkvote:{uid}", max_hits=120, window=3600.0)
+
+    listing = mkt.get_listing(int(user["guild_id"]), listing_id)
+    if not listing:
+        raise HTTPException(status_code=404, detail="No such listing.")
+    if listing.get("seller_id") == str(uid):
+        raise HTTPException(status_code=400, detail="You can't vote on your own craft.")
+
+    result = await asyncio.to_thread(mkt.set_vote, listing_id, uid, req.vote)
+    if result is None:
+        raise HTTPException(status_code=404, detail="No such listing.")
+    likes, dislikes = result
+    my_vote = mkt.VOTE_UP if req.vote > 0 else (mkt.VOTE_DOWN if req.vote < 0 else mkt.VOTE_NONE)
+    return VoteResult(success=True, likes=likes, dislikes=dislikes, my_vote=my_vote)
+
+
+@app.post("/api/v1/web/marketplace/{listing_id}/report", response_model=ReportResult)
+async def web_marketplace_report(listing_id: str, req: ReportRequest,
+                                 user: dict = Depends(get_user_token_only)):
+    """Report a listing to the moderators as a private Discord ticket.
+
+    The ticket is opened in the *reporter's* server, because a ticket they cannot
+    see is no use to them — they'd have nowhere to answer a follow-up question. The
+    listing's origin server is named in the embed instead, since the marketplace is
+    global and the two are often different.
+
+    The seller is `subject_user_id`: shown to the mods for context, deliberately NOT
+    granted access to the channel — the same rule anti-cheat tickets follow.
+    """
+    uid = int(user["user_id"])
+    gid = int(user["guild_id"])
+    # A report costs a channel and a moderator's attention. Three an hour is far
+    # more than anyone files in good faith; per user rather than per IP because a
+    # ticket is attributable to an account.
+    _rate_limit(f"mkreport:{uid}", max_hits=3, window=3600.0)
+
+    reason = (req.reason or "").strip()[:_REPORT_REASON_MAX]
+    if not reason:
+        raise HTTPException(status_code=400, detail="Say what's wrong with this craft.")
+
+    listing = mkt.get_listing(gid, listing_id)
+    if not listing:
+        raise HTTPException(status_code=404, detail="No such listing.")
+    if listing.get("seller_id") == str(uid):
+        raise HTTPException(status_code=400, detail="That's your own craft.")
+    if await asyncio.to_thread(mkt.get_report, listing_id, uid):
+        raise HTTPException(status_code=409,
+                            detail="You've already reported this craft — the mods have it.")
+
+    if not _bot_instance:
+        raise HTTPException(status_code=503, detail="The bot is not available right now.")
+    guild = _bot_instance.get_guild(gid)
+    if guild is None:
+        raise HTTPException(status_code=503,
+                            detail="Your Discord server is not reachable right now.")
+
+    import discord
+    from cogs.tickets import create_ticket
+
+    seller_id = str(listing.get("seller_id", ""))
+    origin_gid = str(listing.get("guild_id", "") or "")
+    origin = _bot_instance.get_guild(int(origin_gid)) if origin_gid.isdigit() else None
+    origin_name = origin.name if origin else f"server `{origin_gid or 'unknown'}`"
+    e = discord.Embed(
+        title="🛒 Reported listing",
+        description=(
+            f"**Craft:** {listing.get('craft_name', 'Unknown')}\n"
+            f"**Listing ID:** `{listing_id}`\n"
+            f"**Price:** {int(listing.get('price', 0)):,} {settings.CURRENCY_SYMBOL}\n"
+            f"**Status:** {listing.get('status', mkt.ACTIVE)} · "
+            f"{int(listing.get('sales_count', 0))} sold\n"
+            f"**Seller:** {listing.get('seller_name', 'Unknown')} (<@{seller_id}>, `{seller_id}`)\n"
+            f"**Listed from:** {origin_name}\n"
+            f"**Reported by:** {user.get('username', 'Unknown')} (<@{uid}>, `{uid}`)"
+        ),
+        color=discord.Color.orange(),
+    )
+    if listing.get("thumbnail_url") or listing.get("blueprint_url"):
+        e.set_image(url=listing.get("thumbnail_url") or listing["blueprint_url"])
+
+    channel = await create_ticket(
+        _bot_instance, guild,
+        opener_id=uid,
+        subject_user_id=int(seller_id) if seller_id.isdigit() else None,
+        kind="user",
+        title="Marketplace report",
+        description=f"**Why this craft was reported**\n{reason}",
+        color=discord.Color.orange(),
+        extra_embeds=[e],
+    )
+    if channel is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Couldn't open a ticket — this server's ticket system isn't set up.")
+
+    await asyncio.to_thread(
+        mkt.record_report, listing, uid, user.get("username", ""), reason,
+        gid, channel.id,
+    )
+    log.info("WEB: %s reported listing %s (seller %s)", user.get("username"), listing_id, seller_id)
+    return ReportResult(
+        success=True,
+        message=f"Reported. A private ticket (#{channel.name}) is open in Discord.")
 
 
 # ── Website: contracts ───────────────────────────────────────────────────────
@@ -4404,7 +4701,12 @@ async def admin_listings(q: str = "", user: dict = Depends(get_owner)):
                  or needle in (l.get("listing_id", "") or "").lower()
                  or needle == str(l.get("seller_id", ""))]
     items.sort(key=lambda l: l.get("created_at") or "", reverse=True)
-    return {"listings": [_listing_to_model(l).model_dump() for l in items]}
+    # report_count is merged in here rather than added to MarketplaceListing: the
+    # same model serves the public grid, and "how many people complained about this"
+    # is a moderation fact, not a shopping one.
+    return {"listings": [{**_listing_to_model(l).model_dump(),
+                          "report_count": int(l.get("report_count", 0) or 0)}
+                         for l in items]}
 
 
 async def _admin_refresh_mirrors(listing: dict, listing_id: str, verb: str):

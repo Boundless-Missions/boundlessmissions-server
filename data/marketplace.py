@@ -7,11 +7,15 @@ of the blueprint, but the listing stays active so anyone else can buy it too.
 
 Firestore structure (GLOBAL — the marketplace spans every server):
     marketplace/{listing_id} → { ...listing fields..., guild_id (origin), mirrors }
+    marketplace_votes/{user_id} → { votes: { listing_id: 1 | -1 } }
+    marketplace_reports/{listing_id}_{reporter_id} → { ...one report... }
 """
 import logging
 import uuid
 from datetime import datetime
 from typing import Any
+
+from firebase_admin import firestore
 
 from data.store import _db, _storage_bucket, safe_filename
 
@@ -20,6 +24,13 @@ log = logging.getLogger(__name__)
 # Status constants
 ACTIVE = "active"
 DELISTED = "delisted"
+
+# Vote values. A vote is a tri-state, not a toggle: the client always sends the
+# state it wants (NONE clears), so a double-click can't flip an unrelated later
+# state back on.
+VOTE_UP = 1
+VOTE_DOWN = -1
+VOTE_NONE = 0
 
 ListingData = dict[str, Any]
 
@@ -83,6 +94,15 @@ def create_listing(
         "ls_crew_capacity": int(ls_crew_capacity or 0),
         "status": ACTIVE,
         "created_at": now,
+        # Vote tallies. These are *derived* counters kept in step with the per-user
+        # vote records in `marketplace_votes` (see set_vote) — cheap to read on a
+        # 25-card grid, which counting the real votes per listing would not be.
+        "likes": 0,
+        "dislikes": 0,
+        # How many distinct users have reported this listing (one report per user
+        # per listing — see record_report). Never shown publicly; it exists so the
+        # owner console can sort by "most complained about".
+        "report_count": 0,
         # Cross-server message mirrors: [{guild_id, channel_id, message_id}, ...]
         "mirrors": [],
         "buyers": [],
@@ -166,6 +186,123 @@ def record_purchase(guild_id: int, listing_id: str, buyer_id: int) -> None:
         "buyers": buyers,
         "sales_count": data.get("sales_count", 0) + 1,
     })
+
+
+# ── Votes ────────────────────────────────────────────────────────────────────
+#
+# Who voted what lives in ONE document per user (`marketplace_votes/{user_id}`),
+# not one per (user, listing). The website needs "which of these 25 crafts have I
+# voted on?" on every grid load, and a per-pair layout answers that with either 25
+# reads or a collection-group query behind a composite index; a per-user map
+# answers it with a single read. The tallies on the listing are the mirror image
+# of the same trade-off: a count that is read on every card is stored, not summed.
+#
+# The two are kept in step by set_vote, which is the only writer of either.
+
+def _votes_doc(user_id: int | str):
+    return _db.collection("marketplace_votes").document(str(user_id))
+
+
+def get_user_votes(user_id: int | str) -> dict[str, int]:
+    """Every vote this user has cast: {listing_id: 1 | -1}. Empty for a user who
+    has never voted (no document), which is the common case."""
+    snap = _votes_doc(user_id).get()
+    if not snap.exists:
+        return {}
+    raw = (snap.to_dict() or {}).get("votes") or {}
+    return {k: int(v) for k, v in raw.items() if int(v) in (VOTE_UP, VOTE_DOWN)}
+
+
+def set_vote(listing_id: str, user_id: int | str, vote: int) -> tuple[int, int] | None:
+    """Record `vote` (VOTE_UP / VOTE_DOWN / VOTE_NONE) by `user_id` on a listing.
+
+    Returns the listing's (likes, dislikes) after the change, or None if the
+    listing is gone. Idempotent: re-sending the same vote changes nothing.
+
+    The tally is moved with a Firestore Increment (atomic — two users voting at
+    once can't clobber each other) and only then is the user's own record written;
+    if that second write fails the increment is undone, so the counter never keeps
+    a vote nobody is recorded as having cast.
+    """
+    vote = VOTE_UP if vote > 0 else (VOTE_DOWN if vote < 0 else VOTE_NONE)
+    ref = _col().document(listing_id)
+    snap = ref.get()
+    if not snap.exists:
+        return None
+    data = snap.to_dict() or {}
+
+    old = int(get_user_votes(user_id).get(listing_id, VOTE_NONE))
+    likes = max(0, int(data.get("likes", 0) or 0))
+    dislikes = max(0, int(data.get("dislikes", 0) or 0))
+    if old == vote:
+        return likes, dislikes
+
+    d_like = (1 if vote == VOTE_UP else 0) - (1 if old == VOTE_UP else 0)
+    d_dislike = (1 if vote == VOTE_DOWN else 0) - (1 if old == VOTE_DOWN else 0)
+
+    ref.update({"likes": firestore.Increment(d_like),
+                "dislikes": firestore.Increment(d_dislike)})
+    try:
+        # DELETE_FIELD rather than a stored 0: the map is the list of votes actually
+        # cast, so a cleared vote must leave nothing behind. set(merge=True) is used
+        # for both cases because update() would fail for a user voting for the first
+        # time, whose document does not exist yet.
+        _votes_doc(user_id).set(
+            {"votes": {listing_id: firestore.DELETE_FIELD if vote == VOTE_NONE else vote}},
+            merge=True,
+        )
+    except Exception:
+        ref.update({"likes": firestore.Increment(-d_like),
+                    "dislikes": firestore.Increment(-d_dislike)})
+        raise
+
+    return max(0, likes + d_like), max(0, dislikes + d_dislike)
+
+
+# ── Reports ──────────────────────────────────────────────────────────────────
+
+def _report_id(listing_id: str, reporter_id: int | str) -> str:
+    return f"{listing_id}_{reporter_id}"
+
+
+def get_report(listing_id: str, reporter_id: int | str) -> dict[str, Any] | None:
+    """This user's existing report against this listing, if any. The document id
+    is the (listing, reporter) pair, so "have I already reported this?" is a
+    single keyed read — no composite index, and no way to file the same complaint
+    twice to make it look louder."""
+    snap = _db.collection("marketplace_reports").document(
+        _report_id(listing_id, reporter_id)).get()
+    return snap.to_dict() if snap.exists else None
+
+
+def record_report(listing: ListingData, reporter_id: int | str, reporter_name: str,
+                  reason: str, guild_id: int | str = "",
+                  ticket_channel_id: int | str = "") -> None:
+    """Store a report and bump the listing's report_count.
+
+    The Discord ticket is where a report is actually *handled*; this record exists
+    so the count survives the ticket being closed, and so a second report from the
+    same user overwrites rather than accumulates."""
+    listing_id = listing["listing_id"]
+    first_time = get_report(listing_id, reporter_id) is None
+    _db.collection("marketplace_reports").document(_report_id(listing_id, reporter_id)).set({
+        "listing_id": listing_id,
+        "craft_name": listing.get("craft_name", ""),
+        "seller_id": str(listing.get("seller_id", "")),
+        "seller_name": listing.get("seller_name", ""),
+        "reporter_id": str(reporter_id),
+        "reporter_name": reporter_name,
+        "reason": reason,
+        "guild_id": str(guild_id),
+        "ticket_channel_id": str(ticket_channel_id),
+        "created_at": datetime.utcnow().isoformat(),
+    })
+    if first_time:
+        try:
+            _col().document(listing_id).update({"report_count": firestore.Increment(1)})
+        except Exception as exc:  # a missing listing must not lose the report
+            log.warning("Could not bump report_count for listing %s: %s", listing_id, exc)
+    log.info("Listing %s reported by %s (%s)", listing_id, reporter_name, reporter_id)
 
 
 async def upload_craft(listing_id: str, filename: str, data: bytes) -> str:

@@ -243,6 +243,17 @@ MARKETPLACE_CHANNEL_ID: int | None = 1515424482020429875
 MARKETPLACE_MIN_PRICE = 1
 MARKETPLACE_MAX_PRICE = 10_000_000
 
+# Listing a sufficiently complex craft pays the seller a flat bonus, at most once
+# per cooldown window. Counted in DISTINCT part types (the listing's `parts`), not
+# in total part count: a booster made of 300 copies of one girder is not a design
+# worth paying for, while a 25-part probe is. The threshold is exclusive — a craft
+# must use MORE than this many distinct parts.
+MARKETPLACE_UPLOAD_REWARD = 300
+MARKETPLACE_UPLOAD_REWARD_MIN_PARTS = 20
+# Only the payout is on a cooldown; listing itself never is. A second qualifying
+# craft the same day still lists normally, it just doesn't pay again.
+MARKETPLACE_UPLOAD_REWARD_COOLDOWN = 24 * 60 * 60
+
 
 # ── Weekly Missions ──────────────────────────────────────────────────────────
 

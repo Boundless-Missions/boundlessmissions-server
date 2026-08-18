@@ -110,6 +110,9 @@ def _default_user() -> UserData:
         "joined_at": "",
         "unlocked_levels": [],
         "rescues": 0,
+        # reward key → unix timestamp of the last payout, for rewards that are
+        # capped to one per window (see try_claim_timed_reward).
+        "reward_cooldowns": {},
     }
 
 
@@ -352,6 +355,32 @@ class UserStore:
             user["balance"] = max(0, user["balance"] + amount)
             self._mark_dirty(guild_id, user_id)
             return user["balance"]
+
+    async def try_claim_timed_reward(
+        self, guild_id: int, user_id: int, key: str,
+        amount: int, cooldown_seconds: float,
+    ) -> tuple[bool, float]:
+        """Credit `amount` KCoins for `key` at most once per `cooldown_seconds`.
+
+        Returns (granted, seconds_until_next). On a refusal nothing is written and
+        the remaining wait is returned so the caller can say when it reopens. The
+        cooldown check and the credit happen under one lock, so two uploads landing
+        together can't both collect — the mirror of `try_debit`'s double-spend guard.
+        """
+        async with self._lock:
+            user = self.get_user(guild_id, user_id)
+            # Records written before this field existed are merged over the defaults
+            # at load, so the dict is present; setdefault covers a hand-edited doc.
+            stamps = user.setdefault("reward_cooldowns", {})
+            now = time.time()
+            elapsed = now - float(stamps.get(key, 0.0) or 0.0)
+            if elapsed < cooldown_seconds:
+                return False, cooldown_seconds - elapsed
+
+            stamps[key] = now
+            user["balance"] = max(0, user["balance"] + amount)
+            self._mark_dirty(guild_id, user_id)
+            return True, cooldown_seconds
 
     async def try_debit(self, guild_id: int, user_id: int, amount: int) -> bool:
         """Atomically deduct `amount` only if the balance fully covers it.

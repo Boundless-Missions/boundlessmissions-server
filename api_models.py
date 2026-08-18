@@ -404,6 +404,12 @@ class MarketplaceListResult(BaseModel):
     success: bool
     message: str
     listing_id: Optional[str] = None
+    # Complexity bonus paid for this upload (0 when the craft didn't qualify or the
+    # seller already collected today). `reward_note` is the one-line explanation the
+    # mod appends to its own success line — it builds that line itself and never
+    # shows `message` on success, so the note has to be its own field.
+    reward: int = 0
+    reward_note: str = ""
 
 class MarketplaceListing(BaseModel):
     listing_id: str
@@ -432,6 +438,10 @@ class MarketplaceListing(BaseModel):
     life_support: str = "none"
     ls_endurance_days: float = 0.0
     ls_crew_capacity: int = 0
+    # Community vote tallies. Public (they're on every card); *who* voted is not —
+    # the caller learns only their own vote, from /web/marketplace/votes.
+    likes: int = 0
+    dislikes: int = 0
 
 class MarketplaceListingsResponse(BaseModel):
     listings: list[MarketplaceListing]
@@ -480,6 +490,31 @@ class WebBuyResult(BaseModel):
     # they can't load yet is still theirs to keep, and the mod substitutes what it can
     # on install, so this warns rather than blocks.
     compatibility: Optional[CraftCompatibility] = None
+
+
+class VoteRequest(BaseModel):
+    """A vote is the state the caller wants, not a toggle: 1 like, -1 dislike,
+    0 "take my vote back". Sending the state means a double-submit is a no-op
+    rather than an unvote of something the user still meant to like."""
+    vote: int = 0
+
+class VoteResult(BaseModel):
+    success: bool
+    likes: int = 0
+    dislikes: int = 0
+    my_vote: int = 0
+
+class MyVotesResponse(BaseModel):
+    """Every vote the caller has cast, {listing_id: 1 | -1}. One read serves the
+    whole grid, so the UI can light up the buttons on crafts they already voted on."""
+    votes: dict[str, int] = {}
+
+class ReportRequest(BaseModel):
+    reason: str
+
+class ReportResult(BaseModel):
+    success: bool
+    message: str
 
 
 # ── Notifications ────────────────────────────────────────────────────────────
