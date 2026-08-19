@@ -59,7 +59,7 @@ S.update({
     "auc.btn_end":         {"en": "🛑 End now"},
     # Command feedback / errors
     "auc.err_disabled":    {"en": "❌ Auctions are not configured (no channel set in settings)."},
-    "auc.err_amount":      {"en": "❌ Starting price must be a positive amount."},
+    "auc.err_amount":      {"en": "❌ Starting price must be at least **{min}** {sym} — an auction opening any lower leaves no bid anyone could legally place."},
     "auc.err_duration":    {"en": "❌ Duration must be between {min} and {max} hours."},
     "auc.err_date":        {"en": "❌ Invalid date. Use YYYY-MM-DD (must be in the future)."},
     "auc.err_funds":       {"en": "❌ Insufficient balance. You must escrow **{need}** {sym}."},
@@ -283,7 +283,9 @@ async def close_auction(bot, gid: int, auction_id: str, *, ended_by: str = "time
             winner = await bot.fetch_user(int(winner_id))
             e = _embed(c, origin_gid)
             e.description = t(origin_gid, "auc.won_dm", price=final, sym=sym)
-            dm = await winner.send(embed=e, view=ContractWorkView(c["contract_id"], origin_gid))
+            dm = await winner.send(
+                embed=e,
+                view=ContractWorkView(c["contract_id"], origin_gid, c.get("mission_type")))
             cdb.update_contract(origin_gid, c["contract_id"], dm_message_id=str(dm.id))
         except Exception as exc:
             log.warning("Could not DM auction winner %s: %s", winner_id, exc)
@@ -439,7 +441,7 @@ class Auctions(commands.Cog, name="Auctions"):
                           description="Post a reverse auction where contractors bid the price down")
     @app_commands.describe(
         mission="Mission description",
-        start_value="Starting (maximum) payment in KCoins, escrowed up front",
+        start_value="Starting (maximum) payment in KCoins, escrowed up front (minimum 2)",
         date_due="Contract due date once won (YYYY-MM-DD)",
         duration_hours="How many hours the auction runs",
         fine="Fine if the winner breaches the contract (default 0)",
@@ -463,8 +465,10 @@ class Auctions(commands.Cog, name="Auctions"):
         if not guild_config.any_channel_configured(self.bot, "auction"):
             await interaction.response.send_message(tp(gid, uid, "auc.err_disabled"), ephemeral=True)
             return
-        if start_value <= 0:
-            await interaction.response.send_message(tp(gid, uid, "auc.err_amount"), ephemeral=True)
+        if start_value < settings.AUCTION_MIN_START_VALUE:
+            await interaction.response.send_message(
+                tp(gid, uid, "auc.err_amount", min=settings.AUCTION_MIN_START_VALUE, sym=sym),
+                ephemeral=True)
             return
         if fine < 0:
             fine = 0

@@ -30,13 +30,23 @@ def is_owner_user(interaction: discord.Interaction) -> bool:
 
 
 def is_admin_user(interaction: discord.Interaction) -> bool:
-    """True only if the real invoker is the single configured admin (cfg.OWNER_ID).
+    """True if the real invoker is the bot owner or holds this guild's mapped
+    bot-admin role (key "admin", set per guild via /admin setrole).
 
-    The admin is intentionally ONE person, set via BOT_OWNER_ID in .env and not
-    changeable in-bot. Guild administrators are NOT auto-admins: server admins
-    manage their server through the moderator role, while bot-wide admin commands
-    (/admin …) are reserved for the owner across every guild."""
-    return getattr(real_user(interaction), "id", None) == cfg.OWNER_ID
+    Guild administrators are still NOT auto-admins: the admin role must be
+    mapped explicitly, and there is no settings.py fallback for it. This gate
+    covers only the guild-scoped /admin commands (setchannel, setrole,
+    announce, …); bot-wide commands (publishing, policy, link-as, mimic, …)
+    stay behind is_owner_user, because a role granted in one guild must never
+    carry authority over every guild the bot is in."""
+    from data import guild_config
+    u = real_user(interaction)
+    if getattr(u, "id", None) == cfg.OWNER_ID:
+        return True
+    if not isinstance(u, discord.Member):
+        return False
+    admin_role = guild_config.resolve_role(u.guild, "admin")
+    return bool(admin_role and u.get_role(admin_role.id))
 
 
 def is_mod_user(interaction: discord.Interaction) -> bool:

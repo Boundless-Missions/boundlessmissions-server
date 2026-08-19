@@ -19,9 +19,8 @@ import re
 
 import discord
 from discord.ui import View, Button, DynamicItem, button
-from i18n import t, tp
+from i18n import t
 import settings
-from data.store import store
 from data import contracts as cdb
 from data import mission_constraints as mc
 from data import orbit_constraints as oc
@@ -181,7 +180,7 @@ def _embed(c, guild_id):
     e.add_field(name=t(guild_id, "ct.fine"), value=f"**{c['fine']}** {sym}", inline=True)
     e.add_field(name=t(guild_id, "ct.due"), value=c["due_date"], inline=True)
     e.add_field(name=t(guild_id, "ct.status"), value=f"`{c['status']}`", inline=True)
-    
+
     # Crew-aboard requirement and (once a craft has been submitted) its min–max
     # life-support endurance for that crew. Constraints come off the contract when
     # present, else are derived from the mission text.
@@ -247,7 +246,8 @@ class AcceptOfferButton(DynamicItem[Button], template=r"ct_accept:" + _ID_PATTER
             return
         e = _embed(r.contract, self.gid)
         e.color = discord.Color.green()
-        await interaction.edit_original_response(embed=e, view=ContractWorkView(self.cid, self.gid))
+        await interaction.edit_original_response(
+            embed=e, view=ContractWorkView(self.cid, self.gid, r.contract.get("mission_type")))
 
 
 class RefuseOfferButton(DynamicItem[Button], template=r"ct_refuse:" + _ID_PATTERN):
@@ -303,9 +303,25 @@ class GiveUpButton(DynamicItem[Button], template=r"ct_giveup:" + _ID_PATTERN):
         await interaction.edit_original_response(embed=e, view=None)
 
 
+# Submitting from Discord is retired for everything except a flag design.
+#
+# A craft submission is read against the game — the vessel, its mod list, its parts
+# and its telemetry — none of which a channel upload carries, so the mod's submit
+# window (`SubmissionSession`) is the only front end that can send a real one. This
+# button survives for two reasons: a flag *is* just an image, which makes Discord the
+# right place to hand one over (the mod's own contract form says so), and every work
+# view already posted to a corp channel still has this custom_id, so the deprecated
+# case has to answer with an explanation rather than a dead interaction.
+SUBMIT_MOVED_NOTICE = (
+    "📤 Submissions now happen in KSP. Open the sidebar's **Contracts** panel and "
+    "press **Submit** there — the mod sends the craft, its mod list and the telemetry "
+    "the review is judged against, which an upload here cannot carry."
+)
+
+
 class SubmitButton(DynamicItem[Button], template=r"ct_submit:" + _ID_PATTERN):
     def __init__(self, contract_id: str, guild_id: int):
-        super().__init__(Button(label="📤 Submit", style=discord.ButtonStyle.blurple,
+        super().__init__(Button(label="📤 Submit flag", style=discord.ButtonStyle.blurple,
                                 custom_id=_cid("ct_submit", contract_id, guild_id)))
         self.cid = contract_id
         self.gid = int(guild_id)
@@ -319,9 +335,13 @@ class SubmitButton(DynamicItem[Button], template=r"ct_submit:" + _ID_PATTERN):
         c = cdb.get_contract(self.gid, self.cid)
         if not c or c["status"] != cdb.ACTIVE:
             return
-        # Weekly missions post this view to a public corp channel, so the presser is not
-        # necessarily the contractor. Without this check a bystander could open the file
-        # picker and submit their own uploads against someone else's contract.
+        if c.get("mission_type") != cdb.FLAG_DESIGN:
+            await interaction.followup.send(SUBMIT_MOVED_NOTICE, ephemeral=True)
+            return
+        # This view is not always in a DM — it was posted to public corp channels for
+        # years and those messages are still there — so the presser is not necessarily
+        # the contractor. Without this check a bystander could open the picker and
+        # submit their own upload against someone else's contract.
         if str(interaction.user.id) != str(c.get("contractor_id")):
             await interaction.followup.send(
                 "❌ This contract is not yours to submit.", ephemeral=True)
@@ -337,24 +357,20 @@ class SubmitButton(DynamicItem[Button], template=r"ct_submit:" + _ID_PATTERN):
             # Stop scanning if we hit the contract message
             if dm_msg_id and msg.id <= dm_msg_id:
                 break
-            
+
             if msg.author.id in (interaction.user.id, real_user_id):
                 for att in reversed(msg.attachments):
                     files_found.append({"url": att.url, "filename": att.filename,
                                         "content_type": att.content_type or "application/octet-stream"})
-        # Reverse so order is chronological
+        # Reverse so order is chronological. A flag design is an image and nothing
+        # else, so anything that isn't one is not worth offering as a choice.
         files_found.reverse()
+        files_found = [f for f in files_found if f["content_type"].startswith("image/")]
         if not files_found:
-            await interaction.followup.send("❌ No files found. Upload files here first.", ephemeral=True)
-            return
-        # Require at least one image (screenshot)
-        has_image = any(f["content_type"].startswith("image/") for f in files_found)
-        if not has_image:
             await interaction.followup.send(
-                "❌ Missing screenshot (image). Upload at least a screenshot.",
-                ephemeral=True)
+                "❌ No image found. Upload the flag image here first.", ephemeral=True)
             return
-        view = FileSelectView(self.cid, self.gid, files_found)
+        view = FlagSubmitView(self.cid, self.gid, files_found)
         await interaction.followup.send(embed=view._generate_embed(), view=view, ephemeral=True)
 
 
@@ -492,7 +508,7 @@ class MoreTimeButton(DynamicItem[Button], template=r"ct_moretime:" + _ID_PATTERN
 
         c = r.contract
         e = _embed(c, self.gid)
-        v = ContractWorkView(self.cid, self.gid)
+        v = ContractWorkView(self.cid, self.gid, c.get("mission_type"))
         try:
             await interaction.edit_original_response(content=f"⏰ {r.message}", embed=e, view=v)
         except Exception:
@@ -601,7 +617,9 @@ class MoreTimeApproveButton(DynamicItem[Button], template=r"ct_mt_y:" + _ID_PATT
             contractor = await interaction.client.fetch_user(int(r.contract["contractor_id"]))
             e = _embed(r.contract, self.gid)
             e.color = discord.Color.green()
-            await contractor.send(embed=e, view=ContractWorkView(self.cid, self.gid))
+            await contractor.send(
+                embed=e,
+                view=ContractWorkView(self.cid, self.gid, r.contract.get("mission_type")))
         except Exception:
             pass
 
@@ -743,10 +761,19 @@ class ContractOfferView(View):
 
 
 class ContractWorkView(View):
-    def __init__(self, contract_id: str = "", guild_id: int = 0):
+    """The contractor's panel on an active contract.
+
+    Submit is drawn only for a flag design — every other kind is submitted from the
+    mod's submit window, so offering a button here that can only refuse would be worse
+    than not offering one. `mission_type` is passed by callers that already hold the
+    contract; when it is not, the view is built without Submit and the button's own
+    check is what answers anyone who reaches the deprecated one on an older message."""
+
+    def __init__(self, contract_id: str = "", guild_id: int = 0, mission_type: str | None = None):
         super().__init__(timeout=None)
         self.add_item(GiveUpButton(contract_id, guild_id))
-        self.add_item(SubmitButton(contract_id, guild_id))
+        if mission_type == cdb.FLAG_DESIGN:
+            self.add_item(SubmitButton(contract_id, guild_id))
 
 
 class ContractReviewView(View):
@@ -790,7 +817,13 @@ class ModReviewView(View):
 #  Non-persistent Views (ephemeral, don't need DynamicItem)
 # ══════════════════════════════════════════════════════════════════════════════
 
-class FileSelectView(View):
+class FlagSubmitView(View):
+    """Pick which of the images uploaded in this channel is the flag being handed over.
+
+    The only submission Discord still runs. It used to serve every contract type,
+    which is why it is a file *picker* — a craft submission arrived as a craft file
+    plus screenshots. A flag is one image, so the list it offers is images alone."""
+
     def __init__(self, contract_id: str, guild_id: int, files: list[dict]):
         super().__init__(timeout=120)
         self.cid = contract_id
@@ -800,16 +833,15 @@ class FileSelectView(View):
         self.current_idx = 0
 
     def _generate_embed(self) -> discord.Embed:
-        craft_exts = (".craft",)
         lines = []
         for i, f in enumerate(self.files):
-            icon = "🚀" if f["filename"].lower().endswith(craft_exts) else "🖼️"
             status = "✅" if i in self.active_indices else "❌"
             pointer = "▶️" if i == self.current_idx else "  "
-            lines.append(f"{pointer} {status} {icon} `{f['filename']}`")
+            lines.append(f"{pointer} {status} 🖼️ `{f['filename']}`")
 
         desc = "\n".join(lines)
-        return discord.Embed(title="📎 Select files to submit", description=desc, color=discord.Color.blue())
+        return discord.Embed(title="🚩 Select the flag to submit", description=desc,
+                             color=discord.Color.blue())
 
     @button(emoji="⬆️", style=discord.ButtonStyle.grey, row=0)
     async def up_btn(self, interaction: discord.Interaction, btn: Button):
@@ -847,83 +879,17 @@ class FileSelectView(View):
             await interaction.followup.send("❌ You must select at least one file.", ephemeral=True)
             return
 
-        has_image = any(f["content_type"].startswith("image/") for f in selected_files)
-
-        if not has_image:
-            await interaction.followup.send(
-                "❌ Missing in selection: screenshot (image). Select at least a screenshot.",
-                ephemeral=True)
+        # The button that opens this view already refuses anything else, and the
+        # contract can have changed hands in between.
+        if c.get("mission_type") != cdb.FLAG_DESIGN:
+            await interaction.followup.send(SUBMIT_MOVED_NOTICE, ephemeral=True)
             return
 
         for child in self.children:
             child.disabled = True
         await interaction.edit_original_response(view=self)
 
-        # ── Flag-design contract → gate full-res, show watermarked preview ──
-        if c.get("mission_type") == cdb.FLAG_DESIGN:
-            await self._submit_flag(interaction, c, selected_files)
-            return
-
-        stored = []
-        for f in selected_files:
-            try:
-                data = await cdb.download_url(f["url"])
-                # Match the in-game submit path: the craft file is private (served via
-                # a signed URL), screenshots stay public (shown in embeds / web review).
-                is_craft = f["filename"].lower().endswith(".craft")
-                upload = cdb.upload_private_to_storage if is_craft else cdb.upload_to_storage
-                url = await upload(self.cid, f["filename"], data, f.get("content_type", ""))
-                stored.append({"filename": f["filename"], "url": url, "content_type": f.get("content_type", "")})
-            except Exception as exc:
-                log.error("Upload failed: %s", exc)
-                stored.append({"filename": f["filename"], "url": f["url"], "content_type": f.get("content_type", "")})
-        from datetime import datetime
-        cdb.update_contract(self.gid, self.cid, status=cdb.SUBMITTED,
-                            submitted_files=stored, submitted_at=datetime.utcnow().isoformat())
-        c = cdb.get_contract(self.gid, self.cid)
-        bot = interaction.client
-
-        # ── Bot-issued contract (weekly missions) → AI auto-review ───────
-        is_bot_issued = (
-            str(c["issuer_id"]) == str(bot.user.id)
-            or c.get("issuer_name", "").lower() == bot.user.display_name.lower()
-        )
-        log.info("Contract %s issuer_id=%s bot_id=%s is_bot=%s",
-                 self.cid, c["issuer_id"], bot.user.id, is_bot_issued)
-        if is_bot_issued:
-            await self._ai_review(interaction, c, stored)
-            return
-
-        # ── Human-issued contract → DM issuer for review ─────────────────
-        try:
-            issuer = await bot.fetch_user(int(c["issuer_id"]))
-            e = _embed(c, self.gid)
-            e.title = f"📬 {t(self.gid, 'ct.review_title')}"
-            e.color = discord.Color.orange()
-            screenshots = [s for s in stored if not s['filename'].lower().endswith('.craft')]
-            craft_count = len(stored) - len(screenshots)
-            file_parts = []
-            if craft_count:
-                file_parts.append(f"🚀 {craft_count} craft file(s) *(revealed after acceptance)*")
-            else:
-                file_parts.append("⚠️ **WARNING: No craft file included!**")
-            for s in screenshots:
-                file_parts.append(f"🖼️ [{s['filename']}]({s['url']})")
-            e.add_field(name="📁 Files", value="\n".join(file_parts) or "None", inline=False)
-            view = ContractReviewView(self.cid, self.gid)
-            msg = await issuer.send(embed=e, view=view)
-            cdb.update_contract(self.gid, self.cid, issuer_review_msg_id=str(msg.id))
-        except Exception as exc:
-            log.error("Could not DM issuer: %s", exc)
-        # Update contractor panel
-        if c.get("dm_message_id"):
-            try:
-                orig = await interaction.channel.fetch_message(int(c["dm_message_id"]))
-                c["status"] = cdb.SUBMITTED
-                await orig.edit(embed=_embed(c, self.gid), view=None)
-            except Exception:
-                pass
-        await interaction.followup.send("✅ Submitted!", ephemeral=True)
+        await self._submit_flag(interaction, c, selected_files)
 
     async def _submit_flag(self, interaction: discord.Interaction, c: dict, selected_files: list[dict]):
         """Flag-design submission: keep the clean image gated, surface only a
@@ -981,145 +947,6 @@ class FileSelectView(View):
             except Exception:
                 pass
         await interaction.followup.send("✅ Flag submitted for review!", ephemeral=True)
-
-    async def _ai_review(self, interaction: discord.Interaction, c: dict, stored: list[dict]):
-        """Use Gemini AI to review screenshots against the mission description."""
-        import aiohttp
-        screenshots = [s for s in stored if s.get("content_type", "").startswith("image/")]
-        if not screenshots:
-            await interaction.followup.send("❌ No screenshots found for AI review.", ephemeral=True)
-            return
-
-        # Download screenshot bytes
-        img_bytes_list = []
-        for s in screenshots:
-            try:
-                raw = await cdb.download_url(s["url"])
-                img_bytes_list.append(raw)
-            except Exception:
-                pass
-
-        if not img_bytes_list:
-            await interaction.followup.send("❌ Could not download screenshots.", ephemeral=True)
-            return
-
-        # Build AI review prompt
-        mission_desc = c.get("mission", "")
-        from cogs.screenshots import active_client, record_gemini, _MODEL
-        from google.genai import types
-        import json
-
-        gemini_client = active_client()
-        if not gemini_client:
-            # Fallback: auto-accept if no Gemini (key missing OR budget reached)
-            await self._auto_accept(interaction, c)
-            return
-
-        review_prompt = (
-            f"You are reviewing a KSP contract submission.\n"
-            f"The mission was: \"{mission_desc}\"\n\n"
-            f"Analyze the screenshot(s) and determine if the mission was completed successfully.\n"
-            f"CRITICAL RULES FOR SPACE ELEVATORS:\n"
-            f"- In KSP, space elevators are built as extremely tall towers or tethers attached to the ground and stretching endlessly into the sky.\n"
-            f"- If the mission involves a space elevator/tether, and you see a tall vertical structure reaching into the sky, you MUST ACCEPT IT.\n"
-            f"- DO NOT reject it by claiming it looks like a 'static ground tower' or 'lacks evidence of altitude/functionality'. A ground-anchored tower stretching up IS the visual proof of a space elevator in KSP.\n"
-            f"- Be highly lenient. If it remotely looks like the requested structure, approve it.\n\n"
-            f"Additionally, assign the highest applicable KSP achievement level (1-15) based on the mission and screenshot.\n"
-            f"1. Kerbin Orbit | 2. Mun Landing | 3. Docking (Space Stations) | 4. Duna Landing | 5. RSS Earth Orbit\n"
-            f"6. Eve Landing | 7. Asteroid Redirect | 8. RSS Moon Landing | 9. Jool 5 | 10. Interstellar Mission\n"
-            f"11. RSS Mars | 12. RSS Venus Landing | 13. RSS Gas Giant | 14. Kerbol Grand Tour | 15. RSS Interstellar\n"
-            f"If none clearly apply, set ksp_level to 0.\n\n"
-            f"Return ONLY valid JSON:\n"
-            f'{{\n  "approved": true/false,\n  "reason": "brief explanation in the same language as the mission description",\n  "ksp_level": integer\n}}'
-        )
-
-        parts = [types.Part.from_text(text=review_prompt)]
-        for img in img_bytes_list:
-            parts.append(types.Part.from_bytes(data=img, mime_type="image/png"))
-
-        try:
-            response = gemini_client.models.generate_content(
-                model=_MODEL,
-                contents=[types.Content(role="user", parts=parts)],
-                config=types.GenerateContentConfig(temperature=0.2, max_output_tokens=512),
-            )
-            record_gemini(response)
-            raw = response.text.strip()
-            if raw.startswith("```"):
-                raw = raw.split("\n", 1)[1] if "\n" in raw else raw[3:]
-            if raw.endswith("```"):
-                raw = raw[:-3]
-            result = json.loads(raw.strip())
-        except Exception as exc:
-            log.error("AI review failed: %s", exc)
-            # Fallback: auto-accept on AI failure
-            await self._auto_accept(interaction, c)
-            return
-
-        if result.get("approved", False):
-            await self._auto_accept(interaction, c, result.get("reason", ""), result.get("ksp_level", 0))
-        else:
-            await self._auto_refuse(interaction, c, result.get("reason", ""))
-
-    async def _auto_accept(self, interaction: discord.Interaction, c: dict, reason: str = "", ksp_level: int = 0):
-        from datetime import datetime
-        cdb.update_contract(self.gid, self.cid, status=cdb.COMPLETED,
-                            completed_at=datetime.utcnow().isoformat())
-        await store.add_balance(self.gid, int(c["contractor_id"]), c["payment"])
-        # Grant XP too for weekly missions
-        diff = c["payment"] // settings.WEEKLY_COINS_PER_DIFFICULTY if settings.WEEKLY_COINS_PER_DIFFICULTY else 0
-        xp = diff * settings.WEEKLY_XP_PER_DIFFICULTY
-        if xp > 0:
-            user = store.get_user(self.gid, int(c["contractor_id"]))
-            from data.store import store as _store
-            await _store.set_xp(self.gid, int(c["contractor_id"]), user["xp"] + xp)
-
-        if ksp_level > 0:
-            from cogs.roles import check_and_award_level
-            interaction.client.loop.create_task(
-                check_and_award_level(interaction.client, self.gid, int(c["contractor_id"]), ksp_level)
-            )
-
-        sym = settings.CURRENCY_SYMBOL
-        e = discord.Embed(
-            title=f"✅ {t(self.gid, 'ct.accepted')}",
-            description=f"{reason}\n\n**+{c['payment']}** {sym} · **+{xp} XP**" if reason else f"**+{c['payment']}** {sym} · **+{xp} XP**",
-            color=discord.Color.green(),
-        )
-        # Update the contract message in corp channel
-        if c.get("dm_message_id"):
-            try:
-                ch = interaction.channel or await interaction.client.fetch_channel(interaction.channel_id)
-                orig = await ch.fetch_message(int(c["dm_message_id"]))
-                c["status"] = cdb.COMPLETED
-                await orig.edit(embed=_embed(c, self.gid), view=None)
-            except Exception:
-                pass
-        await interaction.followup.send(embed=e, ephemeral=True)
-        log.info("AI auto-accepted contract %s", self.cid)
-
-    async def _auto_refuse(self, interaction: discord.Interaction, c: dict, reason: str = ""):
-        # Shared with the two other ways into dispute, so this one is on the auto-fine
-        # clock too — an AI refusal that could be ignored forever would be the easiest
-        # of the three to sit on.
-        cdb.update_contract(self.gid, self.cid, **ca.open_dispute_fields())
-        e = discord.Embed(
-            title=f"❌ {t(self.gid, 'ct.disputed')}",
-            description=reason or t(self.gid, "ct.disputed_desc"),
-            color=discord.Color.red(),
-        )
-        e.set_footer(text=t(self.gid, "ct.disputed_desc"))
-        # Update corp channel message
-        if c.get("dm_message_id"):
-            try:
-                ch = interaction.channel or await interaction.client.fetch_channel(interaction.channel_id)
-                orig = await ch.fetch_message(int(c["dm_message_id"]))
-                c["status"] = cdb.DISPUTED
-                await orig.edit(embed=_embed(c, self.gid), view=DisputeView(self.cid, self.gid))
-            except Exception:
-                pass
-        await interaction.followup.send(embed=e, ephemeral=True)
-        log.info("AI auto-refused contract %s: %s", self.cid, reason)
 
 
 # ── More Time Modal ──────────────────────────────────────────────────────────

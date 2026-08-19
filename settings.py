@@ -233,6 +233,13 @@ LEADERBOARD_PAGE_SIZE = 10
 
 # ── Screenshot Rewards ───────────────────────────────────────────────────────
 
+# When False, the Screenshots cog is not registered at all: /analyze disappears
+# from Discord (run `python bot.py --sync` after flipping this, or the stale
+# command lingers in Discord's tree and fails when invoked). The in-game
+# achievement-photo capture is unaffected — api_server imports the module's
+# Gemini helpers directly, not the cog.
+SCREENSHOT_ANALYSIS_ENABLED = False
+
 # XP awarded per difficulty point (e.g. difficulty 7 × 50 = 350 XP)
 SCREENSHOT_XP_PER_DIFFICULTY = 50
 
@@ -289,11 +296,12 @@ DISPUTE_AUTO_FINE_DAYS = 3
 DISPUTE_MAX_MORE_TIME_REQUESTS = 1
 
 # ── Mod-only gameplay ─────────────────────────────────────────────────────────
-# When True, gameplay commands that the in-game KSP mod can perform itself
-# (screenshot analysis, player-to-player contracts) are disabled on Discord, so
-# the actions can only be triggered from inside the game. Players who invoke
-# them on Discord get an ephemeral notice pointing them to the mod. Gated
-# commands: /analyze, /contract, /flagcontract.
+# When True, gameplay commands that the in-game KSP mod can perform itself are
+# disabled on Discord, so the action can only be triggered from inside the game.
+# Players who invoke them on Discord get an ephemeral notice pointing them to the
+# mod. Only /analyze is still gated by this (and only while
+# SCREENSHOT_ANALYSIS_ENABLED is True): contract creation and submission left
+# Discord for good, so there is nothing left for the switch to turn off there.
 MOD_ONLY_GAMEPLAY = False
 
 # ── Auctions (reverse / Dutch) ───────────────────────────────────────────────
@@ -304,6 +312,12 @@ MOD_ONLY_GAMEPLAY = False
 AUCTION_CHANNEL_ID: int | None = 1518305724667527198
 # A new bid must undercut the current lowest by at least this many KCoins.
 AUCTION_MIN_DECREMENT = 1
+# Lowest starting price an auction may open at. Two, not one: a bid has to undercut
+# the current price by AUCTION_MIN_DECREMENT *and* stay above zero, so an auction that
+# opens at 1 leaves no legal bid at all — it takes the escrow, refuses everyone who
+# tries to bid, and closes with no winner. The floor is therefore one step above the
+# smallest bid anyone could place.
+AUCTION_MIN_START_VALUE = AUCTION_MIN_DECREMENT + 1
 # Bids placed within this many seconds of the end push the end back by the same
 # amount (anti-snipe). Set to 0 to disable.
 AUCTION_ANTISNIPE_SECONDS = 60
@@ -312,10 +326,13 @@ AUCTION_MIN_DURATION_HOURS = 1
 AUCTION_MAX_DURATION_HOURS = 168  # 7 days
 
 # ── Marketplace ──────────────────────────────────────────────────────────────
+# The marketplace is the website plus the mod's Market panel; Discord no longer
+# mirrors listings or sells anything (see cogs/marketplace.py for what is left and
+# why). There is therefore no marketplace channel any more, and no channel to gate
+# listing on — a listing needs somewhere to be *seen*, and that is the website.
 
-# Channel where craft sale listings are posted. Set to None to disable the
-# marketplace (listing attempts from the KSP mod will be rejected).
-MARKETPLACE_CHANNEL_ID: int | None = 1515424482020429875
+# Where a player is pointed when they land on a retired Discord listing mirror.
+MARKETPLACE_WEB_URL = "https://boundlessmissions.com/marketplace"
 
 # Bounds on the price a seller may set for a listing (in KCoins).
 MARKETPLACE_MIN_PRICE = 1

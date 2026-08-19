@@ -39,7 +39,6 @@ log = logging.getLogger(__name__)
 CHANNEL_TYPES: dict[str, tuple[str, str, str, str | None]] = {
     "weekly_missions":   ("Weekly Missions Board", "Where the weekly missions embed is posted.", "text", "WEEKLY_MISSIONS_CHANNEL_ID"),
     "auction":           ("Auction Listings",      "Where /auction reverse-auction posts go.", "text", "AUCTION_CHANNEL_ID"),
-    "marketplace":       ("Marketplace Listings",  "Where craft sale listings are posted.", "text", "MARKETPLACE_CHANNEL_ID"),
     "checkpoint_photos": ("Checkpoint Photos",     "Where in-game milestone 'hero shots' are posted.", "text", "CHECKPOINT_PHOTOS_CHANNEL_ID"),
     "level_up":          ("Level-Up Announcements","Optional dedicated channel for level-up messages.", "text", "LEVEL_UP_CHANNEL_ID"),
     "contract_mod":      ("Contract Escalations",  "Where contract 'sue' escalations are posted (mod review).", "text", "CONTRACT_MOD_CHANNEL_ID"),
@@ -51,7 +50,9 @@ CHANNEL_TYPES: dict[str, tuple[str, str, str, str | None]] = {
 
 # ── Role registry ────────────────────────────────────────────────────────────
 # Level roles are derived from settings.LEVEL_ROLES (names/descriptions + the
-# home-guild fallback ID). The notification + mod roles are added explicitly.
+# home-guild fallback ID). The notification, mod, admin and bug_report roles are
+# added explicitly. "admin" has deliberately NO settings.py fallback: bot-admin
+# authority must be granted per guild on purpose, never inherited from a default.
 def _level_role_key(level: int) -> str:
     return f"level_{level}"
 
@@ -62,6 +63,8 @@ def role_label(key: str) -> str:
         return "🔔 Notifications (self-assign ping role)"
     if key == "mod":
         return "🛡️ Moderator role"
+    if key == "admin":
+        return "⭐ Bot-admin role (guild-scoped /admin commands)"
     if key == "bug_report":
         return "🐛 Bug-report role (pinged by in-game bug reports)"
     if key.startswith("level_"):
@@ -80,6 +83,7 @@ def all_role_keys() -> list[str]:
     keys = [_level_role_key(lvl) for lvl in sorted(settings.LEVEL_ROLES)]
     keys.append("notifications")
     keys.append("mod")
+    keys.append("admin")
     keys.append("bug_report")
     return keys
 

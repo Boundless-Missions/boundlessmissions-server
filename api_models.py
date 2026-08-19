@@ -310,6 +310,8 @@ class AuctionCreateRequest(BaseModel):
     to everyone in Discord; the lowest bidder when it ends is bound to the contract.
     start_value is escrowed up front; the leftover is refunded when it closes."""
     mission: str = Field(..., min_length=3, max_length=500)
+    # The real floor is settings.AUCTION_MIN_START_VALUE, enforced in the handler so
+    # the refusal can say why; this bound only keeps nonsense off the model.
     start_value: int = Field(..., gt=0)
     fine: int = Field(default=0, ge=0)
     due_date: str = Field(..., pattern=r"^\d{4}-\d{2}-\d{2}$")
@@ -515,6 +517,42 @@ class ReportRequest(BaseModel):
 class ReportResult(BaseModel):
     success: bool
     message: str
+
+
+# ── Auctions (website) ───────────────────────────────────────────────────────
+
+class WebAuction(BaseModel):
+    """One open reverse auction as the website shows it. Only OPEN auctions are
+    served — a closed auction becomes a contract, which the Contracts tab shows."""
+    auction_id: str
+    mission: str
+    issuer_name: str
+    start_value: int
+    #: The lowest bid so far; equals start_value until someone bids.
+    current_bid: int
+    current_bidder_name: Optional[str] = None
+    bid_count: int = 0
+    #: A new bid must undercut current_bid by at least this much.
+    min_decrement: int = 1
+    fine: int = 0
+    due_date: str
+    ends_at: str
+    created_at: Optional[str] = None
+    #: craft_build / active_vessel / flag_design, or null when untyped.
+    mission_type: Optional[str] = None
+    modlist: Optional[str] = None
+    #: The caller issued this auction (can end it, cannot bid on it).
+    is_yours: bool = False
+    #: The caller holds the current lowest bid.
+    is_leading: bool = False
+
+
+class WebAuctionListResponse(BaseModel):
+    auctions: list[WebAuction] = []
+
+
+class WebAuctionBidRequest(BaseModel):
+    amount: int = Field(..., gt=0)
 
 
 # ── Notifications ────────────────────────────────────────────────────────────

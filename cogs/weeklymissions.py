@@ -27,6 +27,15 @@ log = logging.getLogger(__name__)
 
 TZ = timezone(timedelta(hours=3))  # GMT+3
 
+# The contract posted here carries no Submit button any more: a mission is finished in
+# KSP and submitted from the mod, which is the only front end that can send the craft
+# and the telemetry the AI review reads. Said on the card so a corp channel is never a
+# dead end.
+SUBMIT_IN_KSP = (
+    "Fly it, then open the mod's sidebar → **Contracts** → **Submit**. "
+    "Submissions no longer happen in Discord."
+)
+
 S.update({
     "wm.title":        {"en": "📋 Weekly Missions"},
     "wm.week":         {"en": "Week {n} ({start} – {end})"},
@@ -294,6 +303,7 @@ async def _handle_selection(interaction: discord.Interaction, week_key: str, gui
     embed.add_field(name="⚠️ Fine", value=f"{mission['fine']} {sym}", inline=True)
     embed.add_field(name="📅 Due", value=due, inline=True)
     embed.set_footer(text=f"Contract: {c['contract_id']}")
+    embed.add_field(name="📤 Submitting", value=SUBMIT_IN_KSP, inline=False)
 
     from cogs.contract_views import ContractWorkView
     view = ContractWorkView(c["contract_id"], guild_id)
@@ -397,7 +407,8 @@ class CustomMissionAcceptView(discord.ui.View):
         c_embed.add_field(name="⚠️ Fine", value=f"{fine} {sym}", inline=True)
         c_embed.add_field(name="📅 Due", value=due, inline=True)
         c_embed.set_footer(text=f"Contract: {c['contract_id']}")
-        
+        c_embed.add_field(name="📤 Submitting", value=SUBMIT_IN_KSP, inline=False)
+
         from cogs.contract_views import ContractWorkView
         view = ContractWorkView(c["contract_id"], guild_id)
         msg = await channel.send(embed=c_embed, view=view)

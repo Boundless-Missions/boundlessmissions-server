@@ -51,6 +51,7 @@ from api_models import (
     MarketplaceListResult, MarketplaceListing, MarketplaceListingsResponse,
     MarketplaceListingsPage, WebBuyResult, CraftCompatibility,
     VoteRequest, VoteResult, MyVotesResponse, ReportRequest, ReportResult,
+    WebAuction, WebAuctionListResponse, WebAuctionBidRequest,
     VersionCheckResponse,
     AttestChallenge, AttestRespondRequest, AttestResult,
 )
@@ -67,6 +68,7 @@ from data import orbit_constraints as oc
 from data import part_resolver as pr
 from data import marketplace as mkt
 from data import imports as imp
+from data import auctions as aucdb
 # The contract state machine, shared with the Discord buttons. `contract_actions`
 # late-imports this module back (for the notification hub and the rescue helpers), so
 # the cycle is resolved at call time, not import time.
@@ -2286,14 +2288,13 @@ async def create_contract_from_ksp(req: ContractCreateRequest, user: dict = Depe
     return ContractAcceptResponse(success=True, message=f"Contract sent! ID: {c['contract_id']}")
 
 
-@app.post("/api/v1/auctions/create", response_model=ContractAcceptResponse)
-async def create_auction_from_ksp(req: AuctionCreateRequest, user: dict = Depends(get_current_user)):
-    """Open a reverse auction from the KSP mod. Escrows start_value, posts it to the
-    Discord auction channel; bidding/closing happen in Discord."""
+async def _open_auction_checked(gid: int, uid: int, username: str,
+                                req: AuctionCreateRequest) -> ContractAcceptResponse:
+    """Validate and open a reverse auction — the whole flow behind both the KSP
+    mod's /auctions/create and the website's /web/auctions, so the two clients
+    cannot drift on rules. Escrows start_value and posts to the Discord auction
+    channels; bidding/closing then happen wherever the player likes."""
     from datetime import date
-
-    gid = int(user["guild_id"])
-    uid = int(user["user_id"])
 
     if _bot_instance is None or not guild_config.any_channel_configured(_bot_instance, "auction"):
         return ContractAcceptResponse(success=False, message="Auctions are not available right now.")
@@ -2301,6 +2302,15 @@ async def create_auction_from_ksp(req: AuctionCreateRequest, user: dict = Depend
         return ContractAcceptResponse(
             success=False,
             message=f"Duration must be {settings.AUCTION_MIN_DURATION_HOURS}–{settings.AUCTION_MAX_DURATION_HOURS} hours.",
+        )
+    # Checked here rather than on the model so a client that gets it wrong reads a
+    # sentence explaining the floor instead of a 422 field error.
+    if req.start_value < settings.AUCTION_MIN_START_VALUE:
+        return ContractAcceptResponse(
+            success=False,
+            message=(f"Starting price must be at least {settings.AUCTION_MIN_START_VALUE} KCoins — "
+                     f"a bid has to undercut it by {settings.AUCTION_MIN_DECREMENT} and stay above "
+                     "zero, so anything lower leaves no bid anyone could place."),
         )
     try:
         dt = datetime.strptime(req.due_date, "%Y-%m-%d").date()
@@ -2333,7 +2343,7 @@ async def create_auction_from_ksp(req: AuctionCreateRequest, user: dict = Depend
     try:
         from cogs.auctions import open_auction
         a = await open_auction(
-            _bot_instance, gid, uid, user["username"], req.mission,
+            _bot_instance, gid, uid, username, req.mission,
             req.start_value, req.fine, req.due_date, req.duration_hours, modlist,
             mission_type=mission_type,
         )
@@ -2345,12 +2355,20 @@ async def create_auction_from_ksp(req: AuctionCreateRequest, user: dict = Depend
             message=f"Insufficient balance ({req.start_value} needed, you have {bal}).",
         )
     except Exception as exc:
-        log.error("KSP auction create failed for user %d: %s", uid, exc)
+        log.error("Auction create failed for user %d: %s", uid, exc)
         return ContractAcceptResponse(success=False, message="Could not post the auction. Try again.")
 
-    log.info("KSP: %s opened auction %s (start %d, %dh)",
-             user["username"], a["auction_id"], req.start_value, req.duration_hours)
+    log.info("%s opened auction %s (start %d, %dh)",
+             username, a["auction_id"], req.start_value, req.duration_hours)
     return ContractAcceptResponse(success=True, message="Auction posted to Discord!")
+
+
+@app.post("/api/v1/auctions/create", response_model=ContractAcceptResponse)
+async def create_auction_from_ksp(req: AuctionCreateRequest, user: dict = Depends(get_current_user)):
+    """Open a reverse auction from the KSP mod. Escrows start_value, posts it to the
+    Discord auction channel; bidding/closing happen in Discord or on the website."""
+    return await _open_auction_checked(int(user["guild_id"]), int(user["user_id"]),
+                                       user["username"], req)
 
 
 # Stock Kerbol-system bodies — used as a server-side fallback to flag a rescue
@@ -3808,13 +3826,11 @@ async def marketplace_list_craft(
     """List a craft (.craft blueprint) for sale on the marketplace.
 
     The mod uploads the craft gzip-compressed (like contract submissions). We
-    decompress and store the raw .craft so the buyer's DM delivery is a straight
-    download. The listing is then posted to the marketplace Discord channel.
+    decompress and store the raw .craft so a buyer's download is a straight one.
+    The listing appears on the website; Discord no longer mirrors it (see
+    cogs/marketplace.py).
     """
     import gzip
-
-    if _bot_instance is None or not guild_config.any_channel_configured(_bot_instance, "marketplace"):
-        return MarketplaceListResult(success=False, message="The marketplace is not available right now.")
 
     if price < settings.MARKETPLACE_MIN_PRICE or price > settings.MARKETPLACE_MAX_PRICE:
         return MarketplaceListResult(
@@ -3913,14 +3929,6 @@ async def marketplace_list_craft(
             reward_note = ("Complexity bonus already claimed today — "
                            f"the next one is in {_fmt_wait(wait)}.")
 
-    # Mirror the listing into every server's marketplace channel (bot loop).
-    try:
-        from cogs.marketplace import post_listing
-        listing = mkt.get_listing(gid, listing["listing_id"]) or listing
-        await post_listing(_bot_instance, listing)
-    except Exception as exc:
-        log.error("Failed to post marketplace listing %s: %s", listing["listing_id"], exc)
-
     log.info("KSP: %s listed craft '%s' for %d (listing %s)",
              user["username"], craft_name, price, listing["listing_id"])
     return MarketplaceListResult(
@@ -3970,14 +3978,6 @@ async def marketplace_delist(listing_id: str, user: dict = Depends(get_current_u
     if listing.get("status") == mkt.ACTIVE:
         mkt.update_listing(gid, listing_id, status=mkt.DELISTED)
         listing["status"] = mkt.DELISTED
-
-    # Update every mirrored marketplace message across servers.
-    if _bot_instance is not None:
-        try:
-            from cogs.marketplace import edit_all_mirrors
-            await edit_all_mirrors(_bot_instance, listing)
-        except Exception as exc:
-            log.warning("Could not update delisted mirrors for %s: %s", listing_id, exc)
 
     return MarketplaceListResult(success=True, message="Craft delisted.", listing_id=listing_id)
 
@@ -4230,10 +4230,10 @@ async def web_marketplace_listings(
 
 @app.post("/api/v1/web/marketplace/{listing_id}/buy", response_model=WebBuyResult)
 async def web_marketplace_buy(listing_id: str, user: dict = Depends(get_user_token_only)):
-    """Buy a craft from the website. Mirrors the Discord Buy button: atomically
-    debits the buyer, credits the seller, queues the craft for KSP auto-import AND
-    returns a direct .craft download URL. Re-buying a craft you already own is a
-    free re-delivery (no charge)."""
+    """Buy a craft from the website — the only place a craft is bought now that
+    Discord's Buy button is retired. Atomically debits the buyer, credits the seller,
+    queues the craft for KSP auto-import AND returns a direct .craft download URL.
+    Re-buying a craft you already own is a free re-delivery (no charge)."""
     gid = int(user["guild_id"])
     uid = int(user["user_id"])
 
@@ -4266,13 +4266,7 @@ async def web_marketplace_buy(listing_id: str, user: dict = Depends(get_user_tok
 
     if not already_owned:
         mkt.record_purchase(gid, listing_id, uid)
-        # Refresh the Discord listing embeds' sale counts, best-effort.
         if _bot_instance is not None:
-            try:
-                from cogs.marketplace import edit_all_mirrors
-                await edit_all_mirrors(_bot_instance, mkt.get_listing(gid, listing_id) or listing)
-            except Exception as exc:
-                log.warning("web buy: could not refresh mirrors for %s: %s", listing_id, exc)
             # Notify the seller, best-effort.
             try:
                 seller = await _bot_instance.fetch_user(seller_id)
@@ -4590,6 +4584,123 @@ async def web_contract_more_time_response(contract_id: str, req: ContractRequest
                                                    actor_name=name, approve=bool(req.approve)))
 
 
+# ── Web auctions ─────────────────────────────────────────────────────────────
+#
+# The website's window onto the same global reverse auctions that run in Discord.
+# One shared document per auction (auctions/{id} in Firestore), so a bid placed
+# here and a press of the Discord "Bid Lower" button are the same write — the
+# rules (undercut by min_decrement, anti-snipe, issuer can't bid) are mirrored
+# from cogs/auctions.BidModal, and every mutation re-renders the Discord mirrors
+# so the channel embeds never lag the site. Only OPEN auctions are listed: a
+# closed auction becomes a contract, which the Contracts tab already shows.
+
+def _web_auction_model(a: dict, uid: str) -> WebAuction:
+    return WebAuction(
+        auction_id=a["auction_id"],
+        mission=a.get("mission", ""),
+        issuer_name=a.get("issuer_name", ""),
+        start_value=int(a.get("start_value", 0)),
+        current_bid=int(a.get("current_bid") or a.get("start_value", 0)),
+        current_bidder_name=a.get("current_bidder_name"),
+        bid_count=int(a.get("bid_count", 0)),
+        min_decrement=int(a.get("min_decrement", 1)),
+        fine=int(a.get("fine", 0)),
+        due_date=a.get("due_date", ""),
+        ends_at=a.get("ends_at", ""),
+        created_at=a.get("created_at"),
+        mission_type=a.get("mission_type"),
+        modlist=a.get("modlist"),
+        is_yours=str(a.get("issuer_id")) == uid,
+        is_leading=(a.get("current_bidder_id") is not None
+                    and str(a.get("current_bidder_id")) == uid),
+    )
+
+
+@app.get("/api/v1/web/auctions", response_model=WebAuctionListResponse)
+async def web_auctions(user: dict = Depends(get_user_token_only)):
+    """Every open auction, soonest-ending first. Auctions are global (mirrored
+    into every server), so there is no guild filter — same view Discord gets."""
+    uid = str(user["user_id"])
+    auctions = [_web_auction_model(a, uid) for a in aucdb.list_open(0)]
+    auctions.sort(key=lambda x: x.ends_at or "")
+    return WebAuctionListResponse(auctions=auctions)
+
+
+@app.post("/api/v1/web/auctions", response_model=ContractAcceptResponse)
+async def web_auction_create(req: AuctionCreateRequest, request: Request,
+                             user: dict = Depends(get_user_token_only)):
+    """Open an auction from the website — same validation and escrow as the KSP
+    endpoint, via the shared helper."""
+    gid, uid, name = _web_actor(user, request)
+    return await _open_auction_checked(gid, uid, name, req)
+
+
+@app.post("/api/v1/web/auctions/{auction_id}/bid", response_model=ContractAcceptResponse)
+async def web_auction_bid(auction_id: str, req: WebAuctionBidRequest, request: Request,
+                          user: dict = Depends(get_user_token_only)):
+    gid, uid, name = _web_actor(user, request)
+    if _bot_instance is None:
+        return ContractAcceptResponse(success=False, message="Auctions are not available right now.")
+    # Re-read fresh to validate against the latest lowest bid (mitigates races) —
+    # the same order of checks as the Discord modal.
+    a = aucdb.get_auction(gid, auction_id)
+    if a is None:
+        raise HTTPException(status_code=404, detail="No such auction")
+    if a["status"] != aucdb.OPEN or a["ends_at"] <= datetime.utcnow().isoformat():
+        return ContractAcceptResponse(success=False, message="This auction has already ended.")
+    if str(uid) == str(a["issuer_id"]):
+        return ContractAcceptResponse(success=False, message="You can't bid on your own auction.")
+
+    step = a.get("min_decrement", 1)
+    ceiling = a["current_bid"] - step
+    if req.amount > ceiling:
+        return ContractAcceptResponse(
+            success=False,
+            message=f"Bid must be at most {ceiling} — undercut the current lowest by at least {step}.",
+        )
+
+    fields = {
+        "current_bid": req.amount,
+        "current_bidder_id": str(uid),
+        "current_bidder_name": name,
+        "bid_count": a["bid_count"] + 1,
+    }
+    # Anti-snipe: a late bid pushes the end back so others can respond.
+    if settings.AUCTION_ANTISNIPE_SECONDS > 0:
+        now = datetime.utcnow()
+        end_dt = datetime.fromisoformat(a["ends_at"])
+        if (end_dt - now).total_seconds() < settings.AUCTION_ANTISNIPE_SECONDS:
+            fields["ends_at"] = (now + timedelta(seconds=settings.AUCTION_ANTISNIPE_SECONDS)).isoformat()
+    aucdb.update_auction(gid, auction_id, **fields)
+    a.update(fields)
+
+    from cogs.auctions import _edit_auction_message
+    await _edit_auction_message(_bot_instance, a, int(a.get("guild_id") or gid), live=True)
+    log.info("WEB: %s bid %d on auction %s", name, req.amount, auction_id)
+    return ContractAcceptResponse(
+        success=True, message=f"Bid placed: {req.amount}. You're the lowest bidder!")
+
+
+@app.post("/api/v1/web/auctions/{auction_id}/end", response_model=ContractAcceptResponse)
+async def web_auction_end(auction_id: str, request: Request,
+                          user: dict = Depends(get_user_token_only)):
+    """End the caller's own auction early — the website's "End now" button."""
+    gid, uid, name = _web_actor(user, request)
+    if _bot_instance is None:
+        return ContractAcceptResponse(success=False, message="Auctions are not available right now.")
+    a = aucdb.get_auction(gid, auction_id)
+    if a is None:
+        raise HTTPException(status_code=404, detail="No such auction")
+    if str(uid) != str(a["issuer_id"]):
+        raise HTTPException(status_code=403, detail="Only the issuer can end this auction.")
+    if a["status"] != aucdb.OPEN:
+        return ContractAcceptResponse(success=False, message="This auction has already ended.")
+    from cogs.auctions import close_auction
+    await close_auction(_bot_instance, gid, auction_id, ended_by="issuer")
+    log.info("WEB: %s ended auction %s early", name, auction_id)
+    return ContractAcceptResponse(success=True, message="Auction ended.")
+
+
 # ── Web → game commands ──────────────────────────────────────────────────────
 #
 # The website can ask the caller's own running KSP to raise a window. It travels
@@ -4708,13 +4819,6 @@ async def web_marketplace_delist(listing_id: str, user: dict = Depends(get_user_
         mkt.update_listing(gid, listing_id, status=mkt.DELISTED)
         listing["status"] = mkt.DELISTED
 
-    if _bot_instance is not None:
-        try:
-            from cogs.marketplace import edit_all_mirrors
-            await edit_all_mirrors(_bot_instance, listing)
-        except Exception as exc:
-            log.warning("web delist: could not update mirrors for %s: %s", listing_id, exc)
-
     return MarketplaceListResult(success=True, message="Craft delisted.", listing_id=listing_id)
 
 
@@ -4734,21 +4838,13 @@ async def web_marketplace_relist(listing_id: str, user: dict = Depends(get_user_
         mkt.update_listing(gid, listing_id, status=mkt.ACTIVE)
         listing["status"] = mkt.ACTIVE
 
-    # Restore the Buy view on every mirrored message across servers.
-    if _bot_instance is not None:
-        try:
-            from cogs.marketplace import edit_all_mirrors
-            await edit_all_mirrors(_bot_instance, listing)
-        except Exception as exc:
-            log.warning("web relist: could not update mirrors for %s: %s", listing_id, exc)
-
     return MarketplaceListResult(success=True, message="Craft relisted.", listing_id=listing_id)
 
 
 @app.post("/api/v1/web/marketplace/{listing_id}/delete", response_model=MarketplaceListResult)
 async def web_marketplace_delete(listing_id: str, user: dict = Depends(get_user_token_only)):
-    """Permanently delete a craft the caller owns: removes the Discord mirror messages,
-    the Storage files and the listing document. Irreversible (vs. delist)."""
+    """Permanently delete a craft the caller owns: erases the Storage files and the
+    listing document. Irreversible (vs. delist)."""
     gid = int(user["guild_id"])
     uid = int(user["user_id"])
 
@@ -4757,15 +4853,6 @@ async def web_marketplace_delete(listing_id: str, user: dict = Depends(get_user_
         raise HTTPException(status_code=404, detail="Listing not found")
     if listing.get("seller_id") != str(uid):
         raise HTTPException(status_code=403, detail="Not your listing")
-
-    # Drop the Discord mirrors first so a half-deleted listing doesn't leave dangling
-    # Buy buttons; then erase Storage + the document.
-    if _bot_instance is not None:
-        try:
-            from cogs.marketplace import delete_all_mirrors
-            await delete_all_mirrors(_bot_instance, listing)
-        except Exception as exc:
-            log.warning("web delete: could not remove mirrors for %s: %s", listing_id, exc)
 
     mkt.delete_listing(listing_id)
     return MarketplaceListResult(success=True, message="Craft permanently deleted.", listing_id=listing_id)
@@ -4922,17 +5009,6 @@ async def admin_listings(q: str = "", user: dict = Depends(get_owner)):
                          for l in items]}
 
 
-async def _admin_refresh_mirrors(listing: dict, listing_id: str, verb: str):
-    """Best-effort re-render of the listing's Discord mirror messages."""
-    if _bot_instance is None:
-        return
-    try:
-        from cogs.marketplace import edit_all_mirrors
-        await edit_all_mirrors(_bot_instance, listing)
-    except Exception as exc:
-        log.warning("admin %s: could not update mirrors for %s: %s", verb, listing_id, exc)
-
-
 @app.patch("/api/v1/web/admin/listings/{listing_id}")
 async def admin_edit_listing(listing_id: str, req: AdminListingEdit,
                              user: dict = Depends(get_owner)):
@@ -4960,22 +5036,15 @@ async def admin_edit_listing(listing_id: str, req: AdminListingEdit,
     mkt.update_listing(0, listing_id, **fields)
     listing.update(fields)
     _admin_audit(user, "edit-listing", f"{listing_id} {fields}")
-    await _admin_refresh_mirrors(listing, listing_id, "edit-listing")
     return {"success": True, "listing": _listing_to_model(listing, include_download=True).model_dump()}
 
 
 @app.delete("/api/v1/web/admin/listings/{listing_id}")
 async def admin_delete_listing(listing_id: str, user: dict = Depends(get_owner)):
-    """Permanently delete any listing: Discord mirrors, Storage files, document."""
+    """Permanently delete any listing: Storage files and the document."""
     listing = mkt.get_listing(0, listing_id)
     if not listing:
         raise HTTPException(status_code=404, detail="Listing not found")
-    if _bot_instance is not None:
-        try:
-            from cogs.marketplace import delete_all_mirrors
-            await delete_all_mirrors(_bot_instance, listing)
-        except Exception as exc:
-            log.warning("admin delete-listing: could not remove mirrors for %s: %s", listing_id, exc)
     mkt.delete_listing(listing_id)
     _admin_audit(user, "delete-listing", f"{listing_id} ({listing.get('craft_name')})")
     return {"success": True}

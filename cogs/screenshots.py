@@ -564,4 +564,11 @@ class Screenshots(commands.Cog, name="Screenshots"):
 
 
 async def setup(bot: commands.Bot) -> None:
+    # Skipping add_cog keeps /analyze out of the command tree entirely (hidden,
+    # not just refused). The module still loads, so api_server's imports of
+    # active_client/_run_gemini/_grant_rewards keep working for the in-game
+    # achievement-photo path.
+    if not settings.SCREENSHOT_ANALYSIS_ENABLED:
+        log.info("Screenshot analysis disabled (settings.SCREENSHOT_ANALYSIS_ENABLED) — /analyze not registered")
+        return
     await bot.add_cog(Screenshots(bot))

@@ -1,7 +1,13 @@
 """
-cogs/contracts.py – Player-to-player contract system.
+cogs/contracts.py – Player-to-player contract system (Discord side).
 
-/g contract @user "mission" money date fine
+Contracts are **created in the KSP mod or on the website**, never here: the old
+`/contract` and `/flagcontract` commands were retired because a contract written
+from Discord could not carry the half that matters — the craft on the build stage,
+the mod list, the orbit and Δv margins a mission is judged against. What is left
+here is the part Discord is actually good at: the offer/dispute/review buttons that
+land in a DM (see `cogs/contract_views.py`), the mod clean-up tool, and the rescue
+leaderboard. `contract_actions.py` is the shared service all front ends call.
 """
 import asyncio
 import logging
@@ -16,11 +22,6 @@ from data.store import store, _db
 from data import contracts as cdb
 from i18n import t, tp, S
 import contract_actions as ca
-from cogs.contract_views import (
-    ContractOfferView, ContractWorkView, ContractReviewView,
-    DisputeView, SettleApprovalView, ModReviewView, _embed,
-)
-from cogs import perms
 
 log = logging.getLogger(__name__)
 
@@ -48,17 +49,6 @@ S.update({
     "ct.sued":           {"en": "⚖️ Case escalated to moderators."},
     "ct.fine_paid":      {"en": "Fine paid."},
     "ct.no_funds":       {"en": "❌ Insufficient balance."},
-    "ct.offer_dm":       {"en": "📜 You received a new contract offer!"},
-    "ct.created":        {"en": "✅ Contract created and sent to {name}."},
-    # Flag-design contracts
-    "ct.flag_mission":   {"en": "🚩 Flag design: {title}"},
-    "ct.flag_offer_dm":  {"en": "🚩 You received a new flag-design request!"},
-    "ct.flag_created":   {"en": "✅ Flag-design contract created and sent to {name}."},
-    "ct.err_self":       {"en": "❌ You can't contract yourself."},
-    "ct.err_funds":      {"en": "❌ Insufficient balance ({need} {sym} required)."},
-    "ct.err_limit":      {"en": "❌ Active contract limit reached ({max})."},
-    "ct.err_dm":         {"en": "❌ Could not DM the user."},
-    "ct.err_date":       {"en": "❌ Invalid date format. Use YYYY-MM-DD."},
     "ct.moretime_request":{"en": "Time Extension Request"},
     "ct.moretime_desc":  {"en": "**{name}** is requesting a deadline extension.\nCurrent: **{old}** → New: **{new}**"},
     # Rescue stats / leaderboard
@@ -77,155 +67,6 @@ class Contracts(commands.Cog, name="Contracts"):
 
     def cog_unload(self):
         self.dispute_timeout_loop.cancel()
-
-    @app_commands.command(name="contract", description="Send a contract to another user")
-    @app_commands.describe(
-        user="User to send the contract to",
-        mission="Mission description",
-        money="Payment amount in KCoins",
-        date_due="Due date (YYYY-MM-DD)",
-        fine="Fine amount if contract is breached",
-    )
-    async def contract(
-        self, interaction: discord.Interaction,
-        user: discord.Member, mission: str,
-        money: int, date_due: str, fine: int,
-    ):
-        gid = interaction.guild_id
-        uid = interaction.user.id
-        sym = settings.CURRENCY_SYMBOL
-
-        if await perms.block_if_mod_only(interaction):
-            return
-
-        # Validations (fast — before defer)
-        if user.id == uid and not settings.CONTRACT_ALLOW_SELF:
-            await interaction.response.send_message(tp(gid, uid, "ct.err_self"), ephemeral=True)
-            return
-
-        # Validate date
-        try:
-            from datetime import datetime, date
-            dt = datetime.strptime(date_due, "%Y-%m-%d").date()
-            if dt <= date.today():
-                await interaction.response.send_message(tp(gid, uid, "ct.err_date"), ephemeral=True)
-                return
-        except ValueError:
-            await interaction.response.send_message(tp(gid, uid, "ct.err_date"), ephemeral=True)
-            return
-
-        # Defer immediately — Firestore queries below can be slow
-        await interaction.response.defer(ephemeral=True)
-
-        # Check contract limit
-        count = cdb.count_active(gid, uid)
-        if count >= settings.MAX_ACTIVE_CONTRACTS_PER_USER:
-            await interaction.followup.send(
-                tp(gid, uid, "ct.err_limit", max=settings.MAX_ACTIVE_CONTRACTS_PER_USER), ephemeral=True)
-            return
-
-        # Escrow: lock the payment. Atomic check-and-deduct so concurrent contract
-        # creates can't each escrow the same funds (double-spend).
-        if not await store.try_debit(gid, uid, money):
-            await interaction.followup.send(
-                tp(gid, uid, "ct.err_funds", need=money, sym=sym), ephemeral=True)
-            return
-
-        # Create contract
-        c = cdb.create_contract(
-            gid, uid, interaction.user.display_name,
-            user.id, user.display_name,
-            mission, money, fine, date_due,
-        )
-
-        # DM the contractor
-        try:
-            e = _embed(c, gid)
-            e.description = t(gid, "ct.offer_dm")
-            view = ContractOfferView(c["contract_id"], gid)
-            dm_msg = await user.send(embed=e, view=view)
-            cdb.update_contract(gid, c["contract_id"], dm_message_id=str(dm_msg.id))
-        except discord.Forbidden:
-            # Refund if can't DM
-            await store.add_balance(gid, uid, money)
-            cdb.update_contract(gid, c["contract_id"], status=cdb.CANCELLED)
-            await interaction.followup.send(tp(gid, uid, "ct.err_dm"), ephemeral=True)
-            return
-
-        await interaction.followup.send(
-            tp(gid, uid, "ct.created", name=user.display_name), ephemeral=True)
-
-    @app_commands.command(name="flagcontract", description="Request a custom flag design from another user")
-    @app_commands.describe(
-        user="User you want to design the flag",
-        title="What the flag should depict / be called",
-        money="Payment amount in KCoins",
-        date_due="Due date (YYYY-MM-DD)",
-        fine="Fine amount if the contract is breached",
-    )
-    async def flagcontract(
-        self, interaction: discord.Interaction,
-        user: discord.Member, title: str,
-        money: int, date_due: str, fine: int,
-    ):
-        gid = interaction.guild_id
-        uid = interaction.user.id
-        sym = settings.CURRENCY_SYMBOL
-
-        if await perms.block_if_mod_only(interaction):
-            return
-
-        if user.id == uid and not settings.CONTRACT_ALLOW_SELF:
-            await interaction.response.send_message(tp(gid, uid, "ct.err_self"), ephemeral=True)
-            return
-
-        # Validate date (must be in the future)
-        try:
-            from datetime import datetime, date
-            dt = datetime.strptime(date_due, "%Y-%m-%d").date()
-            if dt <= date.today():
-                await interaction.response.send_message(tp(gid, uid, "ct.err_date"), ephemeral=True)
-                return
-        except ValueError:
-            await interaction.response.send_message(tp(gid, uid, "ct.err_date"), ephemeral=True)
-            return
-
-        await interaction.response.defer(ephemeral=True)
-
-        # Active-contract limit
-        if cdb.count_active(gid, uid) >= settings.MAX_ACTIVE_CONTRACTS_PER_USER:
-            await interaction.followup.send(
-                tp(gid, uid, "ct.err_limit", max=settings.MAX_ACTIVE_CONTRACTS_PER_USER), ephemeral=True)
-            return
-
-        # Escrow: lock the payment. Atomic check-and-deduct (no double-spend).
-        if not await store.try_debit(gid, uid, money):
-            await interaction.followup.send(
-                tp(gid, uid, "ct.err_funds", need=money, sym=sym), ephemeral=True)
-            return
-
-        c = cdb.create_contract(
-            gid, uid, interaction.user.display_name,
-            user.id, user.display_name,
-            t(gid, "ct.flag_mission", title=title), money, fine, date_due,
-            mission_type=cdb.FLAG_DESIGN,
-        )
-
-        # DM the designer with the offer
-        try:
-            e = _embed(c, gid)
-            e.description = t(gid, "ct.flag_offer_dm")
-            view = ContractOfferView(c["contract_id"], gid)
-            dm_msg = await user.send(embed=e, view=view)
-            cdb.update_contract(gid, c["contract_id"], dm_message_id=str(dm_msg.id))
-        except discord.Forbidden:
-            await store.add_balance(gid, uid, money)
-            cdb.update_contract(gid, c["contract_id"], status=cdb.CANCELLED)
-            await interaction.followup.send(tp(gid, uid, "ct.err_dm"), ephemeral=True)
-            return
-
-        await interaction.followup.send(
-            tp(gid, uid, "ct.flag_created", name=user.display_name), ephemeral=True)
 
     @app_commands.command(name="contractreset", description="[MOD] Cancel all active contracts for a user")
     @app_commands.describe(user="The user whose contracts should be cancelled")

@@ -122,30 +122,28 @@ class _GuildChannelSelect(discord.ui.ChannelSelect):
         self.parent_view._rebuild()
         await interaction.response.edit_message(
             embed=self.parent_view.build_embed(), view=self.parent_view)
-        # When a marketplace/auction channel is first set, mirror the existing
-        # global catalogue into it (back-fill) so the server isn't empty.
-        if key in ("marketplace", "auction"):
+        # When an auction channel is first set, mirror the open auctions into it
+        # (back-fill) so the server isn't empty.
+        if key == "auction":
             interaction.client.loop.create_task(
-                _backfill_after_setchannel(interaction, key, guild_id))
+                _backfill_after_setchannel(interaction, guild_id))
 
 
-async def _backfill_after_setchannel(interaction: discord.Interaction, key: str, guild_id: int) -> None:
-    """Background task: mirror existing marketplace/auction content into a freshly
-    configured channel, then quietly report the count to the admin."""
+async def _backfill_after_setchannel(interaction: discord.Interaction, guild_id: int) -> None:
+    """Background task: mirror the open auctions into a freshly configured auction
+    channel, then quietly report the count to the admin.
+
+    Marketplace listings used to be back-filled the same way; they are the website's
+    now, so an auction is the only catalogue Discord still mirrors."""
     try:
-        if key == "marketplace":
-            from cogs.marketplace import backfill_guild
-            label = "marketplace listing"
-        else:
-            from cogs.auctions import backfill_guild
-            label = "open auction"
+        from cogs.auctions import backfill_guild
         n = await backfill_guild(interaction.client, guild_id)
         if n:
             await interaction.followup.send(
-                f"📦 Mirrored **{n}** existing {label}(s) into this server's channel.",
+                f"📦 Mirrored **{n}** existing open auction(s) into this server's channel.",
                 ephemeral=True)
     except Exception as exc:
-        log.error("Back-fill (%s) failed for guild %s: %s", key, guild_id, exc)
+        log.error("Auction back-fill failed for guild %s: %s", guild_id, exc)
 
 
 class _ClearChannelButton(Button):
@@ -225,9 +223,9 @@ class _SetChannelByIdModal(Modal, title="Set channel by ID / mention"):
         await interaction.response.edit_message(
             embed=self.parent_view.build_embed(), view=self.parent_view)
 
-        if key in ("marketplace", "auction"):
+        if key == "auction":
             interaction.client.loop.create_task(
-                _backfill_after_setchannel(interaction, key, guild.id))
+                _backfill_after_setchannel(interaction, guild.id))
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -236,7 +234,7 @@ class _SetChannelByIdModal(Modal, title="Set channel by ID / mention"):
 
 class SetRoleView(View):
     """Embed + selects letting the admin map each bot role key (level_1..15,
-    notifications, mod) to a role in THIS guild."""
+    notifications, mod, admin, bug_report) to a role in THIS guild."""
 
     def __init__(self, guild: discord.Guild, author_id: int):
         super().__init__(timeout=300)
@@ -340,7 +338,10 @@ class _ClearRoleButton(Button):
 
 
 def is_admin():
-    """Check: user must have Administrator permission or be the bot owner.
+    """Check: user must be the bot owner or hold this guild's mapped bot-admin
+    role (/admin setrole, key "admin"). Guild-scoped commands only — anything
+    with bot-wide effect uses is_owner() instead, since a role granted in one
+    guild must not reach into others.
 
     Gates on the *real* invoker (mimic-safe) so an admin mimicking a higher-
     privileged user can't borrow their authority."""
@@ -381,7 +382,7 @@ class Admin(commands.Cog, name="Admin"):
     # ── /setrole ──────────────────────────────────────────────────────────────
     @app_commands.command(
         name="setrole",
-        description="Map the bot's level / notification / mod roles in this server (Admin only)",
+        description="Map the bot's level / notification / mod / admin roles in this server (Admin only)",
     )
     @is_admin()
     async def setrole(self, interaction: discord.Interaction) -> None:
@@ -460,12 +461,13 @@ class Admin(commands.Cog, name="Admin"):
         await self.bot.close()
 
     # ── /setprefix ────────────────────────────────────────────────────────────
+    # Owner-only: the prefix is process-wide state, not a per-guild setting.
     @app_commands.command(
         name="setprefix",
-        description="Change the bot's prefix command character (Admin only)",
+        description="Change the bot's prefix command character (Owner only)",
     )
     @app_commands.describe(prefix="New prefix character(s)")
-    @is_admin()
+    @is_owner()
     async def setprefix(
         self, interaction: discord.Interaction, prefix: str
     ) -> None:
@@ -476,12 +478,14 @@ class Admin(commands.Cog, name="Admin"):
         log.info("%s changed prefix to '%s'", interaction.user, prefix)
 
     # ── /linkas ───────────────────────────────────────────────────────────────
+    # Owner-only: this mints a session AS another user — impersonation on the
+    # same tier as /mimic, so it carries the same gate.
     @app_commands.command(
         name="linkas",
-        description="Generate a KSP link code that logs in as another user (Admin only)",
+        description="Generate a KSP link code that logs in as another user (Owner only)",
     )
     @app_commands.describe(target="The user whose KSP session to assume")
-    @is_admin()
+    @is_owner()
     async def linkas(self, interaction: discord.Interaction, target: discord.Member) -> None:
         await interaction.response.defer(ephemeral=True)
         code = await asyncio.to_thread(
@@ -560,9 +564,10 @@ class Admin(commands.Cog, name="Admin"):
             )
 
     # ── /publishversion ───────────────────────────────────────────────────────
+    # Owner-only: publishing gates every player's client, in every guild.
     @app_commands.command(
         name="publishversion",
-        description="Register a KSP mod DLL version + hash for the update gate (Admin only)",
+        description="Register a KSP mod DLL version + hash for the update gate (Owner only)",
     )
     @app_commands.describe(
         version="Version label, e.g. 1.2.0",
@@ -571,7 +576,7 @@ class Admin(commands.Cog, name="Admin"):
         sha256="Paste the DLL's SHA256 instead of uploading (optional)",
         set_latest="Make this the required latest version (default: yes)",
     )
-    @is_admin()
+    @is_owner()
     async def publishversion(
         self,
         interaction: discord.Interaction,
@@ -670,9 +675,10 @@ class Admin(commands.Cog, name="Admin"):
         await interaction.followup.send(embed=embed, ephemeral=True)
 
     # ── /policyversion ──────────────────────────────────────────────────────────
+    # Owner-only: bumping forces re-consent for every player, in every guild.
     @app_commands.command(
         name="policyversion",
-        description="Show or bump the Privacy/Terms version players must accept (Admin only)",
+        description="Show or bump the Privacy/Terms version players must accept (Owner only)",
     )
     @app_commands.describe(
         version="New policy version to require (omit to just view the current one)",
@@ -680,7 +686,7 @@ class Admin(commands.Cog, name="Admin"):
         privacy_url="Override the Privacy Policy URL shown to players (optional)",
         terms_url="Override the Terms of Service URL shown to players (optional)",
     )
-    @is_admin()
+    @is_owner()
     async def policyversion(
         self,
         interaction: discord.Interaction,
