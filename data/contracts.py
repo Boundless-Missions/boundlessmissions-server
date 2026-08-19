@@ -8,7 +8,11 @@ from typing import Any
 
 import aiohttp
 
-from data.store import _db, _storage_bucket, safe_filename, safe_content_type
+from data.store import (
+    _db, _storage_bucket, safe_filename, safe_content_type,
+    upload_private, signed_url, sign_stored, is_storage_path,
+    SIGNED_URL_MAX_TTL,
+)
 
 log = logging.getLogger(__name__)
 
@@ -158,7 +162,26 @@ async def upload_to_storage(contract_id: str, filename: str, data: bytes, conten
     return blob.public_url
 
 
+async def upload_private_to_storage(contract_id: str, filename: str, data: bytes,
+                                    content_type: str = "application/octet-stream") -> str:
+    """Upload a file under contracts/{contract_id}/ as a PRIVATE object and return
+    its bucket path (not a URL). Same path convention and sanitization as
+    upload_to_storage, but never made public — the craft/vessel file "private to the
+    two parties" is served only through a signed URL minted at request time. Callers
+    store the returned path on the contract; serve points run it through
+    store.sign_stored()."""
+    if _storage_bucket is None:
+        raise RuntimeError("Firebase Storage not configured")
+    path = f"contracts/{contract_id}/{safe_filename(filename, 'file')}"
+    return upload_private(path, data, content_type)
+
+
 async def download_url(url: str) -> bytes:
+    # A stored reference may be a bare bucket path (a private object) rather than a
+    # URL — resolve it to a signed URL first, so every internal reader works
+    # regardless of which storage scheme produced the reference.
+    if is_storage_path(url):
+        url = signed_url(url)
     async with aiohttp.ClientSession() as s:
         async with s.get(url) as r:
             return await r.read()

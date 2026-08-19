@@ -7,6 +7,19 @@
 
 import os as _os
 
+# Every override below is read straight from the environment, which until now
+# meant they only worked if `config` (the module that calls load_dotenv) had
+# already been imported — import this file first and a .env override silently
+# did nothing. Loading it here too makes the module self-sufficient; the call is
+# idempotent and does not overwrite anything already in the environment, so it
+# cannot conflict with config.py doing the same.
+try:
+    from dotenv import load_dotenv as _load_dotenv
+
+    _load_dotenv()
+except ImportError:  # pragma: no cover - dotenv is a hard dependency in practice
+    pass
+
 
 def _env_float(key: str, default: float) -> float:
     """Read a float from .env, falling back to the default below if unset/blank."""
@@ -43,14 +56,29 @@ BLUEPRINT_SCALE = 2
 # ── Cost Guard: paid-service spending caps ───────────────────────────────────
 #
 # The bot leans on two paid Google services: Gemini (AI screenshot/mission
-# analysis) and Firebase (Firestore + Storage). cost_guard.py meters estimated
-# monthly spend on each — to a LOCAL file, never to Firestore — and cuts a
-# service off once its monthly budget is hit. Budgets reset on the 1st (UTC).
+# analysis) and Firebase (Firestore + Storage). cost_guard.py tracks monthly
+# spend on each — to LOCAL files, never to Firestore — and degrades or cuts off
+# a service as its budget is used up. Budgets reset on the 1st (UTC).
 #
-#   • Gemini over budget  → SOFT degrade: AI calls fall back to heuristics /
-#     "temporarily disabled". The bot keeps running normally.
-#   • Firebase over budget → HARD stop: every Firestore read/write and Storage
-#     transfer raises, so the bot stops persisting until the budget resets.
+# There are two tiers of measurement, and they exist for different reasons:
+#
+#   • TIER 0 — the in-process estimate. Counted by data/firebase_guard.py as the
+#     bot works. Instant, which is the only property that matters for a breaker:
+#     a runaway retry loop has to be stopped in seconds, not at the next poll.
+#     It is an estimate, and it can only see what goes through this process.
+#   • TIER 1 — Cloud Monitoring (data/gcp_metrics.py). Google's own numbers, so
+#     it also sees signed-URL egress, bytes at rest, and usage from scripts or
+#     the console. Lags a few minutes, so it is the truth, not the trigger.
+#
+# Tier 1 corrects tier 0 rather than replacing it: `cost_guard.ingest_usage`
+# adopts the authoritative counts and derives a drift ratio that scales the local
+# estimate between polls. With no IAM grant (or COST_METRICS_ENABLED off) the
+# guard runs on tier 0 alone, exactly as it did before.
+#
+# Enforcement is a ladder, not a wall — see cost_guard.Level:
+#   NORMAL → WARN (owner is told) → DEGRADED (Storage uploads shed, the
+#   expensive and least essential work) → FROZEN (hard stop, after a flush).
+# Gemini degrades softly at every level: it falls back to heuristics.
 #
 # Set a budget to 0 (or negative) to mean "unlimited" — that service is never
 # capped. The values below are the defaults; each can be overridden in .env.
@@ -59,6 +87,52 @@ COST_GUARD_ENABLED: bool = _os.getenv("COST_GUARD_ENABLED", "true").lower() not 
 # Monthly budgets in USD (0 = unlimited).
 GEMINI_MONTHLY_BUDGET_USD: float = _env_float("GEMINI_MONTHLY_BUDGET_USD", 5.0)
 FIREBASE_MONTHLY_BUDGET_USD: float = _env_float("FIREBASE_MONTHLY_BUDGET_USD", 10.0)
+
+# Ladder thresholds, as a fraction of the budget. Crossing one is announced to
+# the owner once; dropping back below it re-arms the announcement.
+COST_WARN_FRACTION: float = _env_float("COST_WARN_FRACTION", 0.5)
+COST_DEGRADE_FRACTION: float = _env_float("COST_DEGRADE_FRACTION", 0.8)
+
+# ── Tier 1: Cloud Monitoring ─────────────────────────────────────────────────
+# Needs roles/monitoring.viewer on the Firebase service account. Until that is
+# granted every poll 403s and the guard silently stays on tier 0.
+COST_METRICS_ENABLED: bool = _os.getenv("COST_METRICS_ENABLED", "true").lower() not in ("false", "0", "no", "off")
+# Poll interval in seconds. This is the only dial that scales what the tracker
+# itself costs: Monitoring read calls are billed (~$0.01/1,000) with a large
+# monthly free allotment, so 300s (~8.6k calls/month) is comfortably free while
+# 10s (~260k) would start to be worth thinking about.
+COST_METRICS_POLL_INTERVAL: int = int(_env_float("COST_METRICS_POLL_INTERVAL", 300))
+
+# ── Tier 2: BigQuery billing export ──────────────────────────────────────────
+# Actual billed dollars, net of free-tier credits. DISPLAY ONLY — it lands a few
+# times a day, so a brake fed by it would let a runaway spend for a whole export
+# cycle before noticing. Tiers 0 and 1 do the stopping; this is the receipt.
+# Needs the export enabled (Billing → Billing export → Standard usage cost) plus
+# roles/bigquery.dataViewer on the dataset and roles/bigquery.jobUser on the
+# project. Until both exist it degrades to "unavailable" and nothing else breaks.
+COST_BILLING_ENABLED: bool = _os.getenv("COST_BILLING_ENABLED", "true").lower() not in ("false", "0", "no", "off")
+COST_BILLING_DATASET: str = _os.getenv("COST_BILLING_DATASET", "")
+# Six hours. The export itself only refreshes a few times a day, so polling
+# faster buys nothing and just spends the 10 MB-per-query floor more often.
+COST_BILLING_POLL_INTERVAL: int = int(_env_float("COST_BILLING_POLL_INTERVAL", 6 * 3600))
+# Hard ceiling on bytes scanned per query — the job is rejected rather than run
+# if it would exceed this. A single project's export is megabytes; 100 MB is
+# generous enough never to fire by accident and small enough that a query gone
+# wrong cannot run up a bill.
+COST_BILLING_MAX_BYTES: int = int(_env_float("COST_BILLING_MAX_BYTES", 100_000_000))
+
+# ── Free tier ────────────────────────────────────────────────────────────────
+# Firebase's free allowances are DAILY (and reset at midnight US/Pacific, not
+# UTC — see gcp_metrics.FREE_TIER_TZ), so they are applied day by day against
+# the per-day usage Monitoring reports. Charging from operation #1, as the old
+# estimator did, overstated a small month's bill by ~100%: it read $0.0059 where
+# Google billed $0.00. Set any of these to 0 to bill from the first operation.
+FREE_FIRESTORE_READS_PER_DAY: int = int(_env_float("FREE_FIRESTORE_READS_PER_DAY", 50_000))
+FREE_FIRESTORE_WRITES_PER_DAY: int = int(_env_float("FREE_FIRESTORE_WRITES_PER_DAY", 20_000))
+FREE_FIRESTORE_DELETES_PER_DAY: int = int(_env_float("FREE_FIRESTORE_DELETES_PER_DAY", 20_000))
+FREE_STORAGE_EGRESS_GB_PER_DAY: float = _env_float("FREE_STORAGE_EGRESS_GB_PER_DAY", 1.0)
+# Bytes at rest is a monthly allowance, not a daily one.
+FREE_STORAGE_STORED_GB: float = _env_float("FREE_STORAGE_STORED_GB", 5.0)
 
 # Estimated unit prices used to convert usage → USD. These are ESTIMATES (Google
 # prices vary by region/tier); tune them in .env to match your billing reality.
@@ -72,6 +146,10 @@ FIRESTORE_DELETE_USD_PER_100K: float = _env_float("FIRESTORE_DELETE_USD_PER_100K
 # Firebase Storage prices, per gigabyte (download = egress, the usual cost driver).
 STORAGE_DOWNLOAD_USD_PER_GB: float = _env_float("STORAGE_DOWNLOAD_USD_PER_GB", 0.12)
 STORAGE_UPLOAD_USD_PER_GB: float = _env_float("STORAGE_UPLOAD_USD_PER_GB", 0.0)
+# Bytes at rest, per GB-month. The one cost a usage breaker cannot stop — it is
+# charged on the accumulated total whether or not anything touches it — so it is
+# metered to be *seen* (a lifecycle rule is the only real fix), not to be capped.
+STORAGE_STORED_USD_PER_GB_MONTH: float = _env_float("STORAGE_STORED_USD_PER_GB_MONTH", 0.026)
 
 
 # ── Moderation & Roles ───────────────────────────────────────────────────────

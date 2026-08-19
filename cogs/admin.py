@@ -760,43 +760,97 @@ class Admin(commands.Cog, name="Admin"):
     async def costs(self, interaction: discord.Interaction) -> None:
         snap = cost_guard.snapshot()
 
-        def fmt_budget(svc: dict) -> str:
-            if svc["unlimited"]:
-                return f"**${svc['usd']:.4f}** / unlimited"
-            pct = (svc["usd"] / svc["budget"] * 100) if svc["budget"] else 0
-            state = "🟢 active" if svc["ok"] else "🔴 capped"
-            return f"**${svc['usd']:.4f}** / ${svc['budget']:.2f}  ({pct:.0f}%) · {state}"
-
-        def human_bytes(n: int) -> str:
+        def human_bytes(n: float) -> str:
             for unit in ("B", "KB", "MB", "GB"):
                 if n < 1024 or unit == "GB":
                     return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
                 n /= 1024
+            return f"{n:.1f} GB"
 
-        g = snap["gemini"]
-        f = snap["firebase"]
+        def fmt_budget(svc: dict) -> str:
+            if svc["unlimited"]:
+                return f"**${svc['usd']:.4f}** / unlimited"
+            pct = (svc["usd"] / svc["budget"] * 100) if svc["budget"] else 0
+            return f"**${svc['usd']:.4f}** / ${svc['budget']:.2f}  ({pct:.0f}%)"
 
-        # Per-component Firebase breakdown (skip rows that cost nothing).
+        g, f, m = snap["gemini"], snap["firebase"], snap["metrics"]
+
+        # Per-component breakdown. `used` is everything measured, `billable` is
+        # what survives the free tier — showing both is the point, since for a
+        # small month the second is zero and the first is not.
         rows = []
-        for label, count, usd in f["lines"]:
-            if count == 0:
+        for line in f["lines"]:
+            if not line["used"] and not line["billable"]:
                 continue
-            qty = human_bytes(count) if "Storage" in label else f"{count:,}"
-            rows.append(f"• {label}: {qty} → **${usd:.4f}**")
+            fmt = human_bytes if line["bytes"] else (lambda v: f"{int(v):,}")
+            free = ""
+            if line["billable"] < line["used"]:
+                free = f" ({fmt(line['used'] - line['billable'])} free)"
+            rows.append(f"• {line['label']}: {fmt(line['used'])}{free} → **${line['usd']:.4f}**")
         breakdown = "\n".join(rows) or "• _no usage recorded yet_"
 
-        guard_state = "on" if snap["enabled"] else "OFF (caps disabled in settings)"
+        level = snap["level"]
+        color, state = {
+            "normal": (discord.Color.green(), "🟢 normal — everything running"),
+            "warning": (discord.Color.gold(), "🟡 warning — past halfway"),
+            "degraded": (discord.Color.orange(), "🟠 degraded — uploads paused"),
+            "frozen": (discord.Color.red(), "🔴 frozen — Firebase paused"),
+        }.get(level, (discord.Color.greyple(), level))
+
+        # Where the numbers come from matters as much as the numbers: an estimate
+        # that cannot see direct-download egress reads low, and saying so is the
+        # difference between a figure and a guess presented as a figure.
+        if not m["enabled"]:
+            source = "⚪ Local estimate only — Cloud Monitoring polling is switched off."
+        elif m["ok"]:
+            when = f"<t:{int(m['fetched_at'])}:R>" if m["fetched_at"] else "just now"
+            drift = m["drift"].get("egress_bytes", 0)
+            source = (f"🛰️ Google's measurements, last read {when}."
+                      + (f"\n  ↳ {human_bytes(drift)} of egress the bot cannot see itself "
+                         f"({m['signed_urls']:,} direct-download links issued)." if drift > 0 else ""))
+        else:
+            source = (f"⚠️ Local estimate only — Cloud Monitoring unavailable:\n"
+                      f"  `{(m['error'] or 'unknown')[:150]}`\n"
+                      "  Figures will read **low**: direct-download egress and bytes "
+                      "at rest are invisible without it.")
+
+        # The invoice, when we have it. Shown next to our own estimate rather
+        # than instead of it: the estimate is what the brake acts on, and the
+        # gap between the two is the error in our price constants.
+        billed = snap["billed"]
+        invoice = ""
+        if billed.get("ok"):
+            invoice = (f"\n\n**🧾 Actually billed** (Google, net of free tier)\n"
+                       f"**{billed['total_usd']:.4f} {billed.get('currency', 'USD')}** "
+                       f"this invoice month")
+            top = [s for s in billed.get("services", []) if abs(s["net"]) >= 0.0001][:4]
+            if top:
+                invoice += "\n" + "\n".join(
+                    f"• {s['service']}: **{s['net']:.4f}**" for s in top)
+            elif billed.get("services"):
+                invoice += " — every service fully covered by free-tier credits."
+
+        storage = snap["storage"]
+        at_rest = ""
+        if storage["stored_bytes"]:
+            at_rest = (f"\n\n**💾 Stored** {human_bytes(storage['stored_bytes'])} "
+                       f"(first {storage['free_gb']:.0f} GB free) — "
+                       f"**${storage['projected_month_usd']:.4f}**/month at this size. "
+                       "No brake can stop this one; it needs a lifecycle rule.")
+
         embed = discord.Embed(
-            title=f"💸 Estimated service spend: {snap['month']}",
-            color=discord.Color.green() if (g["ok"] and f["ok"]) else discord.Color.red(),
+            title=f"💸 Service spend: {snap['month']}",
+            color=color,
             description=(
-                f"Cost guard: **{guard_state}**\n"
-                "Figures are local estimates from usage, not Google's billing.\n\n"
-                f"**🤖 Gemini** (soft-degrade)\n{fmt_budget(g)}\n\n"
-                f"**🔥 Firebase** (hard-stop)\n{fmt_budget(f)}\n{breakdown}"
+                f"**Guard:** {state}"
+                + ("" if snap["enabled"] else "  ·  ⚠️ caps disabled")
+                + f"\n**Source:** {source}\n\n"
+                f"**🤖 Gemini** (falls back to heuristics)\n{fmt_budget(g)}\n\n"
+                f"**🔥 Firebase** (ladder: warn → uploads paused → frozen)\n"
+                f"{fmt_budget(f)}\n{breakdown}{at_rest}{invoice}"
             ),
         )
-        embed.set_footer(text="Budgets reset on the 1st (UTC). Tune prices/budgets in settings.py / .env.")
+        embed.set_footer(text="Budgets reset on the 1st (UTC). Free tier applied per day (US/Pacific).")
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
     # ── Error handler ─────────────────────────────────────────────────────────

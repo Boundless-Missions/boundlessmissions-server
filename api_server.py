@@ -24,11 +24,13 @@ from fastapi import (
     WebSocket, WebSocketDisconnect,
 )
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from firebase_admin import firestore
 from pydantic import BaseModel
 
 import settings
 from config import cfg
+from cost_guard import FirebaseBudgetExceeded, guard as cost_guard
 from api_auth import (
     validate_link_code, create_session_token, verify_session_token,
     logout_all_devices, create_approval_challenge, resolve_approval, poll_approval,
@@ -52,7 +54,7 @@ from api_models import (
     VersionCheckResponse,
     AttestChallenge, AttestRespondRequest, AttestResult,
 )
-from data.store import store, _db, _storage_bucket
+from data.store import store, _db, _storage_bucket, sign_stored, SIGNED_URL_MAX_TTL
 from data import contracts as cdb
 from data import guild_config
 from data import mod_version as mver
@@ -93,6 +95,26 @@ if cfg.API_CORS_ORIGINS:
         allow_origins=cfg.API_CORS_ORIGINS,
         allow_methods=["*"],
         allow_headers=["*"],
+    )
+
+
+@app.exception_handler(FirebaseBudgetExceeded)
+async def _budget_exceeded_handler(request: Request, exc: FirebaseBudgetExceeded):
+    """A spending stop is a service state, not a bug.
+
+    Without this every Firestore call made while the cost guard is frozen
+    surfaces to the KSP client and the website as an opaque 500, which reads as
+    "the server is broken" and invites exactly the retry storm that makes the
+    spend worse. 503 + Retry-After says the right thing to both: the mod's error
+    handling treats it as a transient outage, and the message explains itself.
+    """
+    return JSONResponse(
+        status_code=503,
+        content={"detail": str(exc), "reason": "budget_exceeded"},
+        # The freeze lifts on the 1st, but a client should not be told to sleep
+        # for days — an hour is long enough to stop hammering and short enough
+        # to pick up a budget the owner raises by hand.
+        headers={"Retry-After": "3600"},
     )
 
 
@@ -993,6 +1015,34 @@ async def attest_respond(req: AttestRespondRequest, request: Request,
     return AttestResult(ok=False)
 
 
+# ── Debug/test-only endpoints ────────────────────────────────────────────────
+#
+# Gated by cfg.DEBUG_ENDPOINTS_ENABLED: 404 for everyone when off (invisible in
+# production, like the owner console), so this ships harmlessly. Used by the KSP
+# debug test panel to prove the signed-URL invariant end to end: a private object
+# is reachable through its signed URL but NOT through its bare public URL.
+
+@app.get("/api/v1/debug/signtest")
+async def debug_signtest(user: dict = Depends(get_user_token_only)):
+    """Mint a throwaway PRIVATE object and return both a signed URL (should 200) and
+    its bare public URL (should 403). Dev-server only; 404 when the gate is off."""
+    if not cfg.DEBUG_ENDPOINTS_ENABLED:
+        raise HTTPException(status_code=404, detail="Not found")
+    from data.store import upload_private, signed_url as _signed
+    uid = str(user["user_id"])
+    path = f"debug/signtest/{uid}/{secrets.token_hex(8)}.txt"
+    payload = f"gk-signtest {datetime.now(timezone.utc).isoformat()}".encode()
+    await asyncio.to_thread(upload_private, path, payload, "text/plain")
+    # public_url is the unsigned object URL; on a private object it must 403.
+    public_url = _storage_bucket.blob(path).public_url
+    return {
+        "signed_url": await asyncio.to_thread(_signed, path),
+        "public_url": public_url,
+        "expected": {"signed_status": 200, "public_status": 403},
+        "note": "Signed URL should download; the bare public URL should be forbidden.",
+    }
+
+
 # ── User Profile ─────────────────────────────────────────────────────────────
 
 @app.get("/api/v1/user/profile", response_model=UserProfile)
@@ -1797,7 +1847,7 @@ async def get_active_contracts(user: dict = Depends(get_current_user)):
                 rescue_target=rescue_target,
                 rescue_kerbals=rescue_kerbals,
                 is_modded_target=is_modded_target,
-                rescue_vessel_node_url=rescue_vessel_node_url,
+                rescue_vessel_node_url=sign_stored(rescue_vessel_node_url),
                 rescue_pid=rescue_pid,
                 flag_preview_url=c.get("flag_preview_url"),
                 life_support=c.get("life_support", "none") or "none",
@@ -1924,7 +1974,7 @@ async def accept_contract(contract_id: str, user: dict = Depends(get_current_use
     rt = r.data.get("rescue_target") or {}
     return ContractAcceptResponse(
         success=True, message=r.message,
-        rescue_vessel_node_url=r.data.get("rescue_vessel_node_url"),
+        rescue_vessel_node_url=sign_stored(r.data.get("rescue_vessel_node_url")),
         rescue_target=RescueTarget(**rt) if rt else None,
         rescue_kerbals=r.data.get("rescue_kerbals", []),
     )
@@ -2401,7 +2451,10 @@ async def create_rescue_contract(
     # Store the wreck snapshot (gzipped ConfigNode) in Firebase Storage.
     try:
         node_bytes = await _read_upload(vessel_node)
-        node_url = await cdb.upload_to_storage(
+        # Private, like the submitted vessel node: the wreck is transferred only to
+        # the rescuer, served via a signed URL (get_incoming/active_contracts and the
+        # import-queue serve point).
+        node_url = await cdb.upload_private_to_storage(
             c["contract_id"], "rescue_vessel.cfg", node_bytes, "application/gzip")
         updates: dict = {"rescue_vessel_node_url": node_url}
         # On a "vessel" recovery the wreck's own parts are the evidence it came home,
@@ -2847,11 +2900,14 @@ async def submit_contract(
     # Upload files to Firebase Storage
     stored_files = []
 
-    # Craft file
+    # Craft file. Stored PRIVATE (a bare bucket path, not a public URL): a contract
+    # craft is private to the two parties, so it's reachable only through a signed
+    # URL minted at download time (see download_craft / sign_stored). Screenshots
+    # below stay public — they're shown in Discord embeds and the web review.
     if craft_file:
         data = await _read_upload(craft_file)
         try:
-            url = await cdb.upload_to_storage(
+            url = await cdb.upload_private_to_storage(
                 contract_id, craft_file.filename, data,
                 craft_file.content_type or "application/octet-stream"
             )
@@ -2955,10 +3011,12 @@ async def submit_contract(
         except Exception as exc:
             log.warning("Failed to render/store orbit telemetry for %s: %s", contract_id, exc)
 
-    # Upload vessel node (full vessel state for transfer) to Storage
+    # Upload vessel node (full vessel state for transfer) to Storage. Private, like
+    # the craft file above — it's the transferred vessel, private to the parties, and
+    # is served only via a signed URL (download_craft / the import-queue serve points).
     if vn_data is not None:
         try:
-            vn_url = await cdb.upload_to_storage(
+            vn_url = await cdb.upload_private_to_storage(
                 contract_id, "vessel_node.cfg", vn_data, "application/gzip"
             )
             update_fields["vessel_node_url"] = vn_url
@@ -3329,10 +3387,16 @@ async def download_craft(contract_id: str, user: dict = Depends(get_current_user
     if not craft_files and not vessel_node_url:
         raise HTTPException(status_code=404, detail="No craft file or vessel data in submission")
 
+    # The craft/vessel objects are private; mint a short-lived signed URL for each
+    # reference the client is about to download. sign_stored passes legacy public
+    # URLs through unchanged, so pre-migration submissions still resolve.
+    signed_craft_files = [
+        {**f, "url": sign_stored(f.get("url"))} for f in craft_files
+    ]
     return {
-        "craft_files": craft_files,
+        "craft_files": signed_craft_files,
         "loadmeta": c.get("loadmeta"),
-        "vessel_node_url": vessel_node_url,
+        "vessel_node_url": sign_stored(vessel_node_url),
     }
 
 
@@ -3359,7 +3423,8 @@ async def get_submission_preview(contract_id: str, user: dict = Depends(get_curr
     # flag is only exposed once the contract is completed (i.e. paid for).
     if c.get("mission_type") == cdb.FLAG_DESIGN:
         if c.get("status") == cdb.COMPLETED and c.get("flag_fullres_url"):
-            url, fname = c["flag_fullres_url"], (c.get("flag_filename") or "flag.png")
+            # Private full-res once completed → sign it; the watermarked preview is public.
+            url, fname = sign_stored(c["flag_fullres_url"]), (c.get("flag_filename") or "flag.png")
         else:
             url, fname = c.get("flag_preview_url"), "flag_preview.png"
         images = [{"filename": fname, "url": url}] if url else []
@@ -3387,6 +3452,19 @@ async def get_submission_preview(contract_id: str, user: dict = Depends(get_curr
     }
 
 
+def _sign_import_entry(e: dict) -> dict:
+    """Return a copy of an import/gift queue entry with its craft/vessel file
+    references resolved to signed URLs for the client to download. Only the file
+    fields are touched; image fields (blueprint_url) and legacy public URLs pass
+    through unchanged via sign_stored. The queue stores a private object as a bare
+    path, so the URL is minted fresh on each poll rather than baked in at enqueue."""
+    out = dict(e)
+    for k in ("craft_url", "vessel_node_url", "flag_url"):
+        if out.get(k):
+            out[k] = sign_stored(out[k])
+    return out
+
+
 @app.get("/api/v1/craft/imports/pending")
 async def craft_imports_pending(user: dict = Depends(get_current_user)):
     """Crafts the player queued (in Discord) for auto-import into their save.
@@ -3407,7 +3485,7 @@ async def craft_imports_pending(user: dict = Depends(get_current_user)):
             continue
         # dedup_key lets the mod skip an entry it already processed into this save.
         dedup = e["ref_id"] if e.get("source") == "contract" else f"{e.get('source')}:{e['ref_id']}"
-        imports.append({**e, "dedup_key": dedup})
+        imports.append({**_sign_import_entry(e), "dedup_key": dedup})
 
     imports.sort(key=lambda x: x.get("created_at") or "")
     return {"imports": imports}
@@ -3433,7 +3511,7 @@ async def craft_gifts_pending(user: dict = Depends(get_current_user)):
     """Quicksent crafts awaiting this player's accept/decline decision."""
     gid = int(user["guild_id"])
     uid = int(user["user_id"])
-    gifts = [e for e in imp.list_pending(gid, uid)
+    gifts = [_sign_import_entry(e) for e in imp.list_pending(gid, uid)
              if (e.get("status") or "queued") == "offered"]
     gifts.sort(key=lambda x: x.get("created_at") or "")
     return {"gifts": gifts}
@@ -3456,7 +3534,10 @@ async def craft_gift_accept(import_id: str, user: dict = Depends(get_current_use
     imp.set_status(gid, uid, import_id, "queued")
     entry["status"] = "queued"
     entry["dedup_key"] = f"{entry.get('source')}:{entry['ref_id']}"
-    return {"success": True, "entry": entry}
+    # The client imports on the spot from this entry, so sign its file references now.
+    signed_entry = _sign_import_entry(entry)
+    signed_entry["dedup_key"] = entry["dedup_key"]
+    return {"success": True, "entry": signed_entry}
 
 
 @app.post("/api/v1/craft/gifts/{import_id}/reject")
@@ -3808,8 +3889,15 @@ async def marketplace_delist(listing_id: str, user: dict = Depends(get_current_u
 #  goes through here so the bot stays the single source of truth.
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _listing_to_model(l: dict) -> MarketplaceListing:
-    """Map a raw Firestore listing dict to the API model (used by the web grid)."""
+def _listing_to_model(l: dict, include_download: bool = False) -> MarketplaceListing:
+    """Map a raw Firestore listing dict to the API model.
+
+    craft_url is the paywalled download link and is withheld by default: the public
+    grid must not hand a non-buyer the craft. It's included (as a fresh signed URL,
+    7-day max TTL so a page left open still works) only for owner/buyer surfaces —
+    My Uploads and My Purchases — where the caller is entitled to the file."""
+    craft_url = (sign_stored(l.get("craft_url"), ttl=SIGNED_URL_MAX_TTL)
+                 if include_download else None)
     return MarketplaceListing(
         listing_id=l["listing_id"],
         seller_id=l["seller_id"],
@@ -3825,7 +3913,7 @@ def _listing_to_model(l: dict) -> MarketplaceListing:
         mods=l.get("mods", []) or [],
         thumbnail_url=l.get("thumbnail_url") or None,
         blueprint_url=l.get("blueprint_url") or None,
-        craft_url=l.get("craft_url") or None,
+        craft_url=craft_url,
         craft_filename=l.get("craft_filename") or None,
         status=l.get("status", mkt.ACTIVE),
         life_support=l.get("life_support", "none") or "none",
@@ -4099,7 +4187,8 @@ async def web_marketplace_buy(listing_id: str, user: dict = Depends(get_user_tok
         message=("Re-downloaded (you already own this craft)." if already_owned
                  else f"Purchased for {price:,} {settings.CURRENCY_NAME}. Queued for KSP import."),
         balance=bal,
-        craft_url=listing.get("craft_url") or None,
+        # Buyer just paid (or already owns) → mint a signed download link.
+        craft_url=sign_stored(listing.get("craft_url")) or None,
         craft_filename=listing.get("craft_filename") or None,
         already_owned=already_owned,
         compatibility=_craft_compatibility(gid, uid, listing),
@@ -4483,7 +4572,9 @@ async def web_marketplace_mine(user: dict = Depends(get_user_token_only)):
     """The caller's own listings (active + delisted) — the "My Uploads" view."""
     uid = int(user["user_id"])
     items = sorted(mkt.list_by_seller(uid), key=lambda l: l.get("created_at") or "", reverse=True)
-    return MarketplaceListingsResponse(listings=[_listing_to_model(l) for l in items])
+    # Owner of these listings → entitled to the download link.
+    return MarketplaceListingsResponse(
+        listings=[_listing_to_model(l, include_download=True) for l in items])
 
 
 @app.get("/api/v1/web/marketplace/purchases", response_model=MarketplaceListingsResponse)
@@ -4491,7 +4582,9 @@ async def web_marketplace_purchases(user: dict = Depends(get_user_token_only)):
     """Crafts the caller has bought — the "My Purchases" view (free re-download)."""
     uid = int(user["user_id"])
     items = sorted(mkt.list_by_buyer(uid), key=lambda l: l.get("created_at") or "", reverse=True)
-    return MarketplaceListingsResponse(listings=[_listing_to_model(l) for l in items])
+    # Buyer of these crafts → entitled to re-download.
+    return MarketplaceListingsResponse(
+        listings=[_listing_to_model(l, include_download=True) for l in items])
 
 
 @app.post("/api/v1/web/marketplace/{listing_id}/delist", response_model=MarketplaceListResult)
@@ -4645,6 +4738,13 @@ class AdminChannelLock(BaseModel):
 class AdminControls(BaseModel):
     version_check_enabled: Optional[bool] = None
     device_binding_enabled: Optional[bool] = None
+    # Cost guard. Budgets are settable at runtime because the failure mode that
+    # matters is a *false* stop — wrong price constants freezing a bot that has
+    # not actually overspent. Before this, the only way out was editing .env and
+    # restarting, which is the worst moment to need a restart.
+    cost_guard_enabled: Optional[bool] = None
+    firebase_budget_usd: Optional[float] = None
+    gemini_budget_usd: Optional[float] = None
 
 class AdminPolicyBump(BaseModel):
     summary: str = ""
@@ -4704,7 +4804,7 @@ async def admin_listings(q: str = "", user: dict = Depends(get_owner)):
     # report_count is merged in here rather than added to MarketplaceListing: the
     # same model serves the public grid, and "how many people complained about this"
     # is a moderation fact, not a shopping one.
-    return {"listings": [{**_listing_to_model(l).model_dump(),
+    return {"listings": [{**_listing_to_model(l, include_download=True).model_dump(),
                           "report_count": int(l.get("report_count", 0) or 0)}
                          for l in items]}
 
@@ -4748,7 +4848,7 @@ async def admin_edit_listing(listing_id: str, req: AdminListingEdit,
     listing.update(fields)
     _admin_audit(user, "edit-listing", f"{listing_id} {fields}")
     await _admin_refresh_mirrors(listing, listing_id, "edit-listing")
-    return {"success": True, "listing": _listing_to_model(listing).model_dump()}
+    return {"success": True, "listing": _listing_to_model(listing, include_download=True).model_dump()}
 
 
 @app.delete("/api/v1/web/admin/listings/{listing_id}")
@@ -5071,6 +5171,54 @@ async def admin_publish_version(
 
 # ── Master controls ──────────────────────────────────────────────────────────
 
+@app.get("/api/v1/web/admin/costs")
+async def admin_costs(user: dict = Depends(get_owner)):
+    """This month's spend: what we estimate, what Google measured, and the gap.
+
+    Everything here is read from local state — no Firestore, no Storage. The
+    console page that shows the bill must not itself be a line on it, and more
+    to the point it has to keep working when the guard has frozen Firebase.
+    """
+    snap = cost_guard.snapshot()
+    snap["history"] = cost_guard.history()
+    return snap
+
+
+@app.post("/api/v1/web/admin/costs/refresh")
+async def admin_costs_refresh(user: dict = Depends(get_owner)):
+    """Poll Cloud Monitoring now, clearing a stuck permission failure first.
+
+    A 403 is remembered so a missing IAM grant doesn't re-fail every 5 minutes
+    for the rest of the month. That memory has to be clearable from somewhere
+    once the role is actually granted, or the only fix is a restart."""
+    from data import gcp_billing, gcp_metrics
+
+    gcp_metrics.client.reset_disabled()
+    usage = await gcp_metrics.fetch_usage()
+    if usage.ok:
+        cost_guard.ingest_usage(usage)
+    else:
+        cost_guard.note_metrics_error(usage.error)
+
+    # Same treatment for tier 2. Its two normal-but-unhappy states — export not
+    # loaded yet, IAM not granted yet — are both things this button exists to
+    # retry after fixing, and resetting clears the remembered table name too so a
+    # newly created export table is discovered.
+    gcp_billing.client.reset_disabled()
+    billed = await gcp_billing.fetch_billing()
+    if billed.ok:
+        cost_guard.ingest_billing(billed)
+    else:
+        cost_guard.note_billing_error(billed.error)
+
+    _admin_audit(user, "costs-refresh",
+                 f"metrics={'ok' if usage.ok else usage.error}; "
+                 f"billing={'ok' if billed.ok else billed.error}")
+    snap = cost_guard.snapshot()
+    snap["history"] = cost_guard.history()
+    return snap
+
+
 @app.get("/api/v1/web/admin/controls")
 async def admin_controls(user: dict = Depends(get_owner)):
     return {
@@ -5078,6 +5226,9 @@ async def admin_controls(user: dict = Depends(get_owner)):
         "device_binding_enabled": cfg.KSP_DEVICE_BINDING_ENABLED,
         "policy": policy.get_config(),
         "policy_version": policy.get_version(),
+        "cost_guard_enabled": settings.COST_GUARD_ENABLED,
+        "firebase_budget_usd": settings.FIREBASE_MONTHLY_BUDGET_USD,
+        "gemini_budget_usd": settings.GEMINI_MONTHLY_BUDGET_USD,
     }
 
 
@@ -5091,13 +5242,28 @@ async def admin_set_controls(req: AdminControls, user: dict = Depends(get_owner)
         broadcast_version_update()
     if req.device_binding_enabled is not None:
         cfg.KSP_DEVICE_BINDING_ENABLED = bool(req.device_binding_enabled)
+    # cost_guard reads these out of `settings` on every check rather than caching
+    # them, so assigning here takes effect on the next operation — including
+    # lifting a freeze that is already in force.
+    if req.cost_guard_enabled is not None:
+        settings.COST_GUARD_ENABLED = bool(req.cost_guard_enabled)
+    if req.firebase_budget_usd is not None:
+        settings.FIREBASE_MONTHLY_BUDGET_USD = max(0.0, float(req.firebase_budget_usd))
+    if req.gemini_budget_usd is not None:
+        settings.GEMINI_MONTHLY_BUDGET_USD = max(0.0, float(req.gemini_budget_usd))
     _admin_audit(user, "controls",
-                 f"version_check={req.version_check_enabled} device_binding={req.device_binding_enabled}")
+                 f"version_check={req.version_check_enabled} device_binding={req.device_binding_enabled} "
+                 f"cost_guard={req.cost_guard_enabled} fb_budget={req.firebase_budget_usd} "
+                 f"gemini_budget={req.gemini_budget_usd}")
     return {
         "success": True,
         "persisted": False,
         "version_check_enabled": cfg.KSP_VERSION_CHECK_ENABLED,
         "device_binding_enabled": cfg.KSP_DEVICE_BINDING_ENABLED,
+        "cost_guard_enabled": settings.COST_GUARD_ENABLED,
+        "firebase_budget_usd": settings.FIREBASE_MONTHLY_BUDGET_USD,
+        "gemini_budget_usd": settings.GEMINI_MONTHLY_BUDGET_USD,
+        "level": cost_guard.snapshot()["level"],
     }
 
 

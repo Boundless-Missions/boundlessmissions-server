@@ -9,9 +9,22 @@ The wrappers are recursive, transparent proxies:
 
   • On the happy path (Firebase under budget) they pass straight through, only
     incrementing the usage counters in cost_guard so spend can be estimated.
-  • Once the Firebase budget is spent, `guard.require_firebase()` raises
-    `FirebaseBudgetExceeded` on every network operation (get/set/delete/commit,
-    blob upload/download) — the "hard stop".
+  • As the budget runs down they enforce cost_guard's ladder: at DEGRADED,
+    `require_firebase(upload=True)` refuses new bytes into Storage while
+    everything else keeps working; at FROZEN every network operation raises
+    `FirebaseBudgetExceeded` (get/set/delete/commit, blob upload/download).
+
+Uploads are singled out because they are the expensive, deferrable half: turning
+away a new craft file leaves the bot wholly usable, whereas refusing reads takes
+it down. That is the whole point of having a rung before the wall.
+
+WHAT THIS FILE CANNOT SEE
+A signed or public URL is downloaded by the client straight from GCS, so those
+bytes never pass through this process and cannot be metered here — see
+`generate_signed_url` below, which counts the *issuing* of such URLs as a
+diagnostic and leaves the bytes to Cloud Monitoring (tier 1). This is the blind
+spot the two-tier design exists for: the local meter reacts instantly to what it
+can see, and Google's numbers close the gap on the next poll.
 
 Counting is best-effort and must never raise; the gate is authoritative.
 """
@@ -141,17 +154,28 @@ class _GuardedBlob:
             return attr
 
         def method(*args, **kwargs):
-            transfers = name.startswith("upload") or name.startswith("download")
-            if transfers or name == "delete":
-                guard.require_firebase()
+            uploading = name.startswith("upload")
+            if uploading or name.startswith("download") or name == "delete":
+                # Uploads are refused a rung early (DEGRADED); the rest only at
+                # the hard stop. See cost_guard.Level.
+                guard.require_firebase(upload=uploading)
             result = attr(*args, **kwargs)
             try:
-                if name.startswith("upload") and args:
+                if uploading and args:
                     data = args[0]
                     if isinstance(data, (bytes, bytearray, str)):
                         guard.note_storage(upload=len(data))
                 elif name.startswith("download") and isinstance(result, (bytes, bytearray)):
                     guard.note_storage(download=len(result))
+                elif name == "generate_signed_url":
+                    # Local signing, no network — nothing to gate. But the
+                    # download it authorises is real egress we will never
+                    # otherwise see, so the URL is counted. Only the count: the
+                    # object's size isn't known without a metadata round-trip
+                    # (which would itself cost an operation), and inventing a
+                    # figure would corrupt the very estimate this exists to
+                    # protect. Cloud Monitoring reports the actual bytes.
+                    guard.note_signed_url()
             except Exception:  # pragma: no cover
                 pass
             return result

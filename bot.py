@@ -172,6 +172,7 @@ class GeneKermanBot(commands.Bot):
             "cogs.marketplace",
             "cogs.contractcraft",
             "cogs.tickets",
+            "cogs.costwatch",
         ]
 
         if cfg.ENABLE_MOD_COMMANDS:
@@ -334,9 +335,31 @@ class GeneKermanBot(commands.Bot):
                 custom_id = interaction.data.get("custom_id")
                 print(f"[ExtLog] {real_user}{spoof_str} submitted modal: {custom_id}")
 
+    @staticmethod
+    def _budget_stop(error: BaseException) -> "FirebaseBudgetExceeded | None":
+        """The FirebaseBudgetExceeded behind a command error, if that's what this
+        is. discord.py wraps handler exceptions in CommandInvokeError, so the
+        cause chain has to be walked rather than the top-level type checked."""
+        from cost_guard import FirebaseBudgetExceeded
+
+        seen = 0
+        cursor: BaseException | None = error
+        while cursor is not None and seen < 8:
+            if isinstance(cursor, FirebaseBudgetExceeded):
+                return cursor
+            cursor = getattr(cursor, "original", None) or cursor.__cause__
+            seen += 1
+        return None
+
     async def on_command_error(
         self, ctx: commands.Context, error: commands.CommandError
     ) -> None:
+        budget = self._budget_stop(error)
+        if budget is not None:
+            # Not a fault, and not news to the maintainer — cogs/costwatch.py
+            # DMs them the moment the level changes. Just say what's happening.
+            await ctx.send(f"🛑 {budget}")
+            return
         if isinstance(error, commands.MissingPermissions):
             await ctx.send("❌ You don't have permission to use that command.")
         elif isinstance(error, commands.CommandNotFound):
@@ -354,6 +377,19 @@ class GeneKermanBot(commands.Bot):
             await ctx.send("💥 An unexpected error occurred. The maintainer (<@815228135049527297>) has been pinged via DM.")
 
     async def on_app_command_error(self, interaction: discord.Interaction, error: app_commands.AppCommandError):
+        budget = self._budget_stop(error)
+        if budget is not None:
+            # A spending stop is a known state, not a crash. Saying "unexpected
+            # error" here (and DMing the maintainer for every command anyone runs
+            # while frozen) buries the one message that actually explains it.
+            log.warning("Command refused by the cost guard: %s", error)
+            msg = f"🛑 {budget}"
+            if not interaction.response.is_done():
+                await interaction.response.send_message(msg, ephemeral=True)
+            else:
+                await interaction.followup.send(msg, ephemeral=True)
+            return
+
         log.error("Unhandled app command error: %s", error, exc_info=True)
         try:
             maintainer = self.get_user(815228135049527297) or await self.fetch_user(815228135049527297)

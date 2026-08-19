@@ -41,6 +41,7 @@ _bucket_name = os.getenv("FIREBASE_STORAGE_BUCKET", "")
 _app = firebase_admin.initialize_app(_cred, {
     "storageBucket": _bucket_name,
 } if _bucket_name else None)
+from cost_guard import guard
 from data.firebase_guard import wrap_firestore, wrap_bucket
 
 # All Firestore / Storage access flows through these two handles (every cog
@@ -94,6 +95,78 @@ def safe_content_type(claimed: str) -> str:
     application/octet-stream, so a public blob can't be served as active content."""
     c = (claimed or "").split(";", 1)[0].strip().lower()
     return c if c in _SAFE_UPLOAD_CTYPES else "application/octet-stream"
+
+
+# ── Private objects + signed URLs ────────────────────────────────────────────
+#
+# File objects that should not be world-readable (a contract craft "private to the
+# two parties", or a friend's quicksent payload) are uploaded WITHOUT make_public()
+# and stored on their Firestore doc as a bucket *path* rather than a public URL. A
+# short-lived V4 signed URL is minted at serve time, right before the consumer
+# downloads. `sign_stored` is the read side used by every serve point: it signs a
+# bare storage path and passes a legacy/public http URL through unchanged, so
+# already-stored public URLs keep working and the migration can stay partial.
+
+# A minted URL only has to outlive one API response plus the download that follows
+# it (the mod fetches the URL from a response and downloads immediately), so this is
+# kept just generous enough for a large craft on a slow link.
+SIGNED_URL_TTL = 900  # seconds (15 min)
+
+# For a URL that has to live inside a durable surface (a Discord embed a player may
+# click days after a contract completes). 7 days is the V4 signed-URL maximum. The
+# in-game import queue re-signs on every poll, so this link is only the secondary
+# "also download here" convenience — after it lapses the craft still imports in game.
+SIGNED_URL_MAX_TTL = 7 * 24 * 3600  # seconds (GCS V4 hard cap)
+
+
+def upload_private(path: str, data: bytes,
+                   content_type: str = "application/octet-stream") -> str:
+    """Upload bytes to a NON-public object and return its bucket path (not a URL).
+
+    Unlike the public upload helpers, this never calls make_public(): the object is
+    reachable only through a signed URL minted by sign_stored()/signed_url() at
+    serve time. The returned path is what gets stored on the Firestore doc."""
+    if _storage_bucket is None:
+        raise RuntimeError("Firebase Storage not configured")
+    blob = _storage_bucket.blob(path)
+    blob.upload_from_string(data, content_type=safe_content_type(content_type))
+    log.info("Uploaded private object %s (%d bytes)", path, len(data) if data else 0)
+    return path
+
+
+def signed_url(path: str, ttl: int = SIGNED_URL_TTL) -> str:
+    """A short-lived V4 signed GET URL for a bucket path. The service-account key
+    signs locally, so this is a cheap local operation with no extra round-trip."""
+    if _storage_bucket is None:
+        raise RuntimeError("Firebase Storage not configured")
+    from datetime import timedelta
+    return _storage_bucket.blob(path).generate_signed_url(
+        version="v4", expiration=timedelta(seconds=ttl), method="GET")
+
+
+def is_storage_path(value: str | None) -> bool:
+    """True for a bare bucket path (a private object), False for a full http(s) URL
+    or an empty value. The one predicate every serve point uses to tell a
+    signable private reference from a pass-through legacy/public URL."""
+    return bool(value) and not (value.startswith("http://") or value.startswith("https://"))
+
+
+def sign_stored(value: str | None, ttl: int = SIGNED_URL_TTL) -> str | None:
+    """Serve-time resolver for a stored craft/vessel reference.
+
+    New private objects are stored as a bare bucket path → sign it. Legacy values
+    and objects still public (marketplace/rescue) are full http(s) URLs → pass
+    through unchanged. None/empty → unchanged. This is what lets the migration be
+    partial and backward-compatible: a serve point can call it on every reference
+    without knowing which storage scheme produced it. Never raises — on a signing
+    failure it returns the original value so the caller degrades rather than 500s."""
+    if not is_storage_path(value):
+        return value
+    try:
+        return signed_url(value, ttl)
+    except Exception as exc:
+        log.warning("Could not sign stored object %r: %s", value, exc)
+        return value
 
 
 def _default_user() -> UserData:
@@ -238,27 +311,34 @@ class UserStore:
             self._dirty_users.clear()
 
         try:
-            batch = _db.batch()
-            count = 0
+            # If the cost guard has just frozen Firebase, this flush is exactly
+            # the write that must still get through: everything in `dirty` is
+            # minutes of XP and balance held only in memory, and a freeze that
+            # lasts until the 1st guarantees a restart drops it. The guard arms
+            # one grace pass on freezing; outside that this is a no-op and normal
+            # gating applies.
+            with guard.final_flush():
+                batch = _db.batch()
+                count = 0
 
-            for user_id in dirty:
-                user_data = self._users.get(user_id)
-                if user_data is None:
-                    continue
+                for user_id in dirty:
+                    user_data = self._users.get(user_id)
+                    if user_data is None:
+                        continue
 
-                doc_ref = _db.collection("users").document(user_id)
-                batch.set(doc_ref, user_data)
-                count += 1
+                    doc_ref = _db.collection("users").document(user_id)
+                    batch.set(doc_ref, user_data)
+                    count += 1
 
-                # Firestore batches max out at 500 operations
-                if count >= 450:
+                    # Firestore batches max out at 500 operations
+                    if count >= 450:
+                        batch.commit()
+                        log.info("Committed Firestore batch (%d docs)", count)
+                        batch = _db.batch()
+                        count = 0
+
+                if count > 0:
                     batch.commit()
-                    log.info("Committed Firestore batch (%d docs)", count)
-                    batch = _db.batch()
-                    count = 0
-
-            if count > 0:
-                batch.commit()
             log.info("Saved %d global user records to Firestore", len(dirty))
         except Exception as exc:
             log.error("Failed to save to Firestore: %s", exc, exc_info=True)

@@ -388,17 +388,25 @@ class ReviewAcceptButton(DynamicItem[Button], template=r"ct_rv_acc:" + _ID_PATTE
         files = c.get("submitted_files", [])
         craft_files = [s for s in files if s['filename'].lower().endswith('.craft')]
         if craft_files:
-            flist = "\n".join(f"🚀 [{s['filename']}]({s['url']})" for s in craft_files)
+            # The craft object is private; this Discord link is the secondary
+            # "also download here" convenience (the in-game import queue is the
+            # primary, always-fresh path), so sign it with the 7-day max TTL.
+            flist = "\n".join(
+                f"🚀 [{s['filename']}]({cdb.sign_stored(s['url'], ttl=cdb.SIGNED_URL_MAX_TTL)})"
+                for s in craft_files)
             e.add_field(name="📁 Craft Files", value=flist, inline=False)
         screenshots = [s for s in files if not s['filename'].lower().endswith('.craft')]
         if screenshots:
             flist = "\n".join(f"🖼️ [{s['filename']}]({s['url']})" for s in screenshots)
             e.add_field(name="🖼️ Screenshots", value=flist, inline=False)
-        # Flag-design: reveal the clean full-res flag now that it's paid for.
+        # Flag-design: reveal the clean full-res flag now that it's paid for. The
+        # object is private; sign it (7-day max TTL) for the embed image + link, which
+        # Discord fetches on post. The in-game flag-picker delivery is the durable path.
         if c.get("mission_type") == cdb.FLAG_DESIGN and c.get("flag_fullres_url"):
-            e.set_image(url=c["flag_fullres_url"])
+            fullres = cdb.sign_stored(c["flag_fullres_url"], ttl=cdb.SIGNED_URL_MAX_TTL)
+            e.set_image(url=fullres)
             e.add_field(name="🚩 Flag (full-res)",
-                        value=f"[Download]({c['flag_fullres_url']}); also queued to your "
+                        value=f"[Download]({fullres}); also queued to your "
                               "in-game flag picker.", inline=False)
         # The contractor's "accepted" DM is sent by the service, so every front end
         # produces it — not just this button.
@@ -860,7 +868,11 @@ class FileSelectView(View):
         for f in selected_files:
             try:
                 data = await cdb.download_url(f["url"])
-                url = await cdb.upload_to_storage(self.cid, f["filename"], data, f.get("content_type", ""))
+                # Match the in-game submit path: the craft file is private (served via
+                # a signed URL), screenshots stay public (shown in embeds / web review).
+                is_craft = f["filename"].lower().endswith(".craft")
+                upload = cdb.upload_private_to_storage if is_craft else cdb.upload_to_storage
+                url = await upload(self.cid, f["filename"], data, f.get("content_type", ""))
                 stored.append({"filename": f["filename"], "url": url, "content_type": f.get("content_type", "")})
             except Exception as exc:
                 log.error("Upload failed: %s", exc)
@@ -932,9 +944,11 @@ class FileSelectView(View):
             await interaction.followup.send("❌ Could not read your uploaded flag. Try again.", ephemeral=True)
             return
 
-        # Full-res stays gated; only the watermarked preview is shown until accept.
-        fullres_url = await cdb.upload_to_storage(self.cid, img["filename"], raw,
-                                                  img.get("content_type", "image/png"))
+        # Full-res stays gated: stored PRIVATE (a bare path), surfaced only through a
+        # signed URL once the contract completes (the embed/preview serve points sign
+        # it). Only the watermarked preview below is public and shown until accept.
+        fullres_url = await cdb.upload_private_to_storage(self.cid, img["filename"], raw,
+                                                          img.get("content_type", "image/png"))
         preview_url = await cdb.upload_to_storage(
             self.cid, "flag_preview.png", flag_preview.make_watermarked(raw), "image/png")
 

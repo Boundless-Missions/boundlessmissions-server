@@ -67,6 +67,12 @@ class Config:
     # Set API_DOCS_ENABLED=true only for local development.
     API_DOCS_ENABLED: bool = _optional("API_DOCS_ENABLED", "false").lower() in ("true", "1", "yes", "on")
 
+    # Debug/test-only endpoints (e.g. /api/v1/debug/signtest, used by the KSP debug
+    # test panel to verify the signed-URL invariant). OFF by default and 404 when
+    # off — invisible in production, exactly like the owner console. Turn on ONLY on
+    # a dev server with DEBUG_ENDPOINTS_ENABLED=true to run the in-game live tests.
+    DEBUG_ENDPOINTS_ENABLED: bool = _optional("DEBUG_ENDPOINTS_ENABLED", "false").lower() in ("true", "1", "yes", "on")
+
     # Browser CORS allow-list (comma-separated origins). Empty by default — the KSP
     # client is UnityWebRequest (not a browser) and needs no CORS, so no wildcard is
     # served. Set explicit origins only if a browser front-end must call the API.

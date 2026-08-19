@@ -14,7 +14,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any
 
-from data.store import _db, _storage_bucket, safe_filename
+from data.store import _db, _storage_bucket, safe_filename, upload_private
 
 log = logging.getLogger(__name__)
 
@@ -22,20 +22,16 @@ ImportEntry = dict[str, Any]
 
 
 def upload_gift(import_id: str, filename: str, data: bytes) -> str:
-    """Upload a quicksent craft/vessel payload to Storage. Returns its public URL.
-
-    Used by the friend-quicksend endpoint: the (already decompressed) bytes are
-    stored under a per-gift path so the recipient's KSP client can download and
-    import them via the normal craft-import queue.
+    """Upload a quicksent craft/vessel payload to Storage. Returns its bucket PATH
+    (not a public URL) — the payload is a PRIVATE object, served to the recipient
+    only through a signed URL minted when they poll the gift/import queue (see
+    _sign_import_entry in api_server). A quicksent craft is a private hand-off
+    between two players, so it must not be world-readable by its URL.
     """
     if _storage_bucket is None:
         raise RuntimeError("Firebase Storage not configured")
     path = f"gifts/{import_id}/{safe_filename(filename, 'craft.craft')}"
-    blob = _storage_bucket.blob(path)
-    blob.upload_from_string(data, content_type="text/plain")
-    blob.make_public()
-    log.info("Uploaded gift %s to Storage", path)
-    return blob.public_url
+    return upload_private(path, data, content_type="text/plain")
 
 
 def upload_gift_blueprint(import_id: str, data: bytes) -> str:

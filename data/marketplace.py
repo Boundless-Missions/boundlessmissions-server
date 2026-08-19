@@ -17,7 +17,7 @@ from typing import Any
 
 from firebase_admin import firestore
 
-from data.store import _db, _storage_bucket, safe_filename
+from data.store import _db, _storage_bucket, safe_filename, upload_private
 
 log = logging.getLogger(__name__)
 
@@ -306,20 +306,19 @@ def record_report(listing: ListingData, reporter_id: int | str, reporter_name: s
 
 
 async def upload_craft(listing_id: str, filename: str, data: bytes) -> str:
-    """Upload a raw (decompressed) .craft file to Storage. Returns public URL."""
+    """Upload a raw (decompressed) .craft file to Storage as a PRIVATE object and
+    return its bucket path (not a public URL).
+
+    A listing's craft is behind the paywall: the download URL is minted (signed) only
+    for the buyer / owner surfaces (buy result, My Purchases, My Uploads) and is
+    withheld from the public grid. The browser download still forces a save because
+    the website's /api/marketplace/download proxy streams it with
+    Content-Disposition: attachment — so no per-object content_disposition is needed."""
     if _storage_bucket is None:
         raise RuntimeError("Firebase Storage not configured")
     name = safe_filename(filename, 'craft.craft')
     path = f"marketplace/{listing_id}/{name}"
-    blob = _storage_bucket.blob(path)
-    # Force a download (not inline text) when the browser hits the public URL:
-    # the .craft is text/plain, so without this GCS renders it in the tab. The
-    # HTML `download` attribute can't help — it's ignored for cross-origin URLs.
-    blob.content_disposition = f'attachment; filename="{name}"'
-    blob.upload_from_string(data, content_type="text/plain")
-    blob.make_public()
-    log.info("Uploaded %s to Storage", path)
-    return blob.public_url
+    return upload_private(path, data, content_type="text/plain")
 
 
 async def upload_blueprint(listing_id: str, data: bytes, content_type: str = "image/png") -> str:
