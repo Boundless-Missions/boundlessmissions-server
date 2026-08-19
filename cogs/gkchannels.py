@@ -2,7 +2,7 @@
 cogs/gkchannels.py – Gene Kerman channel gating system.
 
 Controls which channels the bot can operate in:
-- Mods can toggle any channel as a "GK channel" via /gk setchannel
+- Mods can toggle any channel as a "GK channel" via /mod gkchannel
 - All corporation channels are GK channels by default
 - Regular users can only use /gk commands in GK channels
 - Mods can use /gk commands anywhere
@@ -143,14 +143,18 @@ class GKChannels(commands.Cog, name="GKChannels"):
     async def cog_load(self) -> None:
         load_gk_channels()
 
-    # ── /setchannel (mod toggle) ─────────────────────────────────────────────
+    # ── /gkchannel (mod toggle) ──────────────────────────────────────────────
+    # NOT named `setchannel`: cogs/admin.py owns that name, and every command is
+    # registered flat on the tree before bot.py regroups them into /admin and /mod,
+    # so the two would collide at load time and take this whole cog down with them.
+    # (With COMMAND_GROUP empty — the default — they would collide outright.)
     @app_commands.command(
-        name="setchannel",
+        name="gkchannel",
         description="Toggle this channel as a Boundless Missions channel (Mod only)",
     )
     @app_commands.default_permissions(kick_members=True)
     @mod_only()
-    async def setchannel(self, interaction: discord.Interaction) -> None:
+    async def gkchannel(self, interaction: discord.Interaction) -> None:
         gid = interaction.guild_id
         cid = interaction.channel_id
         uid = interaction.user.id

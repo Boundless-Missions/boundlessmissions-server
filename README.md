@@ -12,7 +12,7 @@ A modular, non-production-ready Discord bot built with **discord.py 2.x** design
 | **Economy** | KCoins currency, balances, payments (`/balance`, `/pay`, `/leaderboard`) |
 | **XP System** | Leveling system with rewards for chatting and completing missions |
 | **Screenshots** | AI analysis of KSP screenshots using Gemini AI to detect celestial bodies and mods (`/analyze`) |
-| **GKChannels** | Gate bot commands to specific channels (`/g setchannel`) |
+| **GKChannels** | Gate bot commands to specific channels (`/mod gkchannel`) |
 | **Admin/Mod** | General moderation, announcements, localization settings, and configuration |
 
 All commands are available as **slash commands** (`/`).

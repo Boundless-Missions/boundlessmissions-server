@@ -154,7 +154,7 @@ STORAGE_STORED_USD_PER_GB_MONTH: float = _env_float("STORAGE_STORED_USD_PER_GB_M
 
 # ── Moderation & Roles ───────────────────────────────────────────────────────
 
-# Role ID that grants access to moderation commands (/kick, /ban, /gk setchannel, etc.)
+# Role ID that grants access to moderation commands (/kick, /ban, /mod gkchannel, etc.)
 # If set to None, users must have Discord's built-in Kick Members or Admin permissions.
 MOD_ROLE_ID: int | None = 1492234876273823916
 

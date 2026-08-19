@@ -20,7 +20,12 @@ from data.store import _db
 import settings
 from data import guild_config
 from i18n import t, tp
-from cogs.gkchannels import add_gk_channel, remove_gk_channel
+# gkchannels is imported lazily at each call site, not bound here: corps loads
+# BEFORE cogs.gkchannels, and load_extension re-execs an already-imported module
+# into a second object. Binding the functions now would bind them to that dead
+# copy, whose _gk_channels cache is empty — so add/remove would read an empty set
+# and _persist would overwrite the guild's whole gk_channels list with one entry.
+# (cogs/tickets.py and cogs/weeklymissions.py import is_mod the same way.)
 
 
 def _get_corp_ref(guild_id: int, user_id: int):
@@ -264,6 +269,7 @@ class Corps(commands.Cog, name="Corps"):
         channel, pin_msg = await _create_corp_channel(guild, member, name)
 
         # Auto-register as GK channel
+        from cogs.gkchannels import add_gk_channel
         add_gk_channel(guild.id, channel.id)
 
         # Save to Firestore (per-guild record + global ownership pointer)
@@ -304,6 +310,7 @@ class Corps(commands.Cog, name="Corps"):
                         await old_channel.delete(reason=f"Corporation replaced by {owner}")
                     except discord.Forbidden:
                         log.warning("No permission to delete old corp channel %s", old_channel_id)
+                from cogs.gkchannels import remove_gk_channel
                 remove_gk_channel(old_gid, int(old_channel_id))
 
             # Delete the old per-guild record + clear the global pointer.
@@ -315,6 +322,7 @@ class Corps(commands.Cog, name="Corps"):
         channel, pin_msg = await _create_corp_channel(guild, owner, new_name)
 
         # Auto-register as GK channel
+        from cogs.gkchannels import add_gk_channel
         add_gk_channel(guild.id, channel.id)
 
         now = datetime.datetime.now(datetime.timezone.utc)

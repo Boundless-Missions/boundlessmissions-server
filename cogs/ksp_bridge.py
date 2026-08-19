@@ -43,6 +43,13 @@ S.update({
 # the clicker actually owns the challenge before applying the decision.
 
 async def _finish_approval(interaction: discord.Interaction, challenge_id: str, approve: bool):
+    # Acknowledge before touching Firestore: resolve_approval is a blocking
+    # round-trip that can outlast Discord's 3-second interaction window, which
+    # left the decision applied but the prompt un-edited (10062 Unknown
+    # interaction) with its buttons still live. A component defer() is a
+    # deferred_message_update, so edit_original_response still edits the prompt.
+    await interaction.response.defer()
+
     ok = await asyncio.to_thread(
         resolve_approval, challenge_id, str(interaction.user.id), approve)
     if not ok:
@@ -56,7 +63,7 @@ async def _finish_approval(interaction: discord.Interaction, challenge_id: str, 
         color = discord.Color.red()
     e = discord.Embed(description=msg, color=color)
     # Replace the prompt so the buttons can't be pressed again.
-    await interaction.response.edit_message(embed=e, view=None)
+    await interaction.edit_original_response(embed=e, view=None)
 
 
 class KSPLoginButton(DynamicItem[Button], template=r"ksp_login:(?P<chid>[^:]+)"):
@@ -157,6 +164,9 @@ async def _post_device_base_ticket(client: discord.Client, data: dict, challenge
 
 
 async def _finish_device(interaction: discord.Interaction, challenge_id: str, approve: bool):
+    # Acknowledge first — same reason as _finish_approval above.
+    await interaction.response.defer()
+
     data = await asyncio.to_thread(
         resolve_device_challenge, challenge_id, str(interaction.user.id), approve)
     if data is None:
@@ -170,7 +180,7 @@ async def _finish_device(interaction: discord.Interaction, challenge_id: str, ap
                "sign every device out of your account, then re-link only your own PC.")
         color = discord.Color.red()
     e = discord.Embed(description=msg, color=color)
-    await interaction.response.edit_message(embed=e, view=None)
+    await interaction.edit_original_response(embed=e, view=None)
     # Open the ticket after responding so the 3s interaction window is never at risk.
     if data is not None and not approve:
         await _post_device_base_ticket(interaction.client, data, challenge_id)
@@ -217,6 +227,10 @@ class KSPDevicePingButton(DynamicItem[Button], template=r"ksp_dev_ping:(?P<chid>
         return cls(match["chid"])
 
     async def callback(self, interaction: discord.Interaction):
+        # thinking=True so the defer is a new ephemeral message rather than an edit:
+        # the approve/report prompt has to survive a ping.
+        await interaction.response.defer(ephemeral=True, thinking=True)
+
         ok = await asyncio.to_thread(
             request_device_ping, self.chid, str(interaction.user.id))
         if ok:
@@ -227,7 +241,7 @@ class KSPDevicePingButton(DynamicItem[Button], template=r"ksp_dev_ping:(?P<chid>
                    "• If no PC you can see lights up, it isn't you, so press **🚫 No, report it**.")
         else:
             msg = "⌛ This device request has expired or was already handled, so the ping couldn't be sent."
-        await interaction.response.send_message(msg, ephemeral=True)
+        await interaction.followup.send(msg, ephemeral=True)
 
 
 class DeviceApprovalView(View):
