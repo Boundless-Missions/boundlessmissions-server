@@ -2,7 +2,7 @@
 api_auth.py – KSP ↔ Discord authentication layer.
 
 Flow:
-  1. User runs /g linkcode in Discord → 6-digit code stored in Firestore (10 min TTL)
+  1. User runs /b linkcode in Discord → 6-digit code stored in Firestore (10 min TTL)
   2. KSP client sends POST /api/v1/auth/link with the code
   3. Server validates, returns a signed session token (HMAC-SHA256)
   4. KSP stores the token locally, sends it with every request via Authorization header

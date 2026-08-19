@@ -13,7 +13,6 @@ import logging
 from datetime import datetime, timedelta, timezone
 
 import discord
-from discord import app_commands
 from discord.ext import commands, tasks
 from discord.ui import View, Button, DynamicItem
 
@@ -57,15 +56,6 @@ S.update({
     # Buttons
     "auc.btn_bid":         {"en": "📉 Bid Lower"},
     "auc.btn_end":         {"en": "🛑 End now"},
-    # Command feedback / errors
-    "auc.err_disabled":    {"en": "❌ Auctions are not configured (no channel set in settings)."},
-    "auc.err_amount":      {"en": "❌ Starting price must be a positive amount."},
-    "auc.err_duration":    {"en": "❌ Duration must be between {min} and {max} hours."},
-    "auc.err_date":        {"en": "❌ Invalid date. Use YYYY-MM-DD (must be in the future)."},
-    "auc.err_funds":       {"en": "❌ Insufficient balance. You must escrow **{need}** {sym}."},
-    "auc.err_limit":       {"en": "❌ Active contract limit reached ({max})."},
-    "auc.err_post":        {"en": "❌ Could not post to the auction channel. Escrow refunded."},
-    "auc.created":         {"en": "✅ Auction posted to {channel}."},
     # Bidding
     "auc.bid_modal_title": {"en": "Place a lower bid"},
     "auc.bid_field":       {"en": "Your price in KCoins"},
@@ -208,8 +198,8 @@ async def open_auction(bot, gid: int, issuer_id: int, issuer_name: str, mission:
     """Escrow `start_value`, create the auction doc, and post it to the auction
     channel. Returns the auction doc. Raises (after refunding the escrow) if the
     post fails. Callers must pre-validate balance / limit / date / duration and
-    that an auction channel is configured for this guild (guild_config). Shared by
-    the /auction slash command and the KSP-mod API endpoint.
+    that an auction channel is configured for this guild (guild_config). Called
+    only by the KSP-mod API endpoint — auctions are opened from the game.
 
     The escrow debit is atomic (try_debit): even though callers pre-validate the
     balance, that check and this debit aren't a single operation, so a concurrent
@@ -283,7 +273,9 @@ async def close_auction(bot, gid: int, auction_id: str, *, ended_by: str = "time
             winner = await bot.fetch_user(int(winner_id))
             e = _embed(c, origin_gid)
             e.description = t(origin_gid, "auc.won_dm", price=final, sym=sym)
-            dm = await winner.send(embed=e, view=ContractWorkView(c["contract_id"], origin_gid))
+            dm = await winner.send(
+                embed=e,
+                view=ContractWorkView(c["contract_id"], origin_gid, c.get("mission_type")))
             cdb.update_contract(origin_gid, c["contract_id"], dm_message_id=str(dm.id))
         except Exception as exc:
             log.warning("Could not DM auction winner %s: %s", winner_id, exc)
@@ -435,86 +427,9 @@ class Auctions(commands.Cog, name="Auctions"):
     async def cog_unload(self):
         self.close_loop.cancel()
 
-    @app_commands.command(name="auction",
-                          description="Post a reverse auction where contractors bid the price down")
-    @app_commands.describe(
-        mission="Mission description",
-        start_value="Starting (maximum) payment in KCoins, escrowed up front",
-        date_due="Contract due date once won (YYYY-MM-DD)",
-        duration_hours="How many hours the auction runs",
-        fine="Fine if the winner breaches the contract (default 0)",
-        mods="Mods required / limited to (optional)",
-        work="What the winner has to deliver (default: let the server classify it)",
-    )
-    @app_commands.choices(work=[
-        app_commands.Choice(name="Craft build", value="craft_build"),
-        app_commands.Choice(name="Active mission", value="active_vessel"),
-        app_commands.Choice(name="Flag design", value=cdb.FLAG_DESIGN),
-    ])
-    async def auction(
-        self, interaction: discord.Interaction,
-        mission: str, start_value: int, date_due: str, duration_hours: int,
-        fine: int = 0, mods: str | None = None,
-        work: app_commands.Choice[str] | None = None,
-    ):
-        gid, uid = interaction.guild_id, interaction.user.id
-        sym = settings.CURRENCY_SYMBOL
-
-        if not guild_config.any_channel_configured(self.bot, "auction"):
-            await interaction.response.send_message(tp(gid, uid, "auc.err_disabled"), ephemeral=True)
-            return
-        if start_value <= 0:
-            await interaction.response.send_message(tp(gid, uid, "auc.err_amount"), ephemeral=True)
-            return
-        if fine < 0:
-            fine = 0
-        if not (settings.AUCTION_MIN_DURATION_HOURS <= duration_hours <= settings.AUCTION_MAX_DURATION_HOURS):
-            await interaction.response.send_message(
-                tp(gid, uid, "auc.err_duration",
-                   min=settings.AUCTION_MIN_DURATION_HOURS, max=settings.AUCTION_MAX_DURATION_HOURS),
-                ephemeral=True)
-            return
-        try:
-            from datetime import date
-            dt = datetime.strptime(date_due, "%Y-%m-%d").date()
-            if dt <= date.today():
-                raise ValueError
-        except ValueError:
-            await interaction.response.send_message(tp(gid, uid, "auc.err_date"), ephemeral=True)
-            return
-
-        await interaction.response.defer(ephemeral=True)
-
-        bal = store.get_user(gid, uid)["balance"]
-        if bal < start_value:
-            await interaction.followup.send(
-                tp(gid, uid, "auc.err_funds", need=start_value, sym=sym), ephemeral=True)
-            return
-        if cdb.count_active(gid, uid) >= settings.MAX_ACTIVE_CONTRACTS_PER_USER:
-            await interaction.followup.send(
-                tp(gid, uid, "auc.err_limit", max=settings.MAX_ACTIVE_CONTRACTS_PER_USER), ephemeral=True)
-            return
-
-        # A flag has no in-game build step, so a part restriction on one would mean
-        # nothing — dropped rather than carried onto the winner's contract unused.
-        mission_type = work.value if work else None
-        if mission_type == cdb.FLAG_DESIGN:
-            mods = None
-
-        # Escrow + create + post (leftover escrow is refunded when the auction closes).
-        try:
-            a = await open_auction(self.bot, gid, uid, interaction.user.display_name,
-                                   mission, start_value, fine, date_due, duration_hours, mods,
-                                   mission_type=mission_type)
-        except Exception as exc:
-            log.error("Failed to post auction: %s", exc)
-            await interaction.followup.send(tp(gid, uid, "auc.err_post"), ephemeral=True)
-            return
-
-        first = (a.get("mirrors") or [{}])[0]
-        chan_ref = f"<#{first['channel_id']}>" if first.get("channel_id") else "the auction channels"
-        await interaction.followup.send(
-            tp(gid, uid, "auc.created", channel=chan_ref), ephemeral=True)
+    # No /auction slash command on purpose: auctions are OPENED from the KSP mod
+    # only. Discord (and the website) is where they are mirrored, bid on and
+    # closed — not where they start.
 
     # ── Background: close auctions whose timer has elapsed ────────────────────
     @tasks.loop(seconds=30)

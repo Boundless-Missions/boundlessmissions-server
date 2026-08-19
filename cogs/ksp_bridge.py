@@ -2,7 +2,7 @@
 cogs/ksp_bridge.py – Discord ↔ KSP bridge commands.
 
 Provides:
-  /g linkcode — Generate a 6-digit code for KSP account linking
+  /b linkcode — Generate a 6-digit code for KSP account linking
   Persistent "🎮 Link KSP" button in missions channel
 """
 

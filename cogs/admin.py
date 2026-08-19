@@ -122,30 +122,28 @@ class _GuildChannelSelect(discord.ui.ChannelSelect):
         self.parent_view._rebuild()
         await interaction.response.edit_message(
             embed=self.parent_view.build_embed(), view=self.parent_view)
-        # When a marketplace/auction channel is first set, mirror the existing
-        # global catalogue into it (back-fill) so the server isn't empty.
-        if key in ("marketplace", "auction"):
+        # When an auction channel is first set, mirror the open auctions into it
+        # (back-fill) so the server isn't empty.
+        if key == "auction":
             interaction.client.loop.create_task(
-                _backfill_after_setchannel(interaction, key, guild_id))
+                _backfill_after_setchannel(interaction, guild_id))
 
 
-async def _backfill_after_setchannel(interaction: discord.Interaction, key: str, guild_id: int) -> None:
-    """Background task: mirror existing marketplace/auction content into a freshly
-    configured channel, then quietly report the count to the admin."""
+async def _backfill_after_setchannel(interaction: discord.Interaction, guild_id: int) -> None:
+    """Background task: mirror the open auctions into a freshly configured auction
+    channel, then quietly report the count to the admin.
+
+    Marketplace listings used to be back-filled the same way; they are the website's
+    now, so an auction is the only catalogue Discord still mirrors."""
     try:
-        if key == "marketplace":
-            from cogs.marketplace import backfill_guild
-            label = "marketplace listing"
-        else:
-            from cogs.auctions import backfill_guild
-            label = "open auction"
+        from cogs.auctions import backfill_guild
         n = await backfill_guild(interaction.client, guild_id)
         if n:
             await interaction.followup.send(
-                f"📦 Mirrored **{n}** existing {label}(s) into this server's channel.",
+                f"📦 Mirrored **{n}** existing open auction(s) into this server's channel.",
                 ephemeral=True)
     except Exception as exc:
-        log.error("Back-fill (%s) failed for guild %s: %s", key, guild_id, exc)
+        log.error("Auction back-fill failed for guild %s: %s", guild_id, exc)
 
 
 class _ClearChannelButton(Button):
@@ -225,9 +223,9 @@ class _SetChannelByIdModal(Modal, title="Set channel by ID / mention"):
         await interaction.response.edit_message(
             embed=self.parent_view.build_embed(), view=self.parent_view)
 
-        if key in ("marketplace", "auction"):
+        if key == "auction":
             interaction.client.loop.create_task(
-                _backfill_after_setchannel(interaction, key, guild.id))
+                _backfill_after_setchannel(interaction, guild.id))
 
 
 # ═══════════════════════════════════════════════════════════════════════════

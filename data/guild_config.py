@@ -39,7 +39,6 @@ log = logging.getLogger(__name__)
 CHANNEL_TYPES: dict[str, tuple[str, str, str, str | None]] = {
     "weekly_missions":   ("Weekly Missions Board", "Where the weekly missions embed is posted.", "text", "WEEKLY_MISSIONS_CHANNEL_ID"),
     "auction":           ("Auction Listings",      "Where /auction reverse-auction posts go.", "text", "AUCTION_CHANNEL_ID"),
-    "marketplace":       ("Marketplace Listings",  "Where craft sale listings are posted.", "text", "MARKETPLACE_CHANNEL_ID"),
     "checkpoint_photos": ("Checkpoint Photos",     "Where in-game milestone 'hero shots' are posted.", "text", "CHECKPOINT_PHOTOS_CHANNEL_ID"),
     "level_up":          ("Level-Up Announcements","Optional dedicated channel for level-up messages.", "text", "LEVEL_UP_CHANNEL_ID"),
     "contract_mod":      ("Contract Escalations",  "Where contract 'sue' escalations are posted (mod review).", "text", "CONTRACT_MOD_CHANNEL_ID"),

@@ -2,8 +2,10 @@
 data/marketplace.py – Firestore + Firebase Storage helpers for the craft marketplace.
 
 A listing is a craft (.craft blueprint) a player put up for sale. Listings are
-non-exclusive: buying one transfers KCoins to the seller and DMs the buyer a copy
-of the blueprint, but the listing stays active so anyone else can buy it too.
+non-exclusive: buying one transfers KCoins to the seller and delivers the buyer a
+copy of the blueprint, but the listing stays active so anyone else can buy it too.
+Crafts are listed from the KSP mod's Market panel and bought on the website; Discord
+is out of it entirely (see cogs/marketplace.py).
 
 Firestore structure (GLOBAL — the marketplace spans every server):
     marketplace/{listing_id} → { ...listing fields..., guild_id (origin), mirrors }
@@ -103,7 +105,9 @@ def create_listing(
         # per listing — see record_report). Never shown publicly; it exists so the
         # owner console can sort by "most complained about".
         "report_count": 0,
-        # Cross-server message mirrors: [{guild_id, channel_id, message_id}, ...]
+        # Dead field, kept so a listing written now has the same shape as one written
+        # before Discord stopped mirroring listings: [{guild_id, channel_id, message_id}].
+        # Nothing writes it and nothing reads it any more.
         "mirrors": [],
         "buyers": [],
         "sales_count": 0,
