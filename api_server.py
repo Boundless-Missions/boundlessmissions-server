@@ -59,6 +59,7 @@ from data import contracts as cdb
 from data import guild_config
 from data import mod_version as mver
 from data import policy as policy
+from data import suspensions
 from data import suspicion as susp
 from data import telemetry_check as tcheck
 from data import mission_constraints as mc
@@ -417,14 +418,55 @@ def _guard_link_attempt(request: Request):
     _rate_limit("link:global", max_hits=settings.KSP_LINK_RATELIMIT_GLOBAL, window=60.0)
 
 
-async def get_user_token_only(authorization: str = Header(...)) -> dict:
-    """Validate just the session token (no device gate). Used by the device-
-    approval poll / report endpoints, which a blocked device must still reach."""
+async def get_user_allow_suspended(authorization: str = Header(...)) -> dict:
+    """Validate just the session token — no device gate, and no suspension gate.
+
+    Two things must keep working while a player is suspended: reading their own
+    suspension (or they are stuck at a wall with no text on it), and logging out
+    of every device (their own privacy control, which a punishment must not take
+    away). Nothing else uses this."""
     if not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Invalid authorization header")
     user = verify_session_token(authorization[7:], _get_api_secret())
     if user is None:
         raise HTTPException(status_code=401, detail="Invalid or expired token")
+    return user
+
+
+def _suspension_detail(rec: dict) -> dict:
+    """The 403 body a suspended caller gets. Structured rather than a sentence:
+    the KSP client draws a gate window from it and the website renders `message`,
+    so the expiry has to arrive as a number that can be counted down, not as prose
+    that has to be parsed."""
+    s = suspensions.summary(rec) or {}
+    reason = s.get("reason") or ""
+    return {
+        "code": "suspended",
+        "reason": reason,
+        "until": s.get("until", 0),
+        "until_iso": s.get("until_iso", ""),
+        "message": ("Your access to Boundless Missions services is temporarily "
+                    "suspended" + (f": {reason}" if reason else ".")),
+    }
+
+
+def enforce_not_suspended(user_id: str) -> None:
+    """403 `suspended` while a suspension is running. Everything token-gated goes
+    through here — see get_user_token_only."""
+    rec = suspensions.get_active(user_id)
+    if rec is not None:
+        raise HTTPException(status_code=403, detail=_suspension_detail(rec))
+
+
+async def get_user_token_only(authorization: str = Header(...)) -> dict:
+    """Validate just the session token (no device gate). Used by the device-
+    approval poll / report endpoints, which a blocked device must still reach.
+
+    The suspension gate lives here rather than in get_current_user so that it
+    covers the website's token-only endpoints too — a suspension the marketplace
+    ignored would not be one."""
+    user = await get_user_allow_suspended(authorization)
+    enforce_not_suspended(user["user_id"])
     return user
 
 
@@ -456,15 +498,19 @@ async def get_current_user(request: Request,
                            authorization: str = Header(...),
                            x_device_id: str = Header(default="", alias="X-Device-Id"),
                            x_mod_hash: str = Header(default="", alias="X-Mod-Hash")) -> dict:
-    """Validate the session token, enforce the version gate, then device binding.
+    """Validate the session token, enforce the suspension and version gates, then
+    device binding.
 
+    A suspended account is refused with 403 `suspended` before anything else: it is
+    the one refusal that no client-side action can clear, so telling someone to
+    update a DLL that will still be refused afterwards would only waste their time.
     An outdated/modified DLL is refused with 426 `update_required`. An unrecognized
     device id is refused with 403 `device_unverified` and a challenge_id; the user is
     DMed an approve/reject prompt and the client polls /auth/device/poll until trusted.
     """
     user = await get_user_token_only(authorization)
 
-    # Version gate first: an old client should be told to update before anything else.
+    # Version gate next: an old client should be told to update before anything else.
     enforce_mod_version(x_mod_hash)
 
     if cfg.KSP_DEVICE_BINDING_ENABLED and check_device(user["user_id"], x_device_id) != "ok":
@@ -793,14 +839,36 @@ async def auth_verify(user: dict = Depends(get_current_user)):
     )
 
 
+@app.get("/api/v1/auth/suspension")
+async def auth_suspension(user: dict = Depends(get_user_allow_suspended)):
+    """This account's suspension state — the one endpoint a suspended client can
+    still call, so its "check again" button has something to ask.
+
+    `by` is stripped: who issued a suspension is a moderation fact, not something
+    the suspended player is owed, and naming a moderator to someone angry at the
+    decision is how a moderator gets harassed."""
+    rec = suspensions.get_active(user["user_id"])
+    if rec is None:
+        return {"suspended": False}
+    detail = _suspension_detail(rec)
+    detail.pop("code", None)
+    return {"suspended": True, **detail}
+
+
 @app.post("/api/v1/auth/logout_all")
-async def auth_logout_all(user: dict = Depends(get_current_user)):
+async def auth_logout_all(user: dict = Depends(get_user_allow_suspended)):
     """Log the current user out of every device.
 
     The user's own privacy control for an account left linked somewhere else.
     Bumps their token version so every session token — including this caller's —
     is rejected from here on; each device drops to its unlinked state on its next
     request. Not an admin action: a user can only log out their own sessions.
+
+    Deliberately behind the bare token check rather than the full gate: cutting a
+    session loose is exactly what someone does when their account is linked on a
+    machine they no longer control, and a suspension, an outdated DLL or an
+    unapproved device must not be what stops them. The worst a stolen token buys
+    here is logging the thief out along with everyone else.
     """
     new_version = logout_all_devices(user["user_id"])
     log.info("KSP: %s logged out of all devices", user["username"])
@@ -3340,6 +3408,42 @@ async def mark_notification_read(notif_id: str, user: dict = Depends(get_current
     return {"success": True}
 
 
+@app.delete("/api/v1/user/notifications/read")
+async def dismiss_read_notifications(user: dict = Depends(get_current_user)):
+    """Delete every notification this player has already read.
+
+    Declared *before* the `{notif_id}` route below on purpose: FastAPI matches in
+    declaration order, so the other way round this path would arrive as a dismiss
+    of a notification whose id is the literal string "read".
+
+    Batched rather than deleted one at a time — clearing a feed is the one place
+    where the count is unbounded (the fetch caps at 50, the collection does not),
+    and one round trip per document is what makes that expensive.
+    """
+    gid = int(user["guild_id"])
+    uid = int(user["user_id"])
+
+    col = _notifications_col(gid, uid)
+    batch = _db.batch()
+    count = 0
+    deleted = 0
+
+    for doc in col.where("read", "==", True).stream():
+        batch.delete(doc.reference)
+        count += 1
+        deleted += 1
+        # Firestore batches max out at 500 operations.
+        if count >= 450:
+            batch.commit()
+            batch = _db.batch()
+            count = 0
+
+    if count > 0:
+        batch.commit()
+
+    return {"success": True, "deleted": deleted}
+
+
 @app.delete("/api/v1/user/notifications/{notif_id}")
 async def dismiss_notification(notif_id: str, user: dict = Depends(get_current_user)):
     """Dismiss (delete) a single notification."""
@@ -4715,6 +4819,14 @@ class AdminUserAdjust(BaseModel):
     balance_set: Optional[int] = None
     xp_set: Optional[int] = None
 
+class AdminSuspend(BaseModel):
+    hours: float
+    reason: str = ""
+    # DM the player. Default on: a suspension nobody was told about is
+    # indistinguishable from the mod being broken, and that arrives as a bug
+    # report rather than as an appeal.
+    notify: bool = True
+
 class AdminDirectMessage(BaseModel):
     user_id: str
     title: str = ""
@@ -4782,6 +4894,7 @@ async def admin_overview(user: dict = Depends(get_owner)):
             "updated_at": mv.get("updated_at"),
         },
         "policy_version": policy.get_version(),
+        "suspensions_active": len(suspensions.list_active()),
         "version_check_enabled": cfg.KSP_VERSION_CHECK_ENABLED,
         "device_binding_enabled": cfg.KSP_DEVICE_BINDING_ENABLED,
     }
@@ -4870,7 +4983,14 @@ async def admin_delete_listing(listing_id: str, user: dict = Depends(get_owner))
 
 # ── User accounts ─────────────────────────────────────────────────────────────
 
-def _admin_user_row(uid: str, u: dict) -> dict:
+def _admin_user_row(uid: str, u: dict, suspension: dict | None = None) -> dict:
+    """One row of the console's user list.
+
+    `suspension` is passed in rather than looked up: the list renders up to 200
+    rows and a per-row Firestore read would make the page cost 200 of them, so
+    admin_users resolves them all with one `list_active()` query. A single-user
+    response (adjust, suspend) passes its own.
+    """
     name = u.get("username", "")
     if not name and _bot_instance is not None:
         du = _bot_instance.get_user(int(uid)) if uid.isdigit() else None
@@ -4884,20 +5004,26 @@ def _admin_user_row(uid: str, u: dict) -> dict:
         "messages": u.get("messages", 0),
         "rescues": u.get("rescues", 0),
         "joined_at": u.get("joined_at", ""),
+        "suspension": suspensions.summary(suspension),
     }
 
 
 @app.get("/api/v1/web/admin/users")
 async def admin_users(q: str = "", limit: int = 50, user: dict = Depends(get_owner)):
-    """Search the global wallet store by id or name; no query → richest first."""
+    """Search the global wallet store by id or name; no query → richest first.
+
+    Suspended accounts are sorted to the top regardless of the query: the list is
+    where a suspension is noticed, lifted early or found to have expired, and one
+    buried at rank 140 by balance is one nobody reviews."""
     needle = q.strip().lower()
+    active = {str(r.get("user_id")): r for r in suspensions.list_active()}
     rows = []
     for uid, u in store.get_all_users(0).items():
-        row = _admin_user_row(uid, u)
+        row = _admin_user_row(uid, u, active.get(str(uid)))
         if needle and needle not in uid and needle not in row["username"].lower():
             continue
         rows.append(row)
-    rows.sort(key=lambda r: r["balance"], reverse=True)
+    rows.sort(key=lambda r: (r["suspension"] is not None, r["balance"]), reverse=True)
     return {"users": rows[:max(1, min(limit, 200))], "total": len(rows)}
 
 
@@ -4923,7 +5049,8 @@ async def admin_user_adjust(user_id: str, req: AdminUserAdjust,
 
     _admin_audit(user, "adjust-user",
                  f"{user_id} balance_set={req.balance_set} balance_delta={req.balance_delta} xp_set={req.xp_set}")
-    return {"success": True, "user": _admin_user_row(user_id, store.get_user(0, uid))}
+    return {"success": True, "user": _admin_user_row(user_id, store.get_user(0, uid),
+                                                     suspensions.get_active(user_id))}
 
 
 @app.post("/api/v1/web/admin/users/{user_id}/logout_all")
@@ -4932,6 +5059,118 @@ async def admin_user_logout_all(user_id: str, user: dict = Depends(get_owner)):
     version = logout_all_devices(user_id)
     _admin_audit(user, "logout-all", user_id)
     return {"success": True, "token_version": version}
+
+
+# ── Suspensions ───────────────────────────────────────────────────────────────
+#
+# A suspension blocks the API surface — the KSP client and the website — and
+# nothing else. It is not a Discord ban (that is /mod ban, and it acts on guild
+# membership) and it is not a wipe: balance, XP, contracts and listings are all
+# untouched and waiting when it expires. Nor does it need to be undone by hand;
+# the expiry is the whole mechanism (see data/suspensions.py).
+
+async def _dm_suspension(user_id: str, title: str, body: str, colour) -> bool:
+    """Tell the player what happened, best effort.
+
+    Best effort is not laziness: a player with DMs closed still has to be
+    suspendable, so a failed DM is reported back to the console rather than
+    aborting the suspension — otherwise "this user blocks the bot" would read as
+    "this user cannot be moderated"."""
+    import discord
+    if _bot_instance is None:
+        return False
+    try:
+        target = (_bot_instance.get_user(int(user_id))
+                  or await _bot_instance.fetch_user(int(user_id)))
+        embed = discord.Embed(title=title, description=body, color=colour)
+        embed.set_footer(text="Boundless Missions")
+        await target.send(embed=embed)
+        return True
+    except Exception as exc:
+        log.warning("Could not DM %s about their suspension: %s", user_id, exc)
+        return False
+
+
+def _humanise_hours(hours: float) -> str:
+    if hours < 24:
+        return f"{hours:g} hour" + ("" if hours == 1 else "s")
+    days = hours / 24.0
+    return f"{days:g} day" + ("" if days == 1 else "s")
+
+
+@app.post("/api/v1/web/admin/users/{user_id}/suspend")
+async def admin_user_suspend(user_id: str, req: AdminSuspend,
+                             user: dict = Depends(get_owner)):
+    """Suspend an account from the mod and website for a fixed number of hours.
+
+    Sessions are deliberately *not* revoked. A revoked token drops the KSP client
+    to its link screen, where the only thing it can say is "link again" — which is
+    a lie, since linking would work and nothing else would. Leaving the token
+    valid is what lets every request come back 403 `suspended` carrying the reason
+    and the expiry, so the client can draw a notice that explains itself."""
+    import discord
+    if not user_id.isdigit():
+        raise HTTPException(status_code=422, detail="user_id must be a Discord id.")
+    # The owner's own account gates this console: suspending it would 403 the very
+    # requests needed to undo it, leaving the DB as the only way back in.
+    if _is_owner_id(user_id):
+        raise HTTPException(status_code=422, detail="Refusing to suspend the owner account.")
+    if req.hours < suspensions.MIN_HOURS or req.hours > suspensions.MAX_HOURS:
+        raise HTTPException(
+            status_code=422,
+            detail=(f"Duration must be between {suspensions.MIN_HOURS} hour and "
+                    f"{suspensions.MAX_HOURS // 24} days. Anything longer is a ban, "
+                    f"which is a Discord action."))
+    reason = (req.reason or "").strip()
+    if not reason:
+        # Required, because the reason is what the player is shown at the gate and
+        # what an appeal is about. A suspension with no stated cause is one the
+        # mod team cannot defend a week later either.
+        raise HTTPException(status_code=422, detail="A reason is required — the player is shown it.")
+
+    rec = suspensions.suspend(user_id, req.hours, reason, user.get("username", "owner"))
+    _admin_audit(user, "suspend", f"{user_id} {req.hours}h: {reason}")
+
+    notified = False
+    if req.notify:
+        notified = await _dm_suspension(
+            user_id,
+            "⏸️ Boundless Missions access suspended",
+            (f"Your access to the KSP mod and the Boundless Missions website is "
+             f"suspended for **{_humanise_hours(rec['hours'])}**.\n\n"
+             f"**Reason:** {reason}\n\n"
+             f"Access returns on its own at <t:{int(rec['until'])}:F> "
+             f"(<t:{int(rec['until'])}:R>). Nothing has been deleted — your balance, "
+             f"XP, contracts and listings are all still there. Your Discord "
+             f"membership is unaffected.\n\n"
+             f"If you think this is a mistake, open a ticket in the server."),
+            discord.Color.orange())
+
+    return {"success": True, "suspension": suspensions.summary(rec), "notified": notified}
+
+
+@app.delete("/api/v1/web/admin/users/{user_id}/suspend")
+async def admin_user_unsuspend(user_id: str, notify: bool = True,
+                               user: dict = Depends(get_owner)):
+    """Lift a suspension early. A no-op (success, `lifted: false`) if none was
+    running — an expiry that beat the admin to it is not an error."""
+    import discord
+    if not user_id.isdigit():
+        raise HTTPException(status_code=422, detail="user_id must be a Discord id.")
+    lifted = suspensions.lift(user_id, user.get("username", "owner"))
+    _admin_audit(user, "unsuspend", f"{user_id} lifted={lifted}")
+
+    notified = False
+    if lifted and notify:
+        notified = await _dm_suspension(
+            user_id,
+            "▶️ Boundless Missions access restored",
+            ("Your suspension has been lifted early. The KSP mod and the website "
+             "work again — restart the mod, or press **Check again** on the notice "
+             "it is showing you."),
+            discord.Color.green())
+
+    return {"success": True, "lifted": lifted, "notified": notified}
 
 
 @app.delete("/api/v1/web/admin/users/{user_id}")
