@@ -4853,13 +4853,25 @@ async def web_marketplace_delete(listing_id: str, user: dict = Depends(get_user_
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  Owner Admin API (/api/v1/web/admin/...)
+#  Admin API (/api/v1/web/admin/...)
 #
-#  The website's developer console. Every endpoint here is gated on the single
-#  BOT_OWNER_ID from .env — the same one person cogs/perms.is_owner trusts — and
-#  answers 404 (not 403) to anyone else, so the surface is invisible to a probing
-#  non-owner with a valid session. The website only *hides* the tab client-side;
-#  this dependency is the actual gate.
+#  The website's admin console, gated in two tiers that mirror cogs/perms.py:
+#
+#  - `get_owner`: the single BOT_OWNER_ID from .env — the same one person
+#    cogs/perms.is_owner_user trusts. Guards everything bot-wide: user accounts
+#    (balance, suspensions, deletion), DM-from-bot, DLL publishing, costs,
+#    runtime gates and policy — because a role granted in one guild must never
+#    carry authority over every guild the bot is in.
+#  - `get_admin`: the owner, or a holder of a guild's mapped bot-admin role
+#    (guild_config key "admin", set per guild via /admin setrole — guild
+#    administrators are still NOT auto-admins, matching is_admin_user). Guards
+#    the guild-scoped moderation surface (overview, listings, announcements,
+#    channel locks), and every response and action is scoped to the guilds the
+#    caller actually admins.
+#
+#  Both answer 404 (not 403) to anyone else, so the surface is invisible to a
+#  probing outsider with a valid session. The website only *hides* tabs
+#  client-side; these dependencies are the actual gate.
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _is_owner_id(user_id) -> bool:
@@ -4872,7 +4884,52 @@ async def get_owner(user: dict = Depends(get_user_token_only)) -> dict:
     if not _is_owner_id(user.get("user_id")):
         raise HTTPException(status_code=404, detail="Not found")
     _rate_limit(f"admin:{user['user_id']}", max_hits=240, window=60.0)
+    user["is_owner"] = True
+    user["admin_guild_ids"] = None  # None = every guild (owner is unscoped)
     return user
+
+
+def _admin_role_guild_ids(user_id) -> list[str]:
+    """The guilds in which this user holds the mapped bot-admin role.
+
+    Resolved live against the Discord member cache rather than stored: a role
+    revoked in Discord must revoke console access on the next request, not on
+    the next login. An offline bot yields [] — no roster, no authority."""
+    from data import guild_config
+    if _bot_instance is None or not str(user_id).isdigit():
+        return []
+    out: list[str] = []
+    for g in _bot_instance.guilds:
+        role = guild_config.resolve_role(g, "admin")
+        if role is None:
+            continue
+        member = g.get_member(int(user_id))
+        if member is not None and member.get_role(role.id) is not None:
+            out.append(str(g.id))
+    return out
+
+
+async def get_admin(user: dict = Depends(get_user_token_only)) -> dict:
+    """The owner, or a mapped guild admin. Annotates the user dict with
+    `is_owner` and `admin_guild_ids` (None for the owner = unscoped; a non-empty
+    list for a guild admin). 404 for everyone else, same as get_owner."""
+    if _is_owner_id(user.get("user_id")):
+        user["is_owner"] = True
+        user["admin_guild_ids"] = None
+    else:
+        gids = _admin_role_guild_ids(user.get("user_id"))
+        if not gids:
+            raise HTTPException(status_code=404, detail="Not found")
+        user["is_owner"] = False
+        user["admin_guild_ids"] = gids
+    _rate_limit(f"admin:{user['user_id']}", max_hits=240, window=60.0)
+    return user
+
+
+def _admin_can_guild(user: dict, guild_id) -> bool:
+    """May this console user act on this guild? The owner may on all of them."""
+    scoped = user.get("admin_guild_ids")
+    return scoped is None or str(guild_id) in scoped
 
 
 def _require_bot():
@@ -4883,8 +4940,11 @@ def _require_bot():
 
 
 def _admin_audit(user: dict, action: str, detail: str = ""):
-    """One log line per admin action; the audit trail for the master console."""
-    log.warning("ADMIN[%s]: %s %s", user.get("username", user.get("user_id")), action, detail)
+    """One log line per admin action; the audit trail for the console. Guild
+    admins are labelled distinctly — who held which authority matters when the
+    trail is read a week later."""
+    tag = "ADMIN" if user.get("is_owner", True) else "GUILD-ADMIN"
+    log.warning("%s[%s]: %s %s", tag, user.get("username", user.get("user_id")), action, detail)
 
 
 # ── Request bodies (admin-only; kept local rather than in api_models) ─────────
@@ -4946,19 +5006,30 @@ class AdminPolicyBump(BaseModel):
 
 
 @app.get("/api/v1/web/admin/whoami")
-async def admin_whoami(user: dict = Depends(get_owner)):
-    """200 only for the owner (404 for everyone else) — the website's cheap
-    'should I draw the Admin tab' probe."""
-    return {"is_owner": True, "user_id": user["user_id"], "username": user["username"]}
+async def admin_whoami(user: dict = Depends(get_admin)):
+    """200 for the owner and for mapped guild admins (404 for everyone else) —
+    the website's cheap 'should I draw the Admin tab' probe, now also telling it
+    which tier to draw."""
+    return {
+        "is_owner": user["is_owner"],
+        "is_admin": True,
+        "admin_guild_ids": user["admin_guild_ids"] or [],
+        "user_id": user["user_id"],
+        "username": user["username"],
+    }
 
 
 @app.get("/api/v1/web/admin/overview")
-async def admin_overview(user: dict = Depends(get_owner)):
-    """Dashboard numbers: community size, market size, gate + version state."""
+async def admin_overview(user: dict = Depends(get_admin)):
+    """Dashboard numbers: community size, market size, gate + version state.
+    A guild admin's guild list is cut to the guilds they admin; the counts stay
+    global because they are read-only facts, not levers."""
     bot = _bot_instance
     guilds = []
     if bot is not None:
         for g in bot.guilds:
+            if not _admin_can_guild(user, g.id):
+                continue
             guilds.append({"id": str(g.id), "name": g.name,
                            "member_count": g.member_count or 0})
     listings = mkt.list_all()
@@ -4984,9 +5055,13 @@ async def admin_overview(user: dict = Depends(get_owner)):
 # ── Marketplace moderation ────────────────────────────────────────────────────
 
 @app.get("/api/v1/web/admin/listings")
-async def admin_listings(q: str = "", user: dict = Depends(get_owner)):
-    """Every listing, any seller, any status — newest first."""
+async def admin_listings(q: str = "", user: dict = Depends(get_admin)):
+    """Every listing, any seller, any status — newest first. A guild admin sees
+    only listings that originated from a guild they admin (the market is one
+    shared grid, but moderation authority follows the community it came from)."""
     items = mkt.list_all()
+    if not user["is_owner"]:
+        items = [l for l in items if _admin_can_guild(user, l.get("guild_id", ""))]
     if q.strip():
         needle = q.strip().lower()
         items = [l for l in items
@@ -5005,10 +5080,12 @@ async def admin_listings(q: str = "", user: dict = Depends(get_owner)):
 
 @app.patch("/api/v1/web/admin/listings/{listing_id}")
 async def admin_edit_listing(listing_id: str, req: AdminListingEdit,
-                             user: dict = Depends(get_owner)):
-    """Edit any listing's name / price / status regardless of who owns it."""
+                             user: dict = Depends(get_admin)):
+    """Edit any listing's name / price / status regardless of who owns it.
+    Guild admins can only touch listings from their own guilds — out-of-scope
+    ones 404 exactly like nonexistent ones, so scope can't be probed."""
     listing = mkt.get_listing(0, listing_id)
-    if not listing:
+    if not listing or not _admin_can_guild(user, listing.get("guild_id", "")):
         raise HTTPException(status_code=404, detail="Listing not found")
 
     fields: dict = {}
@@ -5034,10 +5111,11 @@ async def admin_edit_listing(listing_id: str, req: AdminListingEdit,
 
 
 @app.delete("/api/v1/web/admin/listings/{listing_id}")
-async def admin_delete_listing(listing_id: str, user: dict = Depends(get_owner)):
-    """Permanently delete any listing: Storage files and the document."""
+async def admin_delete_listing(listing_id: str, user: dict = Depends(get_admin)):
+    """Permanently delete any listing: Storage files and the document. Same
+    guild scoping as the edit — out-of-scope listings 404."""
     listing = mkt.get_listing(0, listing_id)
-    if not listing:
+    if not listing or not _admin_can_guild(user, listing.get("guild_id", "")):
         raise HTTPException(status_code=404, detail="Listing not found")
     mkt.delete_listing(listing_id)
     _admin_audit(user, "delete-listing", f"{listing_id} ({listing.get('craft_name')})")
@@ -5312,13 +5390,15 @@ async def _announce_via_tickets(bot, guild, role, title: str, content: str, admi
 
 
 @app.post("/api/v1/web/admin/announce")
-async def admin_announce(req: AdminAnnounce, user: dict = Depends(get_owner)):
+async def admin_announce(req: AdminAnnounce, user: dict = Depends(get_admin)):
     """Announce to a channel (optionally pinging a role), or — open_tickets —
-    open a private ticket panel per member of the role with the message."""
+    open a private ticket panel per member of the role with the message. Guild
+    admins can only announce into guilds they admin; anything else reads as the
+    bot not being there."""
     import discord
     bot = _require_bot()
     guild = bot.get_guild(int(req.guild_id)) if req.guild_id.isdigit() else None
-    if guild is None:
+    if guild is None or not _admin_can_guild(user, guild.id):
         raise HTTPException(status_code=404, detail="The bot is not in that guild.")
     if not req.content.strip():
         raise HTTPException(status_code=422, detail="Announcement content is empty.")
@@ -5367,13 +5447,16 @@ async def admin_announce(req: AdminAnnounce, user: dict = Depends(get_owner)):
 # ── Guild structure (pickers) + channel locks ────────────────────────────────
 
 @app.get("/api/v1/web/admin/guilds")
-async def admin_guilds(user: dict = Depends(get_owner)):
+async def admin_guilds(user: dict = Depends(get_admin)):
     """Guilds with their text channels and roles — feeds the console's pickers.
-    A channel is 'locked' when @everyone's send_messages overwrite is False."""
+    A channel is 'locked' when @everyone's send_messages overwrite is False.
+    Guild admins get only the guilds they admin."""
     import discord
     bot = _require_bot()
     out = []
     for g in bot.guilds:
+        if not _admin_can_guild(user, g.id):
+            continue
         channels = []
         for ch in g.text_channels:
             ow = ch.overwrites_for(g.default_role)
@@ -5393,14 +5476,15 @@ async def admin_guilds(user: dict = Depends(get_owner)):
 
 @app.post("/api/v1/web/admin/channels/{channel_id}/lock")
 async def admin_channel_lock(channel_id: str, req: AdminChannelLock,
-                             user: dict = Depends(get_owner)):
+                             user: dict = Depends(get_admin)):
     """Lock (or unlock) a text channel by flipping @everyone's send permission.
     Unlock resets the overwrite to neutral rather than forcing True, so category
-    and role permissions come back exactly as they were."""
+    and role permissions come back exactly as they were. Guild admins can only
+    lock channels in guilds they admin."""
     import discord
     bot = _require_bot()
     guild = bot.get_guild(int(req.guild_id)) if req.guild_id.isdigit() else None
-    if guild is None:
+    if guild is None or not _admin_can_guild(user, guild.id):
         raise HTTPException(status_code=404, detail="The bot is not in that guild.")
     channel = guild.get_channel(int(channel_id)) if channel_id.isdigit() else None
     if not isinstance(channel, discord.TextChannel):
