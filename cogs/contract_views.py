@@ -614,11 +614,10 @@ class MoreTimeApproveButton(DynamicItem[Button], template=r"ct_mt_y:" + _ID_PATT
         )
         # Hand the contractor their work view back so they can submit again.
         try:
-            contractor = await interaction.client.fetch_user(int(r.contract["contractor_id"]))
             e = _embed(r.contract, self.gid)
             e.color = discord.Color.green()
-            await contractor.send(
-                embed=e,
+            await ca.deliver_to_player(
+                self.gid, int(r.contract["contractor_id"]), embed=e,
                 view=ContractWorkView(self.cid, self.gid, r.contract.get("mission_type")))
         except Exception:
             pass
@@ -647,8 +646,9 @@ class MoreTimeRefuseButton(DynamicItem[Button], template=r"ct_mt_n:" + _ID_PATTE
             content="❌ Extension refused.", embed=None, view=None,
         )
         try:
-            contractor = await interaction.client.fetch_user(int(r.contract["contractor_id"]))
-            await contractor.send("❌ Your time extension request was refused.")
+            await ca.deliver_to_player(
+                self.gid, int(r.contract["contractor_id"]),
+                content="❌ Your time extension request was refused.")
         except Exception:
             pass
 
@@ -925,7 +925,6 @@ class FlagSubmitView(View):
         c = cdb.get_contract(self.gid, self.cid)
 
         try:
-            issuer = await interaction.client.fetch_user(int(c["issuer_id"]))
             e = _embed(c, self.gid)
             e.title = f"📬 {t(self.gid, 'ct.review_title')}"
             e.color = discord.Color.orange()
@@ -934,10 +933,12 @@ class FlagSubmitView(View):
                 value="Preview is watermarked; the full-res flag is delivered to your "
                       "in-game flag picker on acceptance.",
                 inline=False)
-            msg = await issuer.send(embed=e, view=ContractReviewView(self.cid, self.gid))
-            cdb.update_contract(self.gid, self.cid, issuer_review_msg_id=str(msg.id))
+            msg = await ca.deliver_to_player(self.gid, int(c["issuer_id"]), embed=e,
+                                             view=ContractReviewView(self.cid, self.gid))
+            if msg is not None:
+                cdb.update_contract(self.gid, self.cid, issuer_review_msg_id=str(msg.id))
         except Exception as exc:
-            log.error("Could not DM issuer for flag review: %s", exc)
+            log.error("Could not deliver flag review to issuer: %s", exc)
 
         # Update the designer's contract panel.
         if c.get("dm_message_id"):

@@ -278,17 +278,19 @@ async def close_auction(bot, gid: int, auction_id: str, *, ended_by: str = "time
         adb.update_auction(origin_gid, auction_id, status=adb.CLOSED, result_contract_id=c["contract_id"])
         log.info("Auction %s closed (%s) → contract %s, winner %s for %d",
                  auction_id, ended_by, c["contract_id"], a["current_bidder_name"], final)
-        # DM the winner their active contract with the work view.
+        # Hand the winner their active contract with the work view — corp channel
+        # first, DM fallback (an auction winner may have no corp).
         try:
-            winner = await bot.fetch_user(int(winner_id))
+            import contract_actions as ca
             e = _embed(c, origin_gid)
             e.description = t(origin_gid, "auc.won_dm", price=final, sym=sym)
-            dm = await winner.send(
-                embed=e,
+            dm = await ca.deliver_to_player(
+                origin_gid, int(winner_id), embed=e,
                 view=ContractWorkView(c["contract_id"], origin_gid, c.get("mission_type")))
-            cdb.update_contract(origin_gid, c["contract_id"], dm_message_id=str(dm.id))
+            if dm is not None:
+                cdb.update_contract(origin_gid, c["contract_id"], dm_message_id=str(dm.id))
         except Exception as exc:
-            log.warning("Could not DM auction winner %s: %s", winner_id, exc)
+            log.warning("Could not notify auction winner %s: %s", winner_id, exc)
     else:
         # No bids — refund the full escrow and cancel.
         await store.add_balance(origin_gid, int(a["issuer_id"]), a["start_value"])

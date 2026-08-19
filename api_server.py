@@ -2255,23 +2255,19 @@ async def create_contract_from_ksp(req: ContractCreateRequest, user: dict = Depe
         if ctype in ("craft_build", "active_vessel"):
             cdb.update_contract(gid, c["contract_id"], mission_type=ctype)
 
-    # DM the contractor via Discord
+    # Tell the contractor on Discord: their corp channel, falling back to a DM.
     if _bot_instance:
         try:
-            import discord
             from cogs.contract_views import ContractOfferView, _embed
 
-            guild = _bot_instance.get_guild(gid)
-            if guild:
-                member = guild.get_member(contractor_id) or await guild.fetch_member(contractor_id)
-                if member:
-                    e = _embed(c, gid)
-                    e.description = f"📜 You received a new contract offer from **{user['username']}** (via KSP)!"
-                    view = ContractOfferView(c["contract_id"], gid)
-                    dm_msg = await member.send(embed=e, view=view)
-                    cdb.update_contract(gid, c["contract_id"], dm_message_id=str(dm_msg.id))
+            e = _embed(c, gid)
+            e.description = f"📜 You received a new contract offer from **{user['username']}** (via KSP)!"
+            dm_msg = await ca.deliver_to_player(
+                gid, contractor_id, embed=e, view=ContractOfferView(c["contract_id"], gid))
+            if dm_msg is not None:
+                cdb.update_contract(gid, c["contract_id"], dm_message_id=str(dm_msg.id))
         except Exception as exc:
-            log.error("Failed to DM contractor %d: %s", contractor_id, exc)
+            log.error("Failed to notify contractor %d on Discord: %s", contractor_id, exc)
             # Don't fail the contract creation — they'll see it in notifications
 
     # Also create a notification
@@ -2557,22 +2553,20 @@ async def create_rescue_contract(
         await store.add_balance(gid, uid, payment)
         return ContractAcceptResponse(success=False, message="Failed to store the rescue vessel.")
 
-    # DM + notify the contractor, exactly like create_contract_from_ksp.
+    # Notify the contractor on Discord, exactly like create_contract_from_ksp:
+    # corp channel first, DM fallback.
     if _bot_instance:
         try:
-            import discord
             from cogs.contract_views import ContractOfferView, _embed
-            guild = _bot_instance.get_guild(gid)
-            if guild:
-                member = guild.get_member(contractor_uid) or await guild.fetch_member(contractor_uid)
-                if member:
-                    e = _embed(c, gid)
-                    e.description = (f"🛟 **{user['username']}** needs a rescue at **{body}** "
-                                     f"({len(rescue_kerbals)} kerbal(s)), via KSP!")
-                    dm_msg = await member.send(embed=e, view=ContractOfferView(c["contract_id"], gid))
-                    cdb.update_contract(gid, c["contract_id"], dm_message_id=str(dm_msg.id))
+            e = _embed(c, gid)
+            e.description = (f"🛟 **{user['username']}** needs a rescue at **{body}** "
+                             f"({len(rescue_kerbals)} kerbal(s)), via KSP!")
+            dm_msg = await ca.deliver_to_player(
+                gid, contractor_uid, embed=e, view=ContractOfferView(c["contract_id"], gid))
+            if dm_msg is not None:
+                cdb.update_contract(gid, c["contract_id"], dm_message_id=str(dm_msg.id))
         except Exception as exc:
-            log.error("Failed to DM rescue contractor %d: %s", contractor_uid, exc)
+            log.error("Failed to notify rescue contractor %d: %s", contractor_uid, exc)
 
     _create_notification(
         gid, contractor_uid, "contract_incoming",

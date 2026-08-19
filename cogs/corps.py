@@ -7,6 +7,7 @@ Each user may own one corporation at a time. Data is persisted in Firestore.
 Firestore path: guilds/{guild_id}/corps/{user_id}
 """
 
+import asyncio
 import logging
 import datetime
 import discord
@@ -38,29 +39,54 @@ def _get_corp_ref(guild_id: int, user_id: int):
     )
 
 
+def _corp_overwrites(
+    guild: discord.Guild,
+    owner: discord.Member | None,
+    members: list[discord.Member] = (),
+) -> dict:
+    """The private-channel permission set: the corp, the mods, the bot, nobody else.
+
+    Contract offers, dispute hand-offs and craft deliveries are posted into corp
+    channels (`contract_actions.deliver_to_player`), so `view_channel=False` on
+    @everyone is what keeps that traffic between the parties and the moderators.
+    Guild administrators bypass overwrites, so an unmapped "mod" role hides the
+    channel from mods without the administrator permission — map it with
+    `/admin setrole` first.
+    """
+    overwrites = {
+        guild.default_role: discord.PermissionOverwrite(view_channel=False),
+        guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True),
+    }
+    mod_role = guild_config.resolve_role(guild, "mod")
+    if mod_role is not None:
+        overwrites[mod_role] = discord.PermissionOverwrite(view_channel=True)
+    if owner is not None:
+        overwrites[owner] = discord.PermissionOverwrite(
+            view_channel=True, send_messages=True,
+            manage_messages=True, manage_channels=False,
+        )
+    for m in members:
+        if owner is None or m.id != owner.id:
+            overwrites[m] = discord.PermissionOverwrite(view_channel=True, send_messages=True)
+    return overwrites
+
+
 async def _create_corp_channel(
     guild: discord.Guild,
     owner: discord.Member,
     name: str,
 ) -> tuple[discord.TextChannel, discord.Message]:
-    """Create the corp text channel and pin the establishment embed."""
+    """Create the corp text channel (private to the corp + mods) and pin the
+    establishment embed."""
     # Sanitise channel name (Discord auto-lowercases and replaces spaces with hyphens)
     cat_id = guild_config.get_channel_id(guild.id, "corp_category")
     category = guild.get_channel(cat_id) if cat_id else None
     channel = await guild.create_text_channel(
-        name=f"corp-{name}",
+        name=name,
         category=category,
         topic=f"🏢 {name} · Founded by {owner.display_name}",
+        overwrites=_corp_overwrites(guild, owner),
         reason=f"Corporation established by {owner}",
-    )
-
-    # Set permissions: owner gets manage_channel so they can invite people etc.
-    await channel.set_permissions(
-        owner,
-        manage_channels=False,
-        manage_messages=True,
-        send_messages=True,
-        reason="Corp owner permissions",
     )
 
     now = datetime.datetime.now(datetime.timezone.utc)
@@ -84,6 +110,76 @@ async def _create_corp_channel(
     await msg.pin()
 
     return channel, msg
+
+
+async def _establish_corp(
+    guild: discord.Guild, member: discord.Member, name: str
+) -> discord.TextChannel:
+    """Create and persist a corporation: channel + GK registration + Firestore
+    record + global ownership pointer. The one implementation behind /corpsetup,
+    corp replacement, and auto-generation — callers only decide the name."""
+    channel, pin_msg = await _create_corp_channel(guild, member, name)
+
+    # Auto-register as GK channel (lazy import — see the note at the top imports)
+    from cogs.gkchannels import add_gk_channel
+    add_gk_channel(guild.id, channel.id)
+
+    now = datetime.datetime.now(datetime.timezone.utc)
+    _save_corp(guild.id, member.id, {
+        "name": name,
+        "owner_id": str(member.id),
+        "owner_name": member.name,
+        "channel_id": str(channel.id),
+        "pin_message_id": str(pin_msg.id),
+        "established_at": now.isoformat(),
+        "members": [str(member.id)],
+    })
+    _set_owner_ptr(member.id, guild.id, channel.id, name)
+    log.info("Established corporation '%s' for %s (channel: %s)", name, member, channel.id)
+    return channel
+
+
+def _auto_corp_name(member: discord.Member) -> str:
+    """'{username} Space Agency' — the name auto-generated corps are given.
+    Uses the display name, which is what the member is known as in the guild;
+    the raw account name is kept separately as `owner_name`."""
+    return f"{member.display_name} Space Agency"
+
+
+async def _resolve_member(guild: discord.Guild, uid) -> discord.Member | None:
+    """A member by id, or None for anyone who has left (or a bad id)."""
+    try:
+        return guild.get_member(int(uid)) or await guild.fetch_member(int(uid))
+    except (discord.NotFound, discord.HTTPException, ValueError, TypeError):
+        return None
+
+
+async def _apply_corp_privacy(guild: discord.Guild, corp: dict, *,
+                              reason: str, force: bool = False) -> str:
+    """Bring one corp's channel up to spec: the private overwrite set, and the
+    channel name without the retired `corp-` prefix.
+
+    Returns "updated", "ok" (already compliant — skipped unless `force`, so the
+    startup sweep costs zero API calls on a guild that is already migrated),
+    or "missing" (channel gone). `force` re-asserts the overwrites even on a
+    private channel, for when the mod role mapping or membership has changed;
+    both fixes share one `edit` call, since channel edits are rate-limited.
+    """
+    channel = guild.get_channel(int(corp.get("channel_id") or 0))
+    if channel is None:
+        return "missing"
+    edits: dict = {}
+    if channel.name.startswith("corp-") and channel.name != "corp-":
+        edits["name"] = channel.name[len("corp-"):]
+    if force or channel.overwrites_for(guild.default_role).view_channel is not False:
+        owner = await _resolve_member(guild, corp.get("owner_id"))
+        members = [m for m in [await _resolve_member(guild, uid)
+                               for uid in corp.get("members", [])] if m]
+        edits["overwrites"] = _corp_overwrites(guild, owner, members)
+    if not edits:
+        return "ok"
+    await channel.edit(reason=reason, **edits)
+    return "updated"
 
 
 def _save_corp(guild_id: int, user_id: int, data: dict) -> None:
@@ -209,6 +305,7 @@ class Corps(commands.Cog, name="Corps"):
 
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
+        self._swept = False  # the startup sweep runs once, not on every reconnect
 
     # ── /corpsetup ────────────────────────────────────────────────────────────
     @app_commands.command(
@@ -266,24 +363,7 @@ class Corps(commands.Cog, name="Corps"):
         # No existing corp — create one
         await interaction.response.defer(ephemeral=True)
 
-        channel, pin_msg = await _create_corp_channel(guild, member, name)
-
-        # Auto-register as GK channel
-        from cogs.gkchannels import add_gk_channel
-        add_gk_channel(guild.id, channel.id)
-
-        # Save to Firestore (per-guild record + global ownership pointer)
-        now = datetime.datetime.now(datetime.timezone.utc)
-        _save_corp(guild.id, member.id, {
-            "name": name,
-            "owner_id": str(member.id),
-            "owner_name": member.name,
-            "channel_id": str(channel.id),
-            "pin_message_id": str(pin_msg.id),
-            "established_at": now.isoformat(),
-            "members": [str(member.id)],
-        })
-        _set_owner_ptr(member.id, guild.id, channel.id, name)
+        channel = await _establish_corp(guild, member, name)
 
         await interaction.followup.send(
             tp(gid, member.id, "corps.setup.done", name=name, channel=channel.mention),
@@ -319,23 +399,7 @@ class Corps(commands.Cog, name="Corps"):
             _clear_owner_ptr(owner.id)
 
         # Create new corp in the requesting guild.
-        channel, pin_msg = await _create_corp_channel(guild, owner, new_name)
-
-        # Auto-register as GK channel
-        from cogs.gkchannels import add_gk_channel
-        add_gk_channel(guild.id, channel.id)
-
-        now = datetime.datetime.now(datetime.timezone.utc)
-        _save_corp(guild.id, owner.id, {
-            "name": new_name,
-            "owner_id": str(owner.id),
-            "owner_name": owner.name,
-            "channel_id": str(channel.id),
-            "pin_message_id": str(pin_msg.id),
-            "established_at": now.isoformat(),
-            "members": [str(owner.id)],
-        })
-        _set_owner_ptr(owner.id, guild.id, channel.id, new_name)
+        channel = await _establish_corp(guild, owner, new_name)
 
         try:
             await owner.send(t(guild.id, "corps.replace.done",
@@ -344,6 +408,168 @@ class Corps(commands.Cog, name="Corps"):
             pass
 
         log.info("%s replaced corporation with '%s' (channel: %s)", owner, new_name, channel.id)
+
+    # ── Startup sweep ─────────────────────────────────────────────────────────
+    @commands.Cog.listener()
+    async def on_ready(self) -> None:
+        """Bring every guild up to date on boot: privatize corp channels created
+        before privacy existed, then create corps for members who joined before
+        auto-generation existed. Idempotent and cheap when there is nothing to
+        do — already-private channels are detected from the local permission
+        cache (zero API calls), and corp ownership is one stream of the global
+        `corp_owners` collection rather than a query per member."""
+        if self._swept:  # on_ready re-fires on every reconnect
+            return
+        self._swept = True
+
+        # Everyone who owns a corp anywhere.
+        owners = {doc.id for doc in _db.collection("corp_owners").stream()}
+
+        for guild in self.bot.guilds:
+            covered = set(owners)
+            privatized = created = 0
+
+            col = _db.collection("guilds").document(str(guild.id)).collection("corps")
+            for doc in col.stream():
+                d = doc.to_dict() or {}
+                d.setdefault("owner_id", doc.id)
+                # Non-owner corp members have a corp channel already; they must
+                # not get a second one of their own.
+                covered.update(str(u) for u in d.get("members", []))
+                covered.add(doc.id)
+                try:
+                    if await _apply_corp_privacy(
+                            guild, d, reason="Corp privacy startup sweep") == "updated":
+                        privatized += 1
+                except Exception as exc:
+                    log.warning("Startup privacy sweep failed for corp %s in %s: %s",
+                                doc.id, guild.id, exc)
+
+            for member in list(guild.members):
+                if member.bot or str(member.id) in covered:
+                    continue
+                try:
+                    await _establish_corp(guild, member, _auto_corp_name(member))
+                    owners.add(str(member.id))
+                    created += 1
+                    await asyncio.sleep(2)  # channel-create rate limit
+                except Exception as exc:
+                    log.warning("Startup corp generation failed for %s in %s: %s",
+                                member, guild.id, exc)
+
+            if privatized or created:
+                log.info("Corp startup sweep in %s: %d channel(s) updated "
+                         "(privacy/rename), %d corp(s) created", guild.id, privatized, created)
+
+    # ── Auto-generation ───────────────────────────────────────────────────────
+    @commands.Cog.listener()
+    async def on_member_join(self, member: discord.Member) -> None:
+        """Every human member gets a corporation on arrival, so contract offers,
+        dispute hand-offs and craft deliveries always have a corp channel to land
+        in (rather than the DM fallback). One corp per user globally still holds:
+        someone who already owns one in another server is left alone."""
+        if member.bot:
+            return
+        try:
+            if find_user_corp(member.guild.id, member.id):
+                return
+            await _establish_corp(member.guild, member, _auto_corp_name(member))
+        except Exception as exc:
+            log.warning("Could not auto-establish corp for %s: %s", member, exc)
+
+    # ── /admin corpsgenerate ──────────────────────────────────────────────────
+    @app_commands.command(
+        name="corpsgenerate",
+        description="Create a corporation for every member that doesn't have one",
+    )
+    @app_commands.default_permissions(administrator=True)
+    async def corpsgenerate(self, interaction: discord.Interaction) -> None:
+        """Backfill for members who joined before auto-generation existed.
+        Channel creation is heavily rate-limited by Discord, so this paces
+        itself; on a large guild it can take a while. Safe to re-run — members
+        who already have a corp (here or anywhere) are skipped."""
+        if not interaction.guild:
+            await interaction.response.send_message(
+                tp(None, interaction.user.id, "common.server_only"), ephemeral=True)
+            return
+        guild = interaction.guild
+        await interaction.response.defer(ephemeral=True)
+
+        created, failed, skipped = 0, [], 0
+        for member in list(guild.members):
+            if member.bot:
+                continue
+            try:
+                if find_user_corp(guild.id, member.id):
+                    skipped += 1
+                    continue
+                await _establish_corp(guild, member, _auto_corp_name(member))
+                created += 1
+                await asyncio.sleep(2)  # be gentle with the channel-create rate limit
+            except Exception as exc:
+                log.warning("corpsgenerate: could not create corp for %s: %s", member, exc)
+                failed.append(member.display_name)
+
+        lines = [f"🏢 Created **{created}** corporation(s); {skipped} member(s) already had one."]
+        if failed:
+            lines.append(f"⚠️ Failed for: {', '.join(failed[:10])}"
+                         + (f" (+{len(failed) - 10} more)" if len(failed) > 10 else ""))
+        try:
+            await interaction.followup.send("\n".join(lines), ephemeral=True)
+        except discord.HTTPException:
+            # A very large backfill can outlive the interaction token (15 min).
+            log.info("corpsgenerate in %s: %d created, %d skipped, %d failed",
+                     guild.id, created, skipped, len(failed))
+
+    # ── /admin corpsprivacy ───────────────────────────────────────────────────
+    @app_commands.command(
+        name="corpsprivacy",
+        description="Make every existing corporation channel private (corp + mods only)",
+    )
+    @app_commands.default_permissions(administrator=True)
+    async def corpsprivacy(self, interaction: discord.Interaction) -> None:
+        """One-time migration: apply the private overwrites `_create_corp_channel`
+        now sets to corp channels created before privacy existed. Discord
+        permissions are not retroactive, so old channels stay public until this
+        sweep runs. Safe to re-run — it just re-asserts the same overwrites."""
+        if not interaction.guild:
+            await interaction.response.send_message(
+                tp(None, interaction.user.id, "common.server_only"), ephemeral=True)
+            return
+        guild = interaction.guild
+        await interaction.response.defer(ephemeral=True)
+
+        updated, failed, missing = [], [], []
+        col = _db.collection("guilds").document(str(guild.id)).collection("corps")
+        for doc in col.stream():
+            d = doc.to_dict() or {}
+            d.setdefault("owner_id", doc.id)
+            name = d.get("name", doc.id)
+            try:
+                # force=True: re-asserts the set even on already-private channels,
+                # so this command also repairs a changed mod-role mapping.
+                outcome = await _apply_corp_privacy(
+                    guild, d, reason=f"Corp privacy migration by {interaction.user}",
+                    force=True)
+            except discord.Forbidden:
+                failed.append(name)
+                continue
+            if outcome == "missing":
+                missing.append(name)
+            else:
+                updated.append(name)
+
+        lines = [f"🔒 Made **{len(updated)}** corp channel(s) private."]
+        if failed:
+            lines.append(f"⚠️ No permission to edit: {', '.join(failed[:10])}")
+        if missing:
+            lines.append(f"👻 Channel gone (skipped): {', '.join(missing[:10])}")
+        if guild_config.resolve_role(guild, "mod") is None:
+            lines.append("⚠️ No `mod` role is mapped (`/admin setrole`) — only "
+                         "administrators can see the channels until one is.")
+        await interaction.followup.send("\n".join(lines), ephemeral=True)
+        log.info("%s ran corpsprivacy in %s: %d updated, %d failed, %d missing",
+                 interaction.user, guild.id, len(updated), len(failed), len(missing))
 
     # ── Error handler ─────────────────────────────────────────────────────────
     async def cog_app_command_error(

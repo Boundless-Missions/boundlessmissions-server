@@ -783,88 +783,111 @@ def _end_of_week() -> str:
 # ── Discord hand-offs ────────────────────────────────────────────────────────
 #
 # Some outcomes need the *other* party to answer, and the only place every player is
-# reachable is Discord. These are best-effort by design: a DM that cannot be delivered
-# must not roll back a state change that already happened, so each returns a bool and
-# the callers above decide whether that mattered. `discord` is imported inside them
-# because this module is also imported by the API server, which must keep working if
-# the bot handle is not up yet.
+# reachable is Discord. These are best-effort by design: a message that cannot be
+# delivered must not roll back a state change that already happened, so each returns a
+# bool and the callers above decide whether that mattered. `discord` is imported inside
+# them because this module is also imported by the API server, which must keep working
+# if the bot handle is not up yet.
 
 def _bot():
     return _api()._bot_instance
 
 
-async def _dm_dispute_options(gid: int, contract_id: str, contractor_id: int) -> bool:
+async def deliver_to_player(gid: int, user_id: int, *, content: str | None = None,
+                            embed=None, view=None):
+    """Deliver a contract message to a player: their corp channel first, DM fallback.
+
+    Corp channels are private (owner + members + mods), so this is no less
+    confidential than a DM — but unlike a DM it works for players who block DMs,
+    and it keeps a player's contract paperwork in one place. A channel post does
+    not notify by itself, so the player is mentioned; the DM fallback drops the
+    mention, which is redundant there. Returns the sent message, or None when
+    neither surface worked.
+    """
     bot = _bot()
     if bot is None:
-        return False
+        return None
+    from cogs.corps import find_user_corp
+    mention = f"<@{int(user_id)}>"
+    try:
+        corp = find_user_corp(gid, int(user_id))
+        ch_id = int(corp.get("channel_id") or 0) if corp else 0
+        if ch_id:
+            # The corp may live in another guild — resolve at the bot level.
+            channel = bot.get_channel(ch_id)
+            if channel is None:
+                channel = await bot.fetch_channel(ch_id)
+            return await channel.send(content=f"{mention} {content}" if content else mention,
+                                      embed=embed, view=view)
+    except Exception as exc:
+        log.warning("Corp-channel delivery to %s failed, trying DM: %s", user_id, exc)
+    try:
+        u = bot.get_user(int(user_id)) or await bot.fetch_user(int(user_id))
+        return await u.send(content=content, embed=embed, view=view)
+    except Exception as exc:
+        log.warning("Could not DM %s: %s", user_id, exc)
+        return None
+
+
+async def _dm_dispute_options(gid: int, contract_id: str, contractor_id: int) -> bool:
     try:
         import discord
         from i18n import t
         from cogs.contract_views import DisputeView
-        contractor = await bot.fetch_user(contractor_id)
         e = discord.Embed(title=f"⚠️ {t(gid, 'ct.disputed')}",
                           description=t(gid, 'ct.disputed_desc'),
                           color=discord.Color.orange())
-        await contractor.send(embed=e, view=DisputeView(contract_id, gid))
-        return True
+        msg = await deliver_to_player(gid, contractor_id, embed=e,
+                                      view=DisputeView(contract_id, gid))
+        return msg is not None
     except Exception as exc:
-        log.warning("Could not DM dispute options for %s: %s", contract_id, exc)
+        log.warning("Could not deliver dispute options for %s: %s", contract_id, exc)
         return False
 
 
 async def _dm_review_approved(gid: int, contractor_id: int, c: dict) -> bool:
-    bot = _bot()
-    if bot is None:
-        return False
     try:
         import discord
         from i18n import t
-        contractor = await bot.fetch_user(contractor_id)
         e = discord.Embed(title=f"✅ {t(gid, 'ct.accepted')}",
                           description=t(gid, 'ct.accepted_desc', payment=c['payment'],
                                         sym=settings.CURRENCY_SYMBOL),
                           color=discord.Color.green())
-        await contractor.send(embed=e)
-        return True
+        msg = await deliver_to_player(gid, contractor_id, embed=e)
+        return msg is not None
     except Exception as exc:
-        log.warning("Could not DM approval for %s: %s", c.get("contract_id"), exc)
+        log.warning("Could not deliver approval for %s: %s", c.get("contract_id"), exc)
         return False
 
 
 async def _dm_settle_request(gid: int, contract_id: str, c: dict) -> bool:
-    bot = _bot()
-    if bot is None:
-        return False
     try:
         import discord
         from i18n import t
         from cogs.contract_views import SettleApprovalView
-        issuer = await bot.fetch_user(int(c["issuer_id"]))
         e = discord.Embed(title=f"🤝 {t(gid, 'ct.settle_request')}",
                           description=t(gid, 'ct.settle_desc', name=c['contractor_name']),
                           color=discord.Color.light_grey())
-        await issuer.send(embed=e, view=SettleApprovalView(contract_id, gid))
-        return True
+        msg = await deliver_to_player(gid, int(c["issuer_id"]), embed=e,
+                                      view=SettleApprovalView(contract_id, gid))
+        return msg is not None
     except Exception as exc:
         log.warning("Could not send settle request for %s: %s", contract_id, exc)
         return False
 
 
 async def _dm_more_time_request(gid: int, contract_id: str, c: dict, new_date: str) -> bool:
-    bot = _bot()
-    if bot is None:
-        return False
     try:
         import discord
         from i18n import t
         from cogs.contract_views import MoreTimeApprovalView
-        issuer = await bot.fetch_user(int(c["issuer_id"]))
         e = discord.Embed(title=f"⏰ {t(gid, 'ct.moretime_request')}",
                           description=t(gid, 'ct.moretime_desc', name=c['contractor_name'],
                                         old=c['due_date'], new=new_date),
                           color=discord.Color.blue())
-        await issuer.send(embed=e, view=MoreTimeApprovalView(contract_id, gid, new_date))
-        return True
+        msg = await deliver_to_player(gid, int(c["issuer_id"]), embed=e,
+                                      view=MoreTimeApprovalView(contract_id, gid, new_date))
+        return msg is not None
     except Exception as exc:
         log.warning("Could not send more-time request for %s: %s", contract_id, exc)
         return False
