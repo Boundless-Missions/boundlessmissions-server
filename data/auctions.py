@@ -8,8 +8,10 @@ mirrored into every server); guild_id on the doc is the origin only.
 """
 import logging
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
+
+from firebase_admin import firestore
 
 from data.store import _db
 
@@ -73,6 +75,65 @@ def get_auction(guild_id: int, auction_id: str) -> AuctionData | None:
 
 def update_auction(guild_id: int, auction_id: str, **fields) -> None:
     _col().document(auction_id).update(fields)
+
+
+def try_place_bid(guild_id: int, auction_id: str, bidder_id, bidder_name: str,
+                  amount: int, antisnipe_seconds: int = 0) -> dict:
+    """Atomically place a reverse-auction bid (lowest bid wins), re-validating
+    against the *committed* auction state inside a Firestore transaction.
+
+    A plain read-then-update lets two near-simultaneous bids validate against the
+    same `current_bid` and then race to write, so the later write wins even when it
+    is a higher (worse) bid — the earlier, genuinely-lower bid is silently clobbered.
+    Doing the ceiling check and the write in one transaction closes that: the ceiling
+    is measured against whatever bid is actually committed at write time.
+
+    Returns one of:
+      {"ok": True,  "auction": <updated dict>}
+      {"ok": False, "reason": "missing"}
+      {"ok": False, "reason": "closed"}
+      {"ok": False, "reason": "own"}
+      {"ok": False, "reason": "too_high", "ceiling": <int>}
+    """
+    ref = _col().document(auction_id)
+    transaction = _db.transaction()
+
+    @firestore.transactional
+    def _bid(txn) -> dict:
+        snap = ref.get(transaction=txn)
+        if not snap.exists:
+            return {"ok": False, "reason": "missing"}
+        a = snap.to_dict() or {}
+
+        now = datetime.utcnow()
+        if a.get("status") != OPEN or a.get("ends_at", "") <= now.isoformat():
+            return {"ok": False, "reason": "closed"}
+        if str(bidder_id) == str(a.get("issuer_id")):
+            return {"ok": False, "reason": "own"}
+
+        step = a.get("min_decrement", 1)
+        ceiling = a["current_bid"] - step
+        if amount > ceiling:
+            return {"ok": False, "reason": "too_high", "ceiling": ceiling, "step": step}
+
+        fields = {
+            "current_bid": amount,
+            "current_bidder_id": str(bidder_id),
+            "current_bidder_name": bidder_name,
+            "bid_count": a.get("bid_count", 0) + 1,
+        }
+        # Anti-snipe: a late bid pushes the end back so others can respond. Evaluated
+        # against the committed end time, same as the ceiling.
+        if antisnipe_seconds > 0:
+            end_dt = datetime.fromisoformat(a["ends_at"])
+            if (end_dt - now).total_seconds() < antisnipe_seconds:
+                fields["ends_at"] = (now + timedelta(seconds=antisnipe_seconds)).isoformat()
+
+        txn.update(ref, fields)
+        a.update(fields)
+        return {"ok": True, "auction": a}
+
+    return _bid(transaction)
 
 
 def list_open(guild_id: int) -> list[AuctionData]:

@@ -4241,16 +4241,29 @@ async def web_marketplace_buy(listing_id: str, user: dict = Depends(get_user_tok
 
     price = int(listing["price"])
     already_owned = str(uid) in (listing.get("buyers") or [])
+    new_purchase = False
 
     if not already_owned:
-        # Atomic check-and-deduct so a double-submit can't pay twice / overdraw.
+        # Atomic check-and-deduct so a double-submit can't overdraw.
         if not await store.try_debit(gid, uid, price):
             bal = store.get_user(gid, uid).get("balance", 0)
             return WebBuyResult(
                 success=False, balance=bal,
                 message=f"You need {price:,} {settings.CURRENCY_NAME} but only have {bal:,}.",
             )
-        await store.add_balance(gid, seller_id, price)
+        # Debit succeeded — now claim ownership atomically. The claim is a Firestore
+        # transaction, so of two concurrent double-submits exactly one adds the buyer
+        # and gets True; the loser is refunded below. Without this, both requests pass
+        # the `already_owned` read above and the buyer pays twice for one craft.
+        claimed = await asyncio.to_thread(mkt.try_claim_purchase, gid, listing_id, uid)
+        if claimed:
+            new_purchase = True
+            await store.add_balance(gid, seller_id, price)
+        else:
+            # Listing vanished mid-buy, or a concurrent request already recorded this
+            # buyer: the debit was redundant → refund it and don't pay the seller.
+            await store.add_balance(gid, uid, price)
+            already_owned = True
 
     # Queue for KSP auto-import (idempotent on source+ref_id) and offer direct download.
     imp.enqueue(
@@ -4258,8 +4271,7 @@ async def web_marketplace_buy(listing_id: str, user: dict = Depends(get_user_tok
         craft_url=listing.get("craft_url"), craft_filename=listing.get("craft_filename"),
     )
 
-    if not already_owned:
-        mkt.record_purchase(gid, listing_id, uid)
+    if new_purchase:
         if _bot_instance is not None:
             # Notify the seller, best-effort.
             try:
@@ -4635,39 +4647,31 @@ async def web_auction_bid(auction_id: str, req: WebAuctionBidRequest, request: R
     gid, uid, name = _web_actor(user, request)
     if _bot_instance is None:
         return ContractAcceptResponse(success=False, message="Auctions are not available right now.")
-    # Re-read fresh to validate against the latest lowest bid (mitigates races) —
-    # the same order of checks as the Discord modal.
-    a = aucdb.get_auction(gid, auction_id)
-    if a is None:
-        raise HTTPException(status_code=404, detail="No such auction")
-    if a["status"] != aucdb.OPEN or a["ends_at"] <= datetime.utcnow().isoformat():
-        return ContractAcceptResponse(success=False, message="This auction has already ended.")
-    if str(uid) == str(a["issuer_id"]):
-        return ContractAcceptResponse(success=False, message="You can't bid on your own auction.")
 
-    step = a.get("min_decrement", 1)
-    ceiling = a["current_bid"] - step
-    if req.amount > ceiling:
+    # The whole bid — re-read, re-validate the ceiling, and write — runs in one
+    # Firestore transaction (see aucdb.try_place_bid), so a concurrent lower bid can't
+    # be clobbered by a higher one landing microseconds later. Same checks and order
+    # as the Discord modal, just made atomic.
+    res = await asyncio.to_thread(
+        aucdb.try_place_bid, gid, auction_id, uid, name, req.amount,
+        settings.AUCTION_ANTISNIPE_SECONDS)
+
+    if not res["ok"]:
+        reason = res["reason"]
+        if reason == "missing":
+            raise HTTPException(status_code=404, detail="No such auction")
+        if reason == "closed":
+            return ContractAcceptResponse(success=False, message="This auction has already ended.")
+        if reason == "own":
+            return ContractAcceptResponse(success=False, message="You can't bid on your own auction.")
+        # too_high
+        ceiling, step = res["ceiling"], res["step"]
         return ContractAcceptResponse(
             success=False,
             message=f"Bid must be at most {ceiling} — undercut the current lowest by at least {step}.",
         )
 
-    fields = {
-        "current_bid": req.amount,
-        "current_bidder_id": str(uid),
-        "current_bidder_name": name,
-        "bid_count": a["bid_count"] + 1,
-    }
-    # Anti-snipe: a late bid pushes the end back so others can respond.
-    if settings.AUCTION_ANTISNIPE_SECONDS > 0:
-        now = datetime.utcnow()
-        end_dt = datetime.fromisoformat(a["ends_at"])
-        if (end_dt - now).total_seconds() < settings.AUCTION_ANTISNIPE_SECONDS:
-            fields["ends_at"] = (now + timedelta(seconds=settings.AUCTION_ANTISNIPE_SECONDS)).isoformat()
-    aucdb.update_auction(gid, auction_id, **fields)
-    a.update(fields)
-
+    a = res["auction"]
     from cogs.auctions import _edit_auction_message
     await _edit_auction_message(_bot_instance, a, int(a.get("guild_id") or gid), live=True)
     log.info("WEB: %s bid %d on auction %s", name, req.amount, auction_id)
