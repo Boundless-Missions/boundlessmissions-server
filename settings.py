@@ -474,6 +474,12 @@ ORBIT_FROZEN_INCL = 63.4          # Molniya / Tundra critical ("frozen") inclina
 ORBIT_FROZEN_INCL_TOL = 5.0
 ORBIT_MOLNIYA_ECC_MIN = 0.50
 ORBIT_TUNDRA_ECC_MIN = 0.20
+# Numeric altitude requirements parsed from mission text ("a 100x100 km orbit",
+# "orbit at 250 km"). The tolerance is generous unless the text names one ("within
+# 5 km"): whichever is larger of a flat floor and a fraction of the target, so
+# "100 km" doesn't demand a 100.0 km orbit while "2,000 km" isn't held to ±10 km.
+ORBIT_ALT_MARGIN_MIN = 10_000.0   # m — floor on the ± tolerance for Ap/Pe targets
+ORBIT_ALT_MARGIN_FRAC = 0.05      # fraction of the target used when it is larger
 
 # ── Rescue target: orbital plane ─────────────────────────────────────────────
 # A rescue in "orbit" mode names an Ap/Pe the rescuer has to reach, which says

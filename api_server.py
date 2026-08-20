@@ -2591,6 +2591,17 @@ async def create_rescue_contract(
     req_types: list[str] = []
     if mode_l == "orbit":
         req_types = oc.normalize_types(orbit_types)
+        # A contradictory pair (polar + equatorial, circular + elliptical, …) is not
+        # a strict contract, it is one no orbit can ever satisfy — refuse it here
+        # rather than escrow money against an unfillable target. The client's form
+        # de-selects conflicts as they are picked, so this only fires for an old or
+        # hand-rolled client.
+        _bad = oc.conflicting_pair(req_types)
+        if _bad:
+            return ContractAcceptResponse(
+                success=False,
+                message=f"Orbit types '{oc.label(_bad[0])}' and '{oc.label(_bad[1])}' "
+                        "contradict each other — no orbit can be both.")
         if inc is not None:
             if not math.isfinite(inc) or not 0.0 <= inc <= 180.0:
                 return ContractAcceptResponse(

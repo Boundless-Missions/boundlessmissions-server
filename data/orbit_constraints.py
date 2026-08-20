@@ -18,6 +18,14 @@ Canonical constraint dict (omitted/empty == no orbit requirement):
     {
       "requirements": [str],   # tokens from REQUIREMENTS, e.g. ["polar", "circular"]
       "notes":        str,     # human-readable summary (optional)
+      "alt": {                 # numeric altitude requirement (optional), metres ASL
+        "ap":     float|None,  # target apoapsis  ("100x100 km", "apoapsis of 200 km")
+        "pe":     float|None,  # target periapsis
+        "margin": float|None,  # ± tolerance for the targets; written at extraction
+                               # time so client and server can't derive it apart
+        "min":    float|None,  # whole orbit at/above this (checked against periapsis)
+        "max":    float|None,  # whole orbit at/below this (checked against apoapsis)
+      },
     }
 
 The orbital elements are reported by the (untrusted) KSP client, exactly like the
@@ -90,7 +98,39 @@ def is_empty(constraint: dict | None) -> bool:
     """True when there is no orbit requirement to enforce."""
     if not constraint:
         return True
-    return not constraint.get("requirements")
+    return not constraint.get("requirements") and not _alt_of(constraint)
+
+
+_ALT_KEYS = ("ap", "pe", "margin", "min", "max")
+
+
+def _alt_of(constraint: dict | None) -> dict | None:
+    """The altitude sub-dict when it actually constrains something, else None."""
+    alt = (constraint or {}).get("alt")
+    if not isinstance(alt, dict):
+        return None
+    for k in ("ap", "pe", "min", "max"):  # a bare margin constrains nothing
+        if alt.get(k) is not None:
+            return alt
+    return None
+
+
+def _norm_alt(raw) -> dict | None:
+    """Validate a loose altitude sub-dict: finite positive metres or absent."""
+    if not isinstance(raw, dict):
+        return None
+    out: dict = {}
+    for k in _ALT_KEYS:
+        v = raw.get(k)
+        if v is None:
+            continue
+        try:
+            f = float(v)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(f) and f > 0:
+            out[k] = f
+    return out if any(out.get(k) is not None for k in ("ap", "pe", "min", "max")) else None
 
 
 def normalize(raw: dict | None) -> dict:
@@ -107,6 +147,9 @@ def normalize(raw: dict | None) -> dict:
         if t in REQUIREMENTS and t not in seen:
             seen.add(t)
             out["requirements"].append(t)
+    alt = _norm_alt(raw.get("alt"))
+    if alt:
+        out["alt"] = alt
     notes = raw.get("notes")
     if isinstance(notes, str) and notes.strip():
         out["notes"] = notes.strip()[:200]
@@ -144,6 +187,136 @@ def extract_heuristic(text: str) -> dict:
         for sub in ("synchronous", "equatorial", "circular"):
             if sub in out["requirements"]:
                 out["requirements"].remove(sub)
+
+    # Numeric altitude requirement ("a 100x100 km orbit", "orbit at 250 km").
+    # Cue-gated like the ambiguous adjectives: a bare number with a unit is
+    # ordinary mission flavour unless the text is about an orbit.
+    if has_cue:
+        alt = _extract_altitude(low)
+        if alt:
+            out["alt"] = alt
+    return out
+
+
+# ── Numeric altitude extraction ───────────────────────────────────────────────
+
+# A decimal number: "100", "71.5", "1,5" (comma-decimal locales write "1,5 km").
+# "1,500 km" (thousands comma) is read as 1.5 km — the ambiguity is unresolvable
+# from text alone and low-stakes here; authors writing thousands spell "1500".
+_NUM = r"(\d+(?:[.,]\d+)?)"
+_UNIT = r"(km|m)"
+
+# "100x100 km", "80 × 120 km", "100km x 200km", "100 by 100 km". The first unit
+# is optional and falls back to the second, which is how people actually write it.
+_RX_APXPE = re.compile(_NUM + r"\s*" + _UNIT + r"?\s*(?:x|×|by)\s*" + _NUM + r"\s*" + _UNIT + r"\b")
+
+# "orbit at/of/around 100 km" (cue before the number) and "100 km orbit",
+# "100 km circular parking orbit", "100 km'lik yörünge" (number before the cue,
+# at most a few words between). The number-before-cue form is the loosest match
+# in this file, so it takes km only: with bare metres allowed, "500 m of cable to
+# the orbital station" reads as a 500 m orbit.
+_RX_CUE_NUM = re.compile(r"(?:orbit\w*|yörünge\w*)\s+(?:at|of|around|:)?\s*(?:an?\s+)?~?"
+                         + _NUM + r"\s*" + _UNIT + r"\b")
+_RX_NUM_CUE = re.compile(_NUM + r"\s*(km)\b[^\d.;!?]{0,40}?(?:orbit|yörünge)")
+
+# Bounds: the whole orbit above/below an altitude.
+_RX_ALT_MIN = re.compile(r"orbit\w*\s+(?:above|over|higher than)\s+" + _NUM + r"\s*" + _UNIT + r"\b")
+_RX_ALT_MAX = re.compile(r"orbit\w*\s+(?:below|under|lower than)\s+" + _NUM + r"\s*" + _UNIT + r"\b")
+
+# Explicit per-side targets: "apoapsis of 200 km", "periapsis at 80km".
+_RX_AP = re.compile(r"apoapsis\s*(?:of|at|=|:)?\s*" + _NUM + r"\s*" + _UNIT + r"\b")
+_RX_PE = re.compile(r"periapsis\s*(?:of|at|=|:)?\s*" + _NUM + r"\s*" + _UNIT + r"\b")
+
+# An explicit tolerance: "within 5 km", "±10 km", "+/- 10km".
+_RX_MARGIN = re.compile(r"(?:±|\+/-|within|plus or minus)\s*" + _NUM + r"\s*" + _UNIT + r"\b")
+
+
+def _metres(num: str, unit: str) -> float | None:
+    try:
+        v = float(num.replace(",", "."))
+    except ValueError:
+        return None
+    if not math.isfinite(v) or v <= 0:
+        return None
+    return v * 1000.0 if unit == "km" else v
+
+
+def default_alt_margin(ap: float | None, pe: float | None) -> float:
+    """The ± tolerance an altitude target gets when the text names none: generous —
+    the larger of a flat floor and a fraction of the bigger target, so "100 km"
+    doesn't demand 100.0 km while "2000 km" isn't held to ±10."""
+    target = max(ap or 0.0, pe or 0.0)
+    return max(settings.ORBIT_ALT_MARGIN_MIN, target * settings.ORBIT_ALT_MARGIN_FRAC)
+
+
+def _extract_altitude(low: str) -> dict | None:
+    """Parse numeric altitude requirements out of (lowercased) mission text.
+    Conservative: every form requires a unit, and the caller has already required
+    an orbit cue word. Returns a canonical `alt` sub-dict or None. The margin is
+    materialised here (explicit "within N km" wins, default otherwise) so the KSP
+    client verifies against the same number the server does."""
+    ap: float | None = None
+    pe: float | None = None
+
+    m = _RX_APXPE.search(low)
+    if m:
+        first = _metres(m.group(1), m.group(2) or m.group(4))
+        second = _metres(m.group(3), m.group(4))
+        if first is not None and second is not None:
+            # Ap is the higher of the pair whichever way the author wrote it.
+            ap, pe = max(first, second), min(first, second)
+
+    # Named per-side targets override the pair form's split for that side.
+    m = _RX_AP.search(low)
+    if m:
+        v = _metres(m.group(1), m.group(2))
+        if v is not None:
+            ap = v
+    m = _RX_PE.search(low)
+    if m:
+        v = _metres(m.group(1), m.group(2))
+        if v is not None:
+            pe = v
+
+    # A single "orbit at N km" only when nothing above matched: "100x100 km orbit"
+    # must not additionally read as a 100 km single-altitude requirement.
+    if ap is None and pe is None:
+        m = _RX_CUE_NUM.search(low) or _RX_NUM_CUE.search(low)
+        if m:
+            v = _metres(m.group(1), m.group(2))
+            if v is not None:
+                ap = pe = v
+
+    alt_min = alt_max = None
+    m = _RX_ALT_MIN.search(low)
+    if m:
+        alt_min = _metres(m.group(1), m.group(2))
+    m = _RX_ALT_MAX.search(low)
+    if m:
+        alt_max = _metres(m.group(1), m.group(2))
+
+    if ap is None and pe is None and alt_min is None and alt_max is None:
+        return None
+
+    out: dict = {}
+    if ap is not None:
+        out["ap"] = ap
+    if pe is not None:
+        out["pe"] = pe
+    if alt_min is not None:
+        out["min"] = alt_min
+    if alt_max is not None:
+        out["max"] = alt_max
+
+    if ap is not None or pe is not None:
+        margin = None
+        m = _RX_MARGIN.search(low)
+        if m:
+            margin = _metres(m.group(1), m.group(2))
+            # Respect a precise ask, but never let it hit zero-width.
+            if margin is not None:
+                margin = max(margin, 1000.0)
+        out["margin"] = margin if margin is not None else default_alt_margin(ap, pe)
     return out
 
 
@@ -177,10 +350,14 @@ def verify_orbit(constraint: dict | None, snap: dict | None) -> list[str]:
     if is_empty(constraint) or not isinstance(snap, dict):
         return []
 
-    reqs = constraint["requirements"]
+    reqs = constraint.get("requirements") or []
+    alt = _alt_of(constraint)
     situation = (snap.get("situation") or "").upper()
     if situation not in _ORBITAL_SITUATIONS:
-        names = ", ".join(_LABELS.get(r, r) for r in reqs)
+        bits = [_LABELS.get(r, r) for r in reqs]
+        if alt:
+            bits.append(_alt_summary(alt))
+        names = ", ".join(bits)
         return [f"Craft must be in orbit ({names}); it is currently {situation or 'not orbiting'}."]
 
     incl = _num(snap, "inclination")
@@ -193,7 +370,76 @@ def verify_orbit(constraint: dict | None, snap: dict | None) -> list[str]:
         msg = _check_one(req, incl, ecc, period, rot)
         if msg:
             out.append(msg)
+    if alt:
+        out.extend(_check_alt(alt, _num(snap, "apoapsis"), _num(snap, "periapsis")))
     return out
+
+
+def _check_alt(alt: dict, apo: float | None, peri: float | None) -> list[str]:
+    """Verify a snapshot's Ap/Pe (metres above the surface) against an altitude
+    requirement. Elements the client didn't report are skipped, like everywhere
+    else in this file — the telemetry-consistency check is what keeps a snapshot
+    honest, not this."""
+    out: list[str] = []
+    ap_t = alt.get("ap")
+    pe_t = alt.get("pe")
+    if ap_t is not None or pe_t is not None:
+        margin = alt.get("margin")
+        if margin is None or margin <= 0:
+            margin = default_alt_margin(ap_t, pe_t)
+        bad_ap = ap_t is not None and apo is not None and abs(apo - ap_t) > margin
+        bad_pe = pe_t is not None and peri is not None and abs(peri - pe_t) > margin
+        if bad_ap or bad_pe:
+            need = " / ".join(
+                bit for bit, want in (
+                    (f"Ap {_fmt_km(ap_t)}", ap_t), (f"Pe {_fmt_km(pe_t)}", pe_t))
+                if want is not None)
+            have = " / ".join(
+                bit for bit, t in (
+                    (f"Ap {_fmt_km(apo)}", ap_t), (f"Pe {_fmt_km(peri)}", pe_t))
+                if t is not None)
+            out.append(f"Orbit off target: need {need} (±{_fmt_km(margin)}); "
+                       f"current is {have}.")
+    alt_min = alt.get("min")
+    if alt_min is not None and peri is not None and peri < alt_min:
+        out.append(f"The whole orbit must stay above {_fmt_km(alt_min)}; "
+                   f"current periapsis is {_fmt_km(peri)}.")
+    alt_max = alt.get("max")
+    if alt_max is not None and apo is not None and apo > alt_max:
+        out.append(f"The whole orbit must stay below {_fmt_km(alt_max)}; "
+                   f"current apoapsis is {_fmt_km(apo)}.")
+    return out
+
+
+def _fmt_km(metres: float | None) -> str:
+    if metres is None:
+        return "?"
+    km = metres / 1000.0
+    return f"{km:,.1f} km" if abs(km) < 10 else f"{km:,.0f} km"
+
+
+def _alt_summary(alt: dict) -> str:
+    """Short human description of an altitude requirement: "100×100 km (±10 km)",
+    "Ap 250 km", "above 400 km"."""
+    bits: list[str] = []
+    ap_t, pe_t = alt.get("ap"), alt.get("pe")
+    if ap_t is not None or pe_t is not None:
+        margin = alt.get("margin")
+        if margin is None or margin <= 0:
+            margin = default_alt_margin(ap_t, pe_t)
+        if ap_t is not None and pe_t is not None:
+            core = (_fmt_km(ap_t) if ap_t == pe_t
+                    else f"{_fmt_km(ap_t)} × {_fmt_km(pe_t)}")
+        elif ap_t is not None:
+            core = f"Ap {_fmt_km(ap_t)}"
+        else:
+            core = f"Pe {_fmt_km(pe_t)}"
+        bits.append(f"{core} (±{_fmt_km(margin)})")
+    if alt.get("min") is not None:
+        bits.append(f"above {_fmt_km(alt['min'])}")
+    if alt.get("max") is not None:
+        bits.append(f"below {_fmt_km(alt['max'])}")
+    return ", ".join(bits)
 
 
 def _check_one(req: str, incl: float | None, ecc: float | None,
@@ -288,8 +534,11 @@ def summary_line(constraint: dict | None) -> str | None:
         return None
     if constraint.get("notes"):
         return constraint["notes"]
-    labels = [_LABELS.get(r, r) for r in constraint["requirements"]]
-    return ("Required orbit: " + ", ".join(labels)) if labels else None
+    bits = [_LABELS.get(r, r) for r in (constraint.get("requirements") or [])]
+    alt = _alt_of(constraint)
+    if alt:
+        bits.append(_alt_summary(alt))
+    return ("Required orbit: " + ", ".join(bits)) if bits else None
 
 
 def label(req: str) -> str:
@@ -316,6 +565,45 @@ def normalize_types(raw) -> list[str]:
         if t in REQUIREMENTS and t not in out:
             out.append(t)
     return out
+
+
+# Regime pairs no single orbit can satisfy, derived from the check maths above
+# (e.g. polar needs inclination ≈90°, equatorial ≈0°/180°; Molniya's half-day
+# period contradicts a synchronous one). Used to refuse a rescue target at
+# creation time — a contradictory set isn't "strict", it's unfillable, and the
+# submit gate would list every violation forever without ever passing. Pairs that
+# merely overlap ("stationary" implies "circular") are allowed: redundant is
+# satisfiable. Mirrored in ContractCreation.cs::OrbitTypeConflictMap — keep the
+# two in sync (same convention as REQUIREMENTS ↔ OrbitTypeTokens).
+_CONFLICTS: dict[str, frozenset[str]] = {
+    "prograde":        frozenset({"retrograde"}),
+    "retrograde":      frozenset({"prograde", "molniya", "tundra"}),
+    "polar":           frozenset({"equatorial", "stationary", "molniya", "tundra"}),
+    "equatorial":      frozenset({"polar", "molniya", "tundra"}),
+    "circular":        frozenset({"elliptical", "molniya", "tundra"}),
+    "elliptical":      frozenset({"circular", "stationary"}),
+    "stationary":      frozenset({"polar", "elliptical", "molniya", "tundra", "semisynchronous"}),
+    "synchronous":     frozenset({"molniya", "semisynchronous"}),
+    "semisynchronous": frozenset({"synchronous", "stationary", "tundra"}),
+    "molniya":         frozenset({"retrograde", "polar", "equatorial", "circular",
+                                  "stationary", "synchronous", "tundra"}),
+    "tundra":          frozenset({"retrograde", "polar", "equatorial", "circular",
+                                  "stationary", "semisynchronous", "molniya"}),
+}
+
+
+def conflicting_pair(types) -> tuple[str, str] | None:
+    """First mutually-unsatisfiable pair in a set of regime tokens, or None.
+    Accepts anything normalize_types does."""
+    toks = normalize_types(types)
+    for i, a in enumerate(toks):
+        conflicts = _CONFLICTS.get(a)
+        if not conflicts:
+            continue
+        for b in toks[i + 1:]:
+            if b in conflicts:
+                return (a, b)
+    return None
 
 
 def verify_types(types, snap: dict | None) -> list[str]:
