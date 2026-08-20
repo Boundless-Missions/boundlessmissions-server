@@ -184,20 +184,40 @@ def delete_listing(listing_id: str) -> None:
     log.info("Listing %s permanently deleted", listing_id)
 
 
-def record_purchase(guild_id: int, listing_id: str, buyer_id: int) -> None:
-    """Append a buyer and bump the sales counter."""
-    doc_ref = _col().document(listing_id)
-    snap = doc_ref.get()
-    if not snap.exists:
-        return
-    data = snap.to_dict()
-    buyers = data.get("buyers", [])
-    if str(buyer_id) not in buyers:
+def try_claim_purchase(guild_id: int, listing_id: str, buyer_id: int) -> bool | None:
+    """Atomically record `buyer_id` as a buyer of a listing (append + bump sales).
+
+    Returns True when this call actually added the buyer (a genuinely new purchase),
+    False when the buyer was already recorded (a duplicate/concurrent buy), or None
+    when the listing is gone.
+
+    The claim runs in a Firestore transaction, which is what makes it a safe charge
+    gate: of two concurrent buys of the same craft by the same user, exactly one gets
+    True. The caller keeps the buyer's debit only on that True and refunds the loser,
+    so a double-submit can never charge twice for one craft (see web_marketplace_buy).
+    The transaction.get / transaction.update calls pass through the cost-guard proxy
+    unchanged — guarded refs handed to transaction methods are unwrapped there.
+    """
+    ref = _col().document(listing_id)
+    transaction = _db.transaction()
+
+    @firestore.transactional
+    def _claim(txn) -> bool | None:
+        snap = ref.get(transaction=txn)
+        if not snap.exists:
+            return None
+        data = snap.to_dict() or {}
+        buyers = list(data.get("buyers", []) or [])
+        if str(buyer_id) in buyers:
+            return False
         buyers.append(str(buyer_id))
-    doc_ref.update({
-        "buyers": buyers,
-        "sales_count": data.get("sales_count", 0) + 1,
-    })
+        txn.update(ref, {
+            "buyers": buyers,
+            "sales_count": int(data.get("sales_count", 0) or 0) + 1,
+        })
+        return True
+
+    return _claim(transaction)
 
 
 # ── Votes ────────────────────────────────────────────────────────────────────
