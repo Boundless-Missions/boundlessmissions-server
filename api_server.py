@@ -2286,10 +2286,10 @@ async def create_contract_from_ksp(req: ContractCreateRequest, user: dict = Depe
 
 async def _open_auction_checked(gid: int, uid: int, username: str,
                                 req: AuctionCreateRequest) -> ContractAcceptResponse:
-    """Validate and open a reverse auction — the whole flow behind both the KSP
-    mod's /auctions/create and the website's /web/auctions, so the two clients
-    cannot drift on rules. Escrows start_value and posts to the Discord auction
-    channels; bidding/closing then happen wherever the player likes."""
+    """Validate and open a reverse auction — the flow behind the KSP mod's
+    /auctions/create, the only place an auction can start. Escrows start_value
+    and posts to the Discord auction channels; bidding/closing then happen in
+    Discord or on the website."""
     from datetime import date
 
     if _bot_instance is None or not guild_config.any_channel_configured(_bot_instance, "auction"):
@@ -4618,15 +4618,6 @@ async def web_auctions(user: dict = Depends(get_user_token_only)):
     auctions = [_web_auction_model(a, uid) for a in aucdb.list_open(0)]
     auctions.sort(key=lambda x: x.ends_at or "")
     return WebAuctionListResponse(auctions=auctions)
-
-
-@app.post("/api/v1/web/auctions", response_model=ContractAcceptResponse)
-async def web_auction_create(req: AuctionCreateRequest, request: Request,
-                             user: dict = Depends(get_user_token_only)):
-    """Open an auction from the website — same validation and escrow as the KSP
-    endpoint, via the shared helper."""
-    gid, uid, name = _web_actor(user, request)
-    return await _open_auction_checked(gid, uid, name, req)
 
 
 @app.post("/api/v1/web/auctions/{auction_id}/bid", response_model=ContractAcceptResponse)
