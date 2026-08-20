@@ -440,6 +440,11 @@ class MarketplaceListing(BaseModel):
     life_support: str = "none"
     ls_endurance_days: float = 0.0
     ls_crew_capacity: int = 0
+    # Whether the craft carries a Textures Unlimited paint job — the website's
+    # "Modded Textures Available" tag. Sent by the KSP client at list-time; for a
+    # listing made before the flag existed it is inferred from the mod row instead
+    # (see _listing_to_model).
+    custom_textures: bool = False
     # Community vote tallies. Public (they're on every card); *who* voted is not —
     # the caller learns only their own vote, from /web/marketplace/votes.
     likes: int = 0

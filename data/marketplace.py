@@ -55,6 +55,7 @@ def create_listing(
     life_support: str = "none",
     ls_endurance_days: float = 0.0,
     ls_crew_capacity: int = 0,
+    custom_textures: bool = False,
 ) -> ListingData:
     lid = uuid.uuid4().hex[:12]
     now = datetime.utcnow().isoformat()
@@ -94,6 +95,13 @@ def create_listing(
         "life_support": life_support or "none",
         "ls_endurance_days": float(ls_endurance_days or 0.0),
         "ls_crew_capacity": int(ls_crew_capacity or 0),
+        # Whether the craft carries a Textures Unlimited paint job, sent by the KSP
+        # client at list-time (TextureTransfer.CraftHasCustomTextures) — the website's
+        # "Modded Textures Available" tag. A flag of its own rather than a read of
+        # `mods`: a texture set the seller can't resolve either contributes no folder
+        # while the paint job is still on the craft. False for listings made before the
+        # flag existed; those fall back to the mod row (see _listing_to_model).
+        "custom_textures": bool(custom_textures),
         "status": ACTIVE,
         "created_at": now,
         # Vote tallies. These are *derived* counters kept in step with the per-user

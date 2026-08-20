@@ -3922,6 +3922,7 @@ async def marketplace_list_craft(
     life_support: str = Form("none"),
     ls_endurance_days: float = Form(0.0),
     ls_crew_capacity: int = Form(0),
+    custom_textures: str = Form(""),
     user: dict = Depends(get_current_user),
 ):
     """List a craft (.craft blueprint) for sale on the marketplace.
@@ -3961,6 +3962,10 @@ async def marketplace_list_craft(
     # Capped — a very large craft is still only a few hundred distinct parts, and this
     # goes into a Firestore document with a 1 MiB ceiling.
     part_list = sorted({p.strip() for p in parts.split(",") if p.strip()})[:2000]
+    # custom_textures: the client sends "1" only when the craft carries a Textures
+    # Unlimited paint job, and nothing at all otherwise — which is also what an older
+    # client sends, so an absent field has to mean False rather than an error.
+    has_custom_textures = custom_textures.strip().lower() in ("1", "true", "yes")
 
     listing = mkt.create_listing(
         gid, uid, user["username"],
@@ -3971,6 +3976,7 @@ async def marketplace_list_craft(
         life_support=(life_support or "none").strip().lower(),
         ls_endurance_days=ls_endurance_days,
         ls_crew_capacity=ls_crew_capacity,
+        custom_textures=has_custom_textures,
     )
 
     try:
@@ -4094,6 +4100,25 @@ async def marketplace_delist(listing_id: str, user: dict = Depends(get_current_u
 #  goes through here so the bot stays the single source of truth.
 # ══════════════════════════════════════════════════════════════════════════════
 
+def _has_custom_textures(l: dict) -> bool:
+    """Whether a listing's craft carries a Textures Unlimited paint job.
+
+    The KSP client sends this as its own flag at list-time, which is the answer to
+    trust. A listing made before that flag existed carries no field, and for those the
+    mod row is a sound stand-in: TU adds zero parts, so its folder can only have got
+    into `mods` through the paint-job scan that put it there (TexturePackFoldersForCraft),
+    never through the part walk. Matched on a normalized substring because TU is
+    installed under more than one folder name ("TexturesUnlimited", "000_TexturesUnlimited");
+    TUFX — scene-wide post-processing, nothing per-craft — does not match it and must not.
+    """
+    if "custom_textures" in l:
+        return bool(l.get("custom_textures"))
+    for m in l.get("mods", []) or []:
+        if "texturesunlimited" in "".join(c for c in str(m).lower() if c.isalnum()):
+            return True
+    return False
+
+
 def _listing_to_model(l: dict, include_download: bool = False) -> MarketplaceListing:
     """Map a raw Firestore listing dict to the API model.
 
@@ -4124,6 +4149,7 @@ def _listing_to_model(l: dict, include_download: bool = False) -> MarketplaceLis
         life_support=l.get("life_support", "none") or "none",
         ls_endurance_days=l.get("ls_endurance_days", 0.0) or 0.0,
         ls_crew_capacity=l.get("ls_crew_capacity", 0) or 0,
+        custom_textures=_has_custom_textures(l),
         likes=int(l.get("likes", 0) or 0),
         dislikes=int(l.get("dislikes", 0) or 0),
     )
