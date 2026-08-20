@@ -142,6 +142,22 @@ def validate_link_code(code: str) -> dict | None:
     }
 
 
+def purge_all_link_codes() -> int:
+    """Burn every outstanding link code. The sweep defense (see api_server's
+    _note_failed_link_guess): a code costs its owner one /linkcode to regenerate,
+    so when the failure pattern says someone is sweeping the 6-digit space, the
+    cheapest possible response is to make sure there is nothing left to hit.
+    Best-effort; returns how many codes were deleted."""
+    n = 0
+    try:
+        for doc in _link_codes_col().stream():
+            doc.reference.delete()
+            n += 1
+    except Exception as exc:
+        log.warning("Could not purge link codes: %s", exc)
+    return n
+
+
 # ── Discord DM login approval ────────────────────────────────────────────────
 #
 # Second step of linking ("push approval"): a valid link code creates a pending
@@ -254,34 +270,95 @@ def _device_chal_col():
     return _db.collection("ksp_device_challenges")
 
 
-def _get_allowed_devices(user_id: str) -> set:
+def _get_allowed_devices(user_id: str) -> set | None:
+    """The user's trusted-device set — or None when it is UNKNOWABLE right now
+    (Firestore read failed with nothing cached).
+
+    None is deliberately distinct from an empty set. Empty means "no device
+    bound yet" and triggers trust-on-first-use in check_device; that adoption is
+    a PERMANENT write, so it must never run off a failed read — an attacker
+    holding a copied session token who happened to ask during a Firestore blip
+    would get their device bound to the account for good. Same rule as
+    _get_token_version above: on a failed read, return the last known value if
+    there is one, and never cache the guess."""
     cached = _allowed_devices.get(user_id)
     now = time.time()
     if cached is not None and now - cached[1] < _ALLOWED_DEV_TTL:
         return cached[0]
-    devices: set = set()
     try:
         snap = _sessions_col().document(user_id).get()
-        if snap.exists:
-            devices = set(snap.to_dict().get("allowed_devices", []) or [])
+        devices = (set(snap.to_dict().get("allowed_devices", []) or [])
+                   if snap.exists else set())
     except Exception as exc:
         log.warning("Could not read allowed devices for %s: %s", user_id, exc)
-        if cached is not None:
-            return cached[0]
+        return cached[0] if cached is not None else None
     _allowed_devices[user_id] = (devices, now)
     return devices
 
 
 def add_allowed_device(user_id: str, device_id: str) -> None:
     """Trust a device for this user (idempotent). Updates the in-process cache so
-    the device's very next request passes without waiting for the cache TTL."""
+    the device's very next request passes without waiting for the cache TTL.
+    Alongside the id, a device_meta entry records when trust was granted — that's
+    what the "your devices" listing shows, and what remove_allowed_device drops."""
     if not device_id:
         return
-    _sessions_col().document(user_id).set(
-        {"allowed_devices": firestore.ArrayUnion([device_id])}, merge=True)
-    self_set = set(_get_allowed_devices(user_id)) | {device_id}
-    _allowed_devices[user_id] = (self_set, time.time())
+    _sessions_col().document(user_id).set({
+        "allowed_devices": firestore.ArrayUnion([device_id]),
+        # set(merge=True) treats nested dict keys as literal map keys (no field-
+        # path parsing), so a raw device id is safe here; sibling entries survive.
+        "device_meta": {device_id: {
+            "added_at": datetime.now(timezone.utc).isoformat(),
+        }},
+    }, merge=True)
+    base = _get_allowed_devices(user_id)
+    if base is not None:
+        _allowed_devices[user_id] = (set(base) | {device_id}, time.time())
     log.info("Device %s… trusted for user %s", device_id[:8], user_id)
+
+
+def remove_allowed_device(user_id: str, device_id: str) -> bool:
+    """Un-trust a device — the reverse of add_allowed_device, and what makes the
+    approval prompt a decision rather than a one-way door. The device's next
+    request falls back into the device gate exactly like a brand-new PC (DM
+    approval required); its session token is NOT revoked, because the gate in
+    front of every gated endpoint is the block. Returns False when the id wasn't
+    in the trust set. Removing the last device re-arms trust-on-first-use, which
+    is the same state a fresh rollout account is in."""
+    if not device_id:
+        return False
+    allowed = _get_allowed_devices(user_id)
+    if allowed is not None and device_id not in allowed:
+        return False
+    _sessions_col().document(user_id).update({
+        "allowed_devices": firestore.ArrayRemove([device_id]),
+        # update() DOES parse field paths — device ids are hex and may start
+        # with a digit, so the segment must be backtick-quoted.
+        f"device_meta.`{device_id}`": firestore.DELETE_FIELD,
+    })
+    cached = _allowed_devices.get(user_id)
+    if cached is not None:
+        # Mutate the cached set in place, keeping its original timestamp: the
+        # removal must be visible immediately without extending staleness.
+        cached[0].discard(device_id)
+    log.info("Device %s… un-trusted for user %s", device_id[:8], user_id)
+    return True
+
+
+def list_devices(user_id: str) -> list[dict]:
+    """The user's trusted devices with their metadata, newest last. Reads the doc
+    directly rather than the cache — a management screen should show the truth,
+    and it is called far too rarely to need one. Devices trusted before metadata
+    existed have added_at=None; the id itself is still listed and removable."""
+    snap = _sessions_col().document(user_id).get()
+    if not snap.exists:
+        return []
+    d = snap.to_dict() or {}
+    meta = d.get("device_meta", {}) or {}
+    return [
+        {"device_id": did, "added_at": (meta.get(did) or {}).get("added_at")}
+        for did in (d.get("allowed_devices", []) or [])
+    ]
 
 
 def check_device(user_id: str, device_id: str) -> str:
@@ -292,6 +369,13 @@ def check_device(user_id: str, device_id: str) -> str:
     aren't locked out by the rollout. After that, only known ids pass.
     """
     allowed = _get_allowed_devices(user_id)
+    if allowed is None:
+        # Trust set unknowable (Firestore outage, nothing cached). Fail open for
+        # THIS request only — the same call the suspension gate makes, for the
+        # same reason: an outage that blocked every player would be worse than a
+        # stolen token getting extra minutes. Crucially: adopt nothing and cache
+        # nothing, so no permanent trust is ever granted on a failed read.
+        return "ok"
     if not allowed:
         if device_id:
             add_allowed_device(user_id, device_id)
@@ -488,6 +572,24 @@ def purge_ksp_user_data(user_id: str) -> None:
 
 
 # ── Session Tokens ───────────────────────────────────────────────────────────
+#
+# Key rotation: tokens are signed with the CURRENT secret but verified against an
+# accept list (current + optionally the previous secret, see config's
+# API_SECRET_KEY_PREVIOUS). That turns rotating the signing key from a mass
+# force-unlink into a non-event: move the old key to _PREVIOUS, set a new current
+# key, restart — existing tokens keep verifying for up to TOKEN_LIFETIME while
+# every new token is minted under the new key; drop _PREVIOUS after 30 days.
+# Each token carries a `kid` (short non-reversible hash of its signing key) for
+# observability only — verification never trusts it, it just names which key a
+# logged token was minted under.
+
+
+def key_id(secret: str) -> str:
+    """Short non-reversible identifier for a signing key: first 8 hex chars of
+    its SHA-256. Safe to embed in tokens/logs — it identifies the key without
+    revealing anything usable about it."""
+    return hashlib.sha256(secret.encode()).hexdigest()[:8]
+
 
 def _sign_token(payload: dict, secret: str) -> str:
     """Create an HMAC-SHA256 signed token from a payload dict."""
@@ -539,6 +641,7 @@ def create_session_token(guild_id: str, user_id: str, username: str, secret: str
         "iat": int(now),
         "exp": int(now + TOKEN_LIFETIME),
         "tv": version,
+        "kid": key_id(secret),  # which key minted this — observability only
     }
     token = _sign_token(payload, secret)
 
@@ -558,12 +661,21 @@ def create_session_token(guild_id: str, user_id: str, username: str, secret: str
     return token
 
 
-def verify_session_token(token: str, secret: str) -> dict | None:
+def verify_session_token(token: str, secret: "str | list[str] | tuple") -> dict | None:
     """
     Verify a session token.
     Returns {guild_id, user_id, username} or None.
+
+    `secret` may be a single key or an accept list (current key first, then the
+    previous one during a rotation window — see the section comment above). The
+    signature is tried against each; the embedded `kid` is never trusted to pick.
     """
-    payload = _verify_token(token, secret)
+    secrets_list = [secret] if isinstance(secret, str) else [s for s in secret if s]
+    payload = None
+    for s in secrets_list:
+        payload = _verify_token(token, s)
+        if payload is not None:
+            break
     if payload is None:
         return None
 
@@ -605,3 +717,22 @@ def logout_all_devices(user_id: str) -> int:
 
     log.info("User %s logged out of all devices (token version → %d)", user_id, new_version)
     return new_version
+
+
+def get_linked_guild(user_id: str) -> str | None:
+    """The guild this user's live session was linked through, or None.
+
+    Feeds the ban→revoke hook (cogs/ksp_bridge.on_member_ban): a ban should end
+    API access only when the banned guild is the one the session's authority
+    came from — being banned from some unrelated server the bot also happens to
+    be in must not log a player out of their own community."""
+    try:
+        snap = _sessions_col().document(str(user_id)).get()
+        if snap.exists:
+            d = snap.to_dict() or {}
+            if d.get("active"):
+                gid = str(d.get("guild_id") or "")
+                return gid or None
+    except Exception as exc:
+        log.warning("Could not read linked guild for %s: %s", user_id, exc)
+    return None

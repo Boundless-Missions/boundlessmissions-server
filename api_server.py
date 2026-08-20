@@ -36,6 +36,7 @@ from api_auth import (
     logout_all_devices, create_approval_challenge, resolve_approval, poll_approval,
     add_allowed_device, check_device, create_device_challenge,
     poll_device_challenge, get_report_target, mark_report_done,
+    remove_allowed_device, list_devices, purge_all_link_codes,
 )
 from api_models import (
     LinkRequest, LinkResponse, PollRequest, DeviceStatusResponse,
@@ -340,8 +341,21 @@ def broadcast_policy_update():
 
 def _get_api_secret() -> str:
     # config.py refuses to start with a blank/default secret when the KSP API is
-    # enabled, so this is always a real key here.
+    # enabled, so this is always a real key here. This is the SIGNING key — new
+    # tokens are always minted under it.
     return cfg.API_SECRET_KEY
+
+
+def _accept_secrets() -> list[str]:
+    """Keys accepted when VERIFYING a token: the current signing key first, then
+    the previous one while a rotation window is open (API_SECRET_KEY_PREVIOUS,
+    already validated by config.py — never blank-as-key, never a placeholder,
+    never a duplicate of the current key). Every verify call site uses this list
+    so rotation can't be half-applied."""
+    out = [cfg.API_SECRET_KEY]
+    if cfg.API_SECRET_KEY_PREVIOUS:
+        out.append(cfg.API_SECRET_KEY_PREVIOUS)
+    return out
 
 
 # ── Rate limiting (link / 2FA brute-force defense) ───────────────────────────
@@ -420,16 +434,50 @@ def _guard_link_attempt(request: Request):
     _rate_limit("link:global", max_hits=settings.KSP_LINK_RATELIMIT_GLOBAL, window=60.0)
 
 
-async def get_user_allow_suspended(authorization: str = Header(...)) -> dict:
+# ── Link-code sweep defense ──────────────────────────────────────────────────
+#
+# The per-IP limit caps one machine, but a distributed sweep of the 6-digit code
+# space fits under the global cap — and with KSP_2FA_ENABLED=false a hit is a
+# session token, not just an approval DM. Codes are free to regenerate (one
+# /linkcode), so the cheap counter-move is to make sweeping self-defeating: past
+# a failure threshold no honest community reaches, burn every outstanding code,
+# leaving the sweep nothing to hit. Failed guesses are the one clean signal —
+# legitimate users nearly always paste a code that exists.
+
+_FAILED_LINK_GUESSES: list[float] = []
+_LINK_SWEEP_WINDOW = 180.0          # one code lifetime (LINK_CODE_LIFETIME)
+_LINK_SWEEP_MAX_FAILURES = 40       # far past typo volume, far below sweep volume
+
+
+def _note_failed_link_guess() -> None:
+    """Record a failed link-code guess; purge all outstanding codes when the
+    volume says sweep rather than typo. In-process state, like _RATE_BUCKETS."""
+    now = time.time()
+    _FAILED_LINK_GUESSES[:] = [t for t in _FAILED_LINK_GUESSES
+                               if now - t < _LINK_SWEEP_WINDOW]
+    _FAILED_LINK_GUESSES.append(now)
+    if len(_FAILED_LINK_GUESSES) >= _LINK_SWEEP_MAX_FAILURES:
+        _FAILED_LINK_GUESSES.clear()
+        n = purge_all_link_codes()
+        log.warning("Link-code sweep suspected (%d failed guesses in %.0fs) — "
+                    "purged %d outstanding link codes",
+                    _LINK_SWEEP_MAX_FAILURES, _LINK_SWEEP_WINDOW, n)
+
+
+async def get_user_allow_suspended(authorization: str = Header(default="")) -> dict:
     """Validate just the session token — no device gate, and no suspension gate.
 
     Two things must keep working while a player is suspended: reading their own
     suspension (or they are stuck at a wall with no text on it), and logging out
     of every device (their own privacy control, which a punishment must not take
-    away). Nothing else uses this."""
-    if not authorization.startswith("Bearer "):
+    away). Nothing else uses this.
+
+    The header is optional-with-default so a MISSING header is our 401, not
+    FastAPI's 422 — the mod's session handling treats 401 as the single "this
+    session is finished" signal, and every no-token shape must speak it."""
+    if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Invalid authorization header")
-    user = verify_session_token(authorization[7:], _get_api_secret())
+    user = verify_session_token(authorization[7:], _accept_secrets())
     if user is None:
         raise HTTPException(status_code=401, detail="Invalid or expired token")
     return user
@@ -460,7 +508,7 @@ def enforce_not_suspended(user_id: str) -> None:
         raise HTTPException(status_code=403, detail=_suspension_detail(rec))
 
 
-async def get_user_token_only(authorization: str = Header(...)) -> dict:
+async def get_user_token_only(authorization: str = Header(default="")) -> dict:
     """Validate just the session token (no device gate). Used by the device-
     approval poll / report endpoints, which a blocked device must still reach.
 
@@ -497,7 +545,7 @@ def enforce_mod_version(x_mod_hash: str) -> None:
 
 
 async def get_current_user(request: Request,
-                           authorization: str = Header(...),
+                           authorization: str = Header(default=""),
                            x_device_id: str = Header(default="", alias="X-Device-Id"),
                            x_mod_hash: str = Header(default="", alias="X-Mod-Hash")) -> dict:
     """Validate the session token, enforce the suspension and version gates, then
@@ -592,6 +640,7 @@ async def auth_link(req: LinkRequest, request: Request,
 
     result = validate_link_code(req.code)
     if result is None:
+        _note_failed_link_guess()
         raise HTTPException(status_code=400, detail="Invalid or expired link code")
 
     # Approval off → link immediately (trusting the linking device).
@@ -736,6 +785,14 @@ async def device_report(report_id: str,
     if not target:
         log.warning("Device report %s: no pending report target found", report_id)
         raise HTTPException(status_code=404, detail="No pending report for this id")
+    # The uploader must be the account the report is about — the offending client
+    # holds a (copied) token for exactly that account, so this costs the real flow
+    # nothing while keeping an unrelated token from writing into someone else's
+    # moderation ticket. 404, not 403: don't confirm the report exists.
+    if str(target.get("user_id")) != str(user.get("user_id")):
+        log.warning("Device report %s: uploader %s is not the reported account %s",
+                    report_id, user.get("user_id"), target.get("user_id"))
+        raise HTTPException(status_code=404, detail="No pending report for this id")
     log_bytes = await _read_upload(ksp_log, MAX_LOG_BYTES) if ksp_log is not None else None
     log.info("Device report %s received from user %s (mac=%s, log=%d bytes)",
              report_id, user.get("user_id"), "yes" if mac else "no",
@@ -743,6 +800,51 @@ async def device_report(report_id: str,
     await _post_device_report(target, mac, _trim_log(log_bytes))
     mark_report_done(target["_doc_id"])
     return {"success": True}
+
+
+# ── Trusted-device management ────────────────────────────────────────────────
+#
+# What makes the device-approval prompt reversible: the approved-devices list can
+# be read and pruned, so a device trusted at 2am (a friend's PC, a mistaken
+# approval) is not trusted forever. Both endpoints sit behind get_current_user —
+# the full gate, device binding included — on purpose: the trust list may only be
+# edited FROM a trusted device. A copied token on an unapproved machine (the
+# exact adversary device binding exists for) must not be able to strip the
+# owner's real devices; token-only auth would allow that. The website therefore
+# can't manage devices (it carries no device id) — its security lever remains
+# logout_all, which is deliberately available even to a stolen token because
+# using it burns that token too.
+
+
+class DeviceRemoveRequest(BaseModel):
+    device_id: str
+
+
+@app.get("/api/v1/auth/devices")
+async def auth_devices_list(x_device_id: str = Header(default="", alias="X-Device-Id"),
+                            user: dict = Depends(get_current_user)):
+    """The account's trusted devices, flagging which one is asking. Ids are the
+    caller's own opaque install GUIDs — nothing personal to withhold."""
+    devices = await asyncio.to_thread(list_devices, user["user_id"])
+    for d in devices:
+        d["current"] = bool(x_device_id) and d["device_id"] == x_device_id
+    return {"devices": devices}
+
+
+@app.post("/api/v1/auth/devices/remove")
+async def auth_devices_remove(req: DeviceRemoveRequest,
+                              x_device_id: str = Header(default="", alias="X-Device-Id"),
+                              user: dict = Depends(get_current_user)):
+    """Un-trust one device. Removing the CURRENT device is allowed — it is how a
+    player retires the PC they're sitting at — and takes effect on its next
+    request, when the device gate challenges it like any new machine. Removing
+    the last device re-arms trust-on-first-use (the fresh-account state)."""
+    removed = await asyncio.to_thread(
+        remove_allowed_device, user["user_id"], req.device_id)
+    if not removed:
+        raise HTTPException(status_code=404, detail="That device is not on your account.")
+    log.info("User %s removed trusted device %s…", user["user_id"], req.device_id[:8])
+    return {"success": True, "removed_current": req.device_id == x_device_id}
 
 
 # ── Bug reports ───────────────────────────────────────────────────────────────
@@ -3355,8 +3457,13 @@ async def notifications_ws(websocket: WebSocket):
 
     if user is None:
         # Deprecated fallback for clients that still pass the token directly.
+        # It must honor the suspension gate itself: the ticket path inherits it
+        # from get_user_token_only at issue time, but a raw token skips that, and
+        # a suspension the notification stream ignored would not be one.
         token = websocket.query_params.get("token", "")
-        user = verify_session_token(token, _get_api_secret()) if token else None
+        user = verify_session_token(token, _accept_secrets()) if token else None
+        if user is not None and suspensions.get_active(user["user_id"]) is not None:
+            user = None
 
     if user is None:
         await websocket.close(code=1008)  # policy violation
@@ -4066,6 +4173,7 @@ async def web_auth_link(req: LinkRequest, request: Request,
 
     result = validate_link_code(req.code)
     if result is None:
+        _note_failed_link_guess()
         raise HTTPException(status_code=400, detail="Invalid or expired link code")
 
     if not cfg.KSP_2FA_ENABLED:

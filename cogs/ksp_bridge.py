@@ -17,6 +17,7 @@ import settings
 from api_auth import (
     generate_link_code, resolve_approval, resolve_device_challenge,
     purge_ksp_user_data, request_device_ping, set_device_ticket_channel,
+    get_linked_guild, logout_all_devices,
 )
 from data.store import store, _db
 from data import guild_config
@@ -322,6 +323,31 @@ class KSPBridge(commands.Cog, name="KSPBridge"):
 
     def __init__(self, bot: commands.Bot):
         self.bot = bot
+
+    @commands.Cog.listener()
+    async def on_member_ban(self, guild: discord.Guild, user: discord.abc.User):
+        """A ban must also end API access. Session tokens live 30 days and bake in
+        the guild they were linked through, so without this a banned player kept
+        the marketplace, contracts and their wallet from in-game and the website
+        for up to a month after the door closed in Discord.
+
+        Fires for bot-issued and manual Discord bans alike. Scoped: sessions are
+        revoked only when the banned guild is the one the session's authority came
+        from (see api_auth.get_linked_guild) — a ban in some unrelated server the
+        bot also sits in must not log a player out of their own community."""
+        def _revoke() -> bool:
+            uid = str(user.id)
+            if get_linked_guild(uid) != str(guild.id):
+                return False
+            logout_all_devices(uid)
+            return True
+
+        try:
+            if await asyncio.to_thread(_revoke):
+                log.info("Revoked KSP/web sessions for banned user %s (guild %s)",
+                         user.id, guild.id)
+        except Exception as exc:
+            log.warning("Could not revoke sessions for banned user %s: %s", user.id, exc)
 
     @app_commands.command(name="linkcode", description="Generate a 6-digit code to link your KSP game")
     async def linkcode(self, interaction: discord.Interaction):

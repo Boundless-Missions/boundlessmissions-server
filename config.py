@@ -61,6 +61,13 @@ class Config:
     API_HOST: str = _optional("API_HOST", "0.0.0.0")
     API_PORT: int = int(_optional("API_PORT", "5022"))
     API_SECRET_KEY: str = _optional("API_SECRET_KEY", "")
+    # Previous signing key, accepted for VERIFICATION only during a rotation
+    # window (new tokens are always signed with API_SECRET_KEY). To rotate: move
+    # the current key here, put a fresh key in API_SECRET_KEY, restart; existing
+    # sessions keep working and re-mint under the new key as they relink. Clear
+    # this after 30 days (TOKEN_LIFETIME) — past that no valid token can still
+    # carry the old signature anyway.
+    API_SECRET_KEY_PREVIOUS: str = _optional("API_SECRET_KEY_PREVIOUS", "")
 
     # Interactive API docs (Swagger UI + OpenAPI schema). Off by default: the docs
     # enumerate every endpoint for an attacker and the KSP client never needs them.
@@ -138,6 +145,13 @@ if cfg.KSP_API_ENABLED and cfg.API_SECRET_KEY.strip() in _DEFAULT_API_SECRETS:
         "    python -c \"import secrets; print(secrets.token_urlsafe(48))\"\n"
         "Or disable the KSP API with KSP_API_ENABLED=false."
     )
+
+# The previous key only exists to widen the VERIFY accept list during rotation.
+# A placeholder value would widen it to a publicly known key (token forgery), and
+# a copy of the current key adds nothing — blank both out rather than serve them.
+if (cfg.API_SECRET_KEY_PREVIOUS.strip() in _DEFAULT_API_SECRETS
+        or cfg.API_SECRET_KEY_PREVIOUS == cfg.API_SECRET_KEY):
+    cfg.API_SECRET_KEY_PREVIOUS = ""
 
 # Configure root logger once here so every module inherits it
 logging.basicConfig(
