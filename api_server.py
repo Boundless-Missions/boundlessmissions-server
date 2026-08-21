@@ -2210,6 +2210,60 @@ async def more_time_response_from_ksp(contract_id: str, req: ContractRequestResp
     return ContractAcceptResponse(success=r.ok, message=r.message)
 
 
+@app.post("/api/v1/contracts/{contract_id}/reimport_submission", response_model=ContractAcceptResponse)
+async def reimport_submission(contract_id: str, user: dict = Depends(get_current_user)):
+    """Give the contractor back the craft they submitted, from the server's own copy.
+
+    The hole this fills: land at the target, submit, hit KSP's Recover button — the
+    craft (and its crew) leave the save through stock recovery. If the issuer then
+    refuses and the dispute ends in more time, the contract is active again but the
+    delivery craft no longer exists to re-fly. The submission already uploaded the
+    full vessel node (it is how an approval delivers the craft to the issuer), so
+    restoring is just queueing that same node back to its *builder* as a live-vessel
+    import — the exact mechanism _restore_issuer_vessel already uses for the issuer's
+    wreck on a failed rescue.
+
+    Client-initiated rather than automatic on the more-time approval, because only
+    the client knows whether the craft is actually gone — most contractors still have
+    it, and spawning a duplicate would be worse than the gap. Idempotent: the import
+    queue de-dupes on (source, ref_id), so a second press while one is pending
+    returns the queued entry rather than a second craft.
+    """
+    gid = int(user["guild_id"])
+    uid = int(user["user_id"])
+
+    c = cdb.get_contract(gid, contract_id)
+    if not c:
+        return ContractAcceptResponse(success=False, message="Contract not found.")
+    if c.get("contractor_id") != str(uid):
+        return ContractAcceptResponse(success=False, message="Not your contract.")
+    if c.get("mission_type") != cdb.RESCUE:
+        return ContractAcceptResponse(
+            success=False, message="Only a rescue delivery has a stored craft to restore.")
+    # Active (a dispute granted more time) or still disputed. Never completed — the
+    # craft belongs to the issuer then — and never pending/submitted, where the local
+    # copy is still the player's to keep or the review hasn't happened yet.
+    if c.get("status") not in (cdb.ACTIVE, cdb.DISPUTED):
+        return ContractAcceptResponse(
+            success=False, message="This contract isn't in a state where the craft can be restored.")
+    url = c.get("delivered_vessel_node_url")
+    if not url:
+        return ContractAcceptResponse(
+            success=False, message="No submitted craft is stored for this contract.")
+
+    craft_name = (c.get("vessel_data") or {}).get("vessel_name") or "Submitted craft"
+    # owner_name is the contractor themselves: on import their own crew's names come
+    # back untagged while the rescued kerbals keep the issuer's tag — exactly the
+    # state the save was in before the recovery.
+    imp.enqueue(gid, uid, "submission_restore", contract_id, craft_name,
+                vessel_node_url=url, owner_name=user["username"])
+    log.info("Rescue %s: queued submitted-craft restore for contractor %d", contract_id, uid)
+    return ContractAcceptResponse(
+        success=True,
+        message="Craft restore queued — it spawns where it was when you submitted, "
+                "on your next Space Center visit.")
+
+
 @app.post("/api/v1/contracts/{contract_id}/cancel", response_model=ContractAcceptResponse)
 async def cancel_contract(contract_id: str, user: dict = Depends(get_current_user)):
     """Withdraw (issuer) or decline (contractor) a contract that has not finished.
