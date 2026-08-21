@@ -64,6 +64,7 @@ from data import policy as policy
 from data import suspensions
 from data import suspicion as susp
 from data import telemetry_check as tcheck
+from data import cheat_check
 from data import mission_constraints as mc
 from data import orbit_constraints as oc
 from data import part_resolver as pr
@@ -2966,6 +2967,9 @@ async def submit_contract(
     life_support: Optional[str] = Form(None),
     ls_endurance_days: float = Form(0.0),
     ls_crew_capacity: int = Form(0),
+    # Client-side cheat watchdog's verdict on the submitted vessels (JSON; see
+    # data/cheat_check.py). Absent on older clients — which must not be rejected.
+    cheat_report: Optional[str] = Form(None),
     user: dict = Depends(get_current_user),
 ):
     """
@@ -3031,6 +3035,22 @@ async def submit_contract(
                     success=False,
                     message=f"Craft uses parts outside this contract's allowed mods: {', '.join(illegal)}.",
                 )
+
+    # Cheat disqualification — the mod's in-flight watchdog taints vessels moved
+    # by HyperEdit / VesselMover / F12 Set Position-Set Orbit or flown with F12
+    # cheat toggles on, and reports it here. Only the client can know: a
+    # teleported vessel really is at the target, so its telemetry passes every
+    # consistency check below. Env-gated (KSP_CHEAT_DISQUALIFY_ENABLED, default
+    # on); a missing report (older client) is treated as clean, and a cheat tool
+    # merely being installed never disqualifies. Deliberately NOT flag_suspicion'd:
+    # this is an honest self-report of in-game cheating, not an attempt to deceive
+    # the server.
+    cheat_verdict = cheat_check.evaluate(
+        cheat_report, enabled=cfg.KSP_CHEAT_DISQUALIFY_ENABLED)
+    if cheat_verdict.reject:
+        log.info("Submission rejected for contract %s: cheats detected — %s",
+                 contract_id, cheat_verdict.detail)
+        return SubmissionResult(success=False, message=cheat_verdict.reject_message)
 
     # Server-side part-limit ("mission limit") check — authoritative re-check of
     # the constraints the editor/submit gate already enforce client-side. Skipped

@@ -106,6 +106,16 @@ class Config:
     # version has been published yet, the gate never blocks regardless of this flag.
     KSP_VERSION_CHECK_ENABLED: bool = _optional("KSP_VERSION_CHECK_ENABLED", "true").lower() not in ("false", "0", "no", "off")
 
+    # Cheat disqualification for contract submissions. When on, a submission whose
+    # client-side cheat report marks the vessel as moved by HyperEdit / VesselMover /
+    # the F12 cheat menu's Set Position-Set Orbit, or flown with F12 cheat toggles
+    # enabled, is refused with the reasons shown to the player (see
+    # data/cheat_check.py). A cheat tool merely being installed never disqualifies,
+    # and older clients that send no report are never rejected. Default on; set
+    # KSP_CHEAT_DISQUALIFY_ENABLED=false to accept such submissions (they still
+    # face the issuer's / AI review).
+    KSP_CHEAT_DISQUALIFY_ENABLED: bool = _optional("KSP_CHEAT_DISQUALIFY_ENABLED", "true").lower() not in ("false", "0", "no", "off")
+
     # IPs of trusted reverse proxies (comma-separated, e.g. "127.0.0.1"). When a
     # request's direct peer is one of these, the real client IP is read from
     # X-Forwarded-For for rate limiting. Leave empty when clients connect the API
