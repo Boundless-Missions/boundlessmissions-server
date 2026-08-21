@@ -75,6 +75,7 @@ def enqueue(
     blueprint_url: str | None = None,
     sender_id: int | None = None,
     status: str = "queued",
+    vessel_pid: str | None = None,
 ) -> ImportEntry:
     """Queue a craft for the player's KSP client to auto-import.
 
@@ -91,6 +92,13 @@ def enqueue(
     auto-import poll until accepted). Offers carry the sender's `sender_id` so a
     decline can notify them, and a `blueprint_url` preview when the sender's
     client managed to render one.
+
+    `vessel_pid` (gift_vessel only) is the vessel's pid in the SENDER's save. A
+    quicksent live vessel is a hand-over — the sender's client removes it on
+    send — so the pid rides both the offer (the accept notification echoes it,
+    letting the sender's client re-queue a removal a quickload rolled back) and
+    the decline-return entry (the sender's client uses it to cancel a removal
+    that hasn't run yet instead of spawning a duplicate).
     """
     for doc in _col(guild_id, user_id).stream():
         d = doc.to_dict()
@@ -112,6 +120,7 @@ def enqueue(
         "blueprint_url": blueprint_url,
         "sender_id": sender_id,
         "status": status,
+        "vessel_pid": vessel_pid,
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
     _col(guild_id, user_id).document(iid).set(entry)

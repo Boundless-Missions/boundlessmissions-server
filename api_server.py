@@ -3784,7 +3784,14 @@ async def craft_import_done(import_id: str, user: dict = Depends(get_current_use
     """Ack a completed import — removes it from the player's queue."""
     gid = int(user["guild_id"])
     uid = int(user["user_id"])
+    entry = imp.get(gid, uid, import_id)
     deleted = imp.delete(gid, uid, import_id)
+    # A gift's Storage files serve exactly one download — the accepted import, or
+    # the decline-return to the sender. Once that import is acked nothing will
+    # ever fetch them again, so clean them up here rather than leaking a payload
+    # per quicksend forever.
+    if deleted and entry and entry.get("source") in ("gift_craft", "gift_vessel"):
+        await asyncio.to_thread(imp.delete_gift_files, entry["ref_id"])
     return {"success": deleted}
 
 
@@ -3822,6 +3829,23 @@ async def craft_gift_accept(import_id: str, user: dict = Depends(get_current_use
     imp.set_status(gid, uid, import_id, "queued")
     entry["status"] = "queued"
     entry["dedup_key"] = f"{entry.get('source')}:{entry['ref_id']}"
+
+    # Tell the sender. For a live vessel the notification also carries the pid the
+    # sender's client reported at send time: the vessel left their save then, but a
+    # quickload can roll the removal back while the offer lives on — the client
+    # re-queues the removal off this echo, so the accepted hand-over cannot leave a
+    # copy behind.
+    sender_id = entry.get("sender_id")
+    if sender_id:
+        _create_notification(
+            gid, int(sender_id), "craft_gift_accepted",
+            "🎁 Craft Accepted",
+            f"{user['username']} accepted the craft you sent: "
+            f"{entry.get('craft_name') or 'Craft'}.",
+            {"craft_name": entry.get("craft_name") or "",
+             "vessel_pid": entry.get("vessel_pid") or ""},
+        )
+
     # The client imports on the spot from this entry, so sign its file references now.
     signed_entry = _sign_import_entry(entry)
     signed_entry["dedup_key"] = entry["dedup_key"]
@@ -3830,7 +3854,15 @@ async def craft_gift_accept(import_id: str, user: dict = Depends(get_current_use
 
 @app.post("/api/v1/craft/gifts/{import_id}/reject")
 async def craft_gift_reject(import_id: str, user: dict = Depends(get_current_user)):
-    """Decline an offered gift: the entry and its files go away, the sender hears."""
+    """Decline an offered gift, and the sender hears.
+
+    A blueprint (gift_craft) was only ever a copy — the entry and its files go
+    away. A live vessel (gift_vessel) left the sender's save at send time, so
+    declining it must give it BACK: the same stored vessel node is re-queued to
+    the sender as a normal auto-import (no accept step — it is their own ship
+    coming home), and the files stay for that one download; the sender's ack of
+    the return import cleans them up (see craft_import_done).
+    """
     gid = int(user["guild_id"])
     uid = int(user["user_id"])
     entry = imp.get(gid, uid, import_id)
@@ -3838,15 +3870,31 @@ async def craft_gift_reject(import_id: str, user: dict = Depends(get_current_use
         return {"success": False, "message": "That offer is no longer there."}
 
     imp.delete(gid, uid, import_id)
-    await asyncio.to_thread(imp.delete_gift_files, entry["ref_id"])
 
     sender_id = entry.get("sender_id")
+    # vessel_pid doubles as the marker that the sender's client removed the
+    # vessel at send time (older clients sent a copy and kept theirs) — without
+    # it a "return" would hand the sender a duplicate of a ship they never lost.
+    returning = (entry.get("source") == "gift_vessel" and sender_id
+                 and entry.get("vessel_pid"))
+    if returning:
+        imp.enqueue(
+            gid, int(sender_id), source="gift_vessel", ref_id=entry["ref_id"],
+            craft_name=entry.get("craft_name") or "Craft",
+            vessel_node_url=entry.get("vessel_node_url"),
+            owner_name=entry.get("owner_name"),
+            vessel_pid=entry.get("vessel_pid"),
+        )
+    else:
+        await asyncio.to_thread(imp.delete_gift_files, entry["ref_id"])
+
     if sender_id:
         _create_notification(
             gid, int(sender_id), "craft_gift_declined",
             "📪 Craft Declined",
             f"{user['username']} declined the craft you sent: "
-            f"{entry.get('craft_name') or 'Craft'}.",
+            f"{entry.get('craft_name') or 'Craft'}."
+            + (" It is being returned to your save." if returning else ""),
             {"craft_name": entry.get("craft_name") or ""},
         )
     return {"success": True, "message": "Declined."}
@@ -3859,6 +3907,7 @@ async def craft_send_to_friend(
     recipient_id: str = Form(...),
     kind: str = Form("craft"),
     craft_name: str = Form("Craft"),
+    vessel_pid: str = Form(None),
     user: dict = Depends(get_current_user),
 ):
     """Quicksend a craft/vessel from the KSP mod's Tools tab to another player.
@@ -3868,8 +3917,12 @@ async def craft_send_to_friend(
     entry is created as an OFFER (status "offered"): the recipient's client shows
     it — with the rendered `blueprint` preview when the sender's client managed
     one — and only an explicit accept moves it into the auto-import queue; a
-    decline deletes it and tells the sender. The payload arrives gzip-compressed
-    (like submissions/listings); we store it decompressed.
+    decline deletes a blueprint but RETURNS a live vessel to the sender's import
+    queue, because a live vessel is a hand-over: the sender's client removes it
+    from their save once this endpoint confirms, and `vessel_pid` (its pid in the
+    sender's save) is what lets their client cancel or re-assert that removal
+    when the decision comes back. The payload arrives gzip-compressed (like
+    submissions/listings); we store it decompressed.
     """
     import gzip
     from cogs.corps import _get_corp
@@ -3936,6 +3989,7 @@ async def craft_send_to_friend(
             gid, rid, source="gift_vessel", ref_id=iid, craft_name=craft_name,
             vessel_node_url=url, owner_name=user["username"],
             blueprint_url=bp_url, sender_id=uid, status="offered",
+            vessel_pid=(vessel_pid or "").strip() or None,
         )
         kind_label = "a live vessel"
     else:
@@ -3956,7 +4010,16 @@ async def craft_send_to_friend(
     )
 
     log.info("KSP: %s quicksent %s '%s' to %d", user["username"], kind, craft_name, rid)
-    return {"success": True, "message": f"Sent to {recipient_name}!"}
+    # vessel_returnable tells the client this server stored the pid and will
+    # return the vessel on a decline — the client only removes it from the
+    # sender's save on that promise. An older server never says it, and the
+    # client falls back to the old send-a-copy behavior rather than deleting a
+    # ship nothing would ever give back.
+    return {
+        "success": True,
+        "message": f"Sent to {recipient_name}!",
+        "vessel_returnable": kind == "vessel" and bool((vessel_pid or "").strip()),
+    }
 
 
 # ── Marketplace ────────────────────────────────────────────────────────────────
