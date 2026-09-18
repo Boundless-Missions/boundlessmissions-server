@@ -10766,6 +10766,12 @@ async def mp_block_action(body: MpBlockBody, user: dict = Depends(get_current_us
     if not ok:
         raise HTTPException(status_code=400, detail=msg)
 
+    if action in ("block", "unblock"):
+        # The requester's own view just changed — drop their cached resolves so a
+        # new block hides the target on the next overlay refresh rather than after
+        # the cache TTL (design §6.4). The reverse direction relaxes on its own.
+        mp_profiles.clear_requester(account_id)
+
     if action == "block":
         try:
             await asyncio.to_thread(friends_db.remove_friend, account_id, target)

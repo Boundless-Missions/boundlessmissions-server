@@ -26,6 +26,7 @@ Two invariants this module holds:
 """
 
 import logging
+import time
 
 from data import accounts
 from data import friends as friends_db
@@ -34,6 +35,77 @@ from data import mp_visibility
 from data.store import sign_stored, SIGNED_URL_MAX_TTL
 
 log = logging.getLogger(__name__)
+
+
+# ── The resolve cache (design §6.4) ──────────────────────────────────────────
+#
+# The overlay resolves the visible owner set on a slow cadence, and a name or
+# avatar changes rarely, so a short per-(requester, handle) cache turns a screen
+# full of the same neighbours into almost no Firestore work — which is what keeps
+# this off the cost_guard bill. 120 s sits in the design's 60–300 s band.
+#
+# **Only a positive profile is cached, never a `None`.** A `None` means one of:
+# unknown handle, a block or hidden tier, a non-friend, or a *fail-closed* read
+# error — and the last must not be frozen in as "invisible" for two minutes after
+# Firestore recovers. Re-resolving the negatives every call is also the safer
+# direction for a block that has just been placed: the moment a subject flips to
+# blocked/hidden it resolves to `None`, and `None` is never what we serve from
+# cache. A positive that a *reverse-direction* block should now hide can still be
+# served for up to the TTL; the design accepts that cadence, and `clear_requester`
+# collapses it to zero for the side that placed the block.
+PROFILE_CACHE_TTL = 120.0          # seconds
+_CACHE_MAX = 20000                 # hard ceiling across all requesters
+_cache: dict = {}                  # (requester, handle) -> (expiry_monotonic, profile)
+
+
+def _now() -> float:
+    return time.monotonic()
+
+
+def clear_requester(requester_id) -> None:
+    """Drop everything this requester has cached.
+
+    Called when the requester changes what *they* are allowed to see — placing or
+    lifting a block — so the change takes effect for them at once rather than
+    after the TTL. It cannot clear the *reverse* direction (how others see the
+    requester); that relaxes on its own within the TTL, which the design permits.
+    """
+    r = str(requester_id)
+    for key in [k for k in _cache if k[0] == r]:
+        _cache.pop(key, None)
+
+
+def clear_cache() -> None:
+    """Empty the whole cache (tests, and any global privacy reset)."""
+    _cache.clear()
+
+
+def _cache_get(requester, handle, now):
+    hit = _cache.get((requester, handle))
+    if hit is None:
+        return False, None
+    expiry, profile = hit
+    if expiry <= now:
+        _cache.pop((requester, handle), None)
+        return False, None
+    return True, profile
+
+
+def _cache_put(requester, handle, profile, now) -> None:
+    # Only positives are ever stored (see the module note above).
+    if profile is None:
+        return
+    if len(_cache) >= _CACHE_MAX:
+        # Reclaim expired entries first; if that is not enough, shed the tranche
+        # closest to expiry so a burst of distinct requesters cannot grow the map
+        # without bound. Bounded work, and the cache is an optimisation — a
+        # dropped entry only costs one re-resolve.
+        for k in [k for k, (exp, _) in list(_cache.items()) if exp <= now]:
+            _cache.pop(k, None)
+        if len(_cache) >= _CACHE_MAX:
+            for k in sorted(_cache, key=lambda k: _cache[k][0])[:max(1, _CACHE_MAX // 10)]:
+                _cache.pop(k, None)
+    _cache[(requester, handle)] = (now + PROFILE_CACHE_TTL, profile)
 
 
 def _display(acct: dict) -> str:
@@ -107,14 +179,35 @@ def profile_one(aid, handle, requester, requester_blocked,
     }
 
 
-def resolve(requester_id, handles) -> dict:
+def resolve(requester_id, handles, *, use_cache=True, now=None) -> dict:
     """Resolve a batch of handles for one requester -> {handle: profile | None}.
 
-    Reads the requester-side sets (blocks, friends) once for the whole batch, then
+    Serves cached positive profiles first (design §6.4), then reads the
+    requester-side sets (blocks, friends) **once** for whatever remains and
     resolves each distinct account once. All Firestore work is synchronous; the
-    caller runs this in a worker thread.
+    caller runs this in a worker thread. On a full cache hit no Firestore read
+    happens at all — not even the requester's own sets.
+
+    `use_cache=False` and `now=` are for the tests; production passes neither.
     """
     requester = str(requester_id)
+    ts = now if now is not None else _now()
+
+    out: dict = {}
+    misses: list = []   # distinct handles needing a live resolve, first-seen order
+    for raw in (handles or []):
+        h = str(raw or "").strip()
+        if not h or h in out or h in misses:
+            continue
+        if use_cache:
+            ok, profile = _cache_get(requester, h, ts)
+            if ok:
+                out[h] = profile
+                continue
+        misses.append(h)
+
+    if not misses:
+        return out
 
     try:
         requester_blocked = blocks_db.blocked_ids(requester)
@@ -131,22 +224,20 @@ def resolve(requester_id, handles) -> dict:
         friend_set = outgoing = incoming = set()
         friends_ok = False   # friends-tier subjects fail closed
 
-    out: dict = {}
     by_account: dict = {}
-    for raw in (handles or []):
-        h = str(raw or "").strip()
-        if not h or h in out:
-            continue
+    for h in misses:
         aid = accounts.account_for_username(h)
         if not aid:
-            out[h] = None
-            continue
+            out[h] = None                       # not cached: an unclaimed handle
+            continue                            # may be claimed within the TTL
         aid = str(aid)
         if aid in by_account:
-            out[h] = by_account[aid]
-            continue
-        result = profile_one(aid, h, requester, requester_blocked,
-                             friend_set, outgoing, incoming, friends_ok)
-        by_account[aid] = result
+            result = by_account[aid]
+        else:
+            result = profile_one(aid, h, requester, requester_blocked,
+                                 friend_set, outgoing, incoming, friends_ok)
+            by_account[aid] = result
         out[h] = result
+        if use_cache:
+            _cache_put(requester, h, result, ts)   # a no-op when result is None
     return out
