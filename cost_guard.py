@@ -700,7 +700,7 @@ class _CostGuard:
             # re-introducing the very thing the `max()` above exists to prevent, in
             # the one direction (under-reporting) that a brake must never fail in.
             if "stored_bytes" not in getattr(snap, "present", ()):
-                log.debug("cost_guard: no storage reading in this poll — keeping the "
+                log.debug("cost_guard: no storage reading in this poll, keeping the "
                           "at-rest estimate at %d", self._stored_bytes)
             elif self._stored_bytes > self._auth_stored_bytes:
                 log.debug("cost_guard: clamping the at-rest estimate %d -> %d "

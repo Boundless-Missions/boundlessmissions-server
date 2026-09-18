@@ -26,6 +26,7 @@ from discord.ext import commands
 from discord.ui import View, Button, DynamicItem, Select, Modal, TextInput
 
 import settings
+from config import cfg
 from cogs import perms
 from data.store import _db
 from data import tickets as tdb
@@ -118,7 +119,7 @@ async def _alert_category_full(client, guild, category, kind: str, *,
         title = "⚠️ Ticket intake is rate limited"
         body = (f"**{guild.name}** has opened {TICKET_GUILD_PER_HOUR} tickets in the "
                 f"last hour, which is the per-guild ceiling. Every ticket path in "
-                f"that server is refused until the hour rolls — reports, bug reports "
+                f"that server is refused until the hour rolls, reports, bug reports "
                 f"and the anti-cheat flag included; a `{kind}` ticket was just turned "
                 f"away.\n\nThis clears by itself. If it keeps happening, somebody is "
                 f"probably driving it: check who has been opening tickets.")
@@ -126,7 +127,7 @@ async def _alert_category_full(client, guild, category, kind: str, *,
         title = "⚠️ Ticket system is full"
         body = (f"The ticket category **{getattr(category, 'name', '?')}** in "
                 f"**{guild.name}** is full ({len(getattr(category, 'channels', ()))} "
-                f"channels). Every ticket path in that server is now refused — reports, "
+                f"channels). Every ticket path in that server is now refused: reports, "
                 f"bug reports and the anti-cheat flag included; a `{kind}` ticket was "
                 f"just turned away.\n\nClose some tickets to bring intake back.")
 
@@ -359,7 +360,7 @@ async def create_ticket(
 
     limit = TICKET_CATEGORY_SOFT_MAX if reserve_capacity else TICKET_CATEGORY_BULK_MAX
     if len(getattr(category, "channels", ())) >= limit:
-        log.error("Ticket category %r in guild %s is full (%d channels) — refusing to "
+        log.error("Ticket category %r in guild %s is full (%d channels), refusing to "
                   "open a %s ticket. Close some tickets to restore the ticket system.",
                   getattr(category, "name", "?"), guild.id,
                   len(category.channels), kind)
@@ -802,6 +803,14 @@ class Tickets(commands.Cog, name="Tickets"):
         if self._panel_ensured:
             return
         self._panel_ensured = True
+        # ... unless this instance does not own the panel. `_find_existing_panel`
+        # only recognises a panel THIS bot user posted, so a dev bot sharing the
+        # guild cannot see the live one and would post a duplicate under it — whose
+        # button it would then serve, taking real tickets into the test bot.
+        if not cfg.TICKET_PANEL_ENABLED:
+            log.info("Ticket panel auto-post is off (TICKET_PANEL_ENABLED=false); "
+                     "leaving the existing panel alone.")
+            return
         for guild in self.bot.guilds:
             channel = self._resolve_panel_channel(guild)
             if channel is None:
@@ -827,6 +836,18 @@ class Tickets(commands.Cog, name="Tickets"):
 
         The `check` is the real gate: `default_permissions` is only what Discord
         shows by default, and a server admin can hand the command to any role."""
+        # Gated by the same switch as the auto-post, and refused out loud rather than
+        # quietly ignored. An admin running this on a bot that shares the guild with
+        # the live one would stamp a second panel over the real one by hand, which is
+        # the exact thing the switch exists to prevent — and a command that appears to
+        # do nothing is worse than one that says why.
+        if not cfg.TICKET_PANEL_ENABLED:
+            await interaction.response.send_message(
+                "❌ This bot instance does not own the ticket panel "
+                "(`TICKET_PANEL_ENABLED=false`). Posting one here would sit under the "
+                "live bot's panel and take its tickets. Run this on the live bot "
+                "instead.", ephemeral=True)
+            return
         ch_id = guild_config.get_channel_id(interaction.guild_id, "ticket_panel")
         if not ch_id:
             await interaction.response.send_message(

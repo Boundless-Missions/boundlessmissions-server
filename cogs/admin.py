@@ -714,10 +714,10 @@ class Admin(commands.Cog, name="Admin"):
                 f"**SHA256:** `{digest}`\n"
                 f"**Download:** {download_url}\n"
                 f"**Latest now:** `{rec.get('latest_version')}`\n"
-                + ("**Mandatory:** yes — builds below this one stop working "
+                + ("**Mandatory:** yes. Builds below this one stop working "
                    f"{grace_days} days after they were superseded."
                    if rec.get("versions", {}).get(version.strip(), {}).get("mandatory") else
-                   "**Mandatory:** no — older builds keep working, with an update notice.")
+                   "**Mandatory:** no. Older builds keep working, with an update notice.")
                 + ("\n📡 Live clients poked to re-check." if broadcast else "")
                 + ("\n🛡️ Attestation enabled (pristine DLL stored)."
                    if rec.get("versions", {}).get(version.strip(), {}).get("has_dll") else

@@ -45,3 +45,6 @@ Thumbs.db
 *.db
 *.sqlite
 *.sqlite3
+
+# Agent guidance for the GK-DW workspace, filter-out for possible private information
+/CLAUDE.md

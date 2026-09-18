@@ -526,7 +526,7 @@ class UserStore:
         if self._load_attempted and not self._loaded:
             raise WalletUnavailable(
                 "The wallet is not loaded, so this change cannot be saved. "
-                + ("The Firebase cost guard is FROZEN — raise the budget or clear "
+                + ("The Firebase cost guard is FROZEN. Raise the budget or clear "
                    "the freeze, and the wallet reloads by itself."
                    if self._budget_blocked else
                    "The boot read did not complete.")
@@ -554,7 +554,7 @@ class UserStore:
                 return False          # still frozen; nothing to retry yet
         except Exception:             # pragma: no cover - guard import/attr issues
             return False
-        log.info("Cost guard is no longer FROZEN — re-reading the wallet.")
+        log.info("Cost guard is no longer FROZEN. Re-reading the wallet.")
         await self.load()
         if self._loaded:
             log.info("Wallet reloaded after the budget freeze cleared; writes are live again.")

@@ -116,8 +116,22 @@ def _digit_code(n: int = 6) -> str:
 # revocation takes effect immediately within the running bot (and within the TTL
 # for the read-through path).
 
+# TWO counters, not one. `token_version` means "log out EVERYWHERE" and every token
+# checks it. `web_token_version` is the website's own sign-out: only an AUD_WEB token
+# checks it, so signing out of a browser leaves the player's KSP installs linked.
+#
+# The split exists because the site's ordinary "Log out" used to bump the single
+# global counter, so a browser sign-out 401'd every KSP client the account had. Each
+# install only discovered that at its next launch, which made one sign-out read as
+# the mod unlinking itself at random for days afterwards. Signing out of a browser is
+# not a statement about the game and is now scoped like one; "log out everywhere" is
+# still offered on both surfaces and still bumps the global counter.
 _TOKEN_VERSION_TTL = 30  # seconds
-_token_versions: dict[str, tuple[int, float]] = {}  # user_id -> (version, fetched_at)
+# user_id -> (version, web_version, fetched_at). Both counters live in the same
+# session document and are read and cached together: this sits on the auth dependency
+# of every authenticated route, so fetching them separately would double the busiest
+# read in the system.
+_token_versions: dict[str, tuple[int, int, float]] = {}
 
 
 class TokenVersionUnavailable(Exception):
@@ -132,16 +146,18 @@ class TokenVersionUnavailable(Exception):
     """
 
 
-def _get_token_version(user_id: str) -> int:
-    """Current token-revocation version for a user (0 if never revoked).
+def _get_versions(user_id: str) -> tuple[int, int]:
+    """`(token_version, web_token_version)` for a user — `(0, 0)` if never revoked.
+
+    One Firestore read for both, cached together; see the note on `_token_versions`.
 
     Raises `TokenVersionUnavailable` when the read fails and there is nothing
     cached to fall back on — see the class docstring for why that is not 0.
     """
     cached = _token_versions.get(user_id)
     now = time.time()
-    if cached is not None and now - cached[1] < _TOKEN_VERSION_TTL:
-        return cached[0]
+    if cached is not None and now - cached[2] < _TOKEN_VERSION_TTL:
+        return cached[0], cached[1]
 
     try:
         # Unguarded on purpose — see `_sessions_col_unguarded`. Metered by hand so
@@ -152,7 +168,9 @@ def _get_token_version(user_id: str) -> int:
             _cost_guard.note_firestore(reads=1)
         except Exception:                       # metering must never fail a login
             pass
-        version = int(snap.to_dict().get("token_version", 0) or 0) if snap.exists else 0
+        data = (snap.to_dict() or {}) if snap.exists else {}
+        version = int(data.get("token_version", 0) or 0)
+        web_version = int(data.get("web_token_version", 0) or 0)
     except Exception as exc:
         log.warning("Could not read token version for %s: %s", user_id, exc)
         # Read failed: return the last known value (a revocation already cached still
@@ -167,10 +185,20 @@ def _get_token_version(user_id: str) -> int:
         # instead, and let the caller make it a retry.
         if cached is None:
             raise TokenVersionUnavailable(str(user_id))
-        return cached[0]
+        return cached[0], cached[1]
 
-    _token_versions[user_id] = (version, now)
-    return version
+    _token_versions[user_id] = (version, web_version, now)
+    return version, web_version
+
+
+def _get_token_version(user_id: str) -> int:
+    """The global revocation version — the one EVERY token is checked against."""
+    return _get_versions(user_id)[0]
+
+
+def _get_web_token_version(user_id: str) -> int:
+    """The website-only revocation version — checked by AUD_WEB tokens alone."""
+    return _get_versions(user_id)[1]
 
 
 # ── Link Codes ───────────────────────────────────────────────────────────────
@@ -791,14 +819,21 @@ def purge_ksp_user_data(user_id: str) -> None:
     # unlinked on its next request) — while dropping username/guild/devices.
     try:
         snap = _sessions_col().document(uid).get()
-        cur = int(snap.to_dict().get("token_version", 0) or 0) if snap.exists else 0
+        data = (snap.to_dict() or {}) if snap.exists else {}
+        cur = int(data.get("token_version", 0) or 0)
         new_version = cur + 1
+        # The web counter is carried across the tombstone rather than dropped. The
+        # global bump already retires every web token, so this changes no decision —
+        # but a counter that silently restarts at 0 is the one shape this whole
+        # mechanism cannot afford, and `set()` with no merge would restart it.
+        new_web = int(data.get("web_token_version", 0) or 0)
         _sessions_col().document(uid).set({   # no merge → strips all other fields
             "token_version": new_version,
+            "web_token_version": new_web,
             "active": False,
             "deleted_at": datetime.now(timezone.utc).isoformat(),
         })
-        _token_versions[uid] = (new_version, time.time())
+        _token_versions[uid] = (new_version, new_web, time.time())
     except Exception as exc:
         log.warning("purge: could not reset session for %s: %s", uid, exc)
 
@@ -872,11 +907,12 @@ def _verify_token(token: str, secret: str) -> dict | None:
 
 
 def build_session_payload(guild_id: str, user_id: str, username: str, secret: str,
-                          version: int, aud: str = AUD_KSP, now: float | None = None) -> dict:
+                          version: int, aud: str = AUD_KSP, now: float | None = None,
+                          web_version: int = 0) -> dict:
     """The claims a session token carries. Pure, so it can be tested without
     Firestore; `create_session_token` is the only production caller."""
     now = time.time() if now is None else now
-    return {
+    payload = {
         "gid": guild_id,
         "uid": user_id,
         "usr": username,
@@ -886,6 +922,11 @@ def build_session_payload(guild_id: str, user_id: str, username: str, secret: st
         "aud": aud,
         "kid": key_id(secret),  # which key minted this — observability only
     }
+    # Only a web token carries `wtv`, because only a web token is ever checked
+    # against the web counter. A KSP payload stays exactly what it was.
+    if aud == AUD_WEB:
+        payload["wtv"] = web_version
+    return payload
 
 
 def create_session_token(guild_id: str, user_id: str, username: str, secret: str,
@@ -897,8 +938,9 @@ def create_session_token(guild_id: str, user_id: str, username: str, secret: str
     # Mint the token at the user's current version. A fresh login does NOT bump
     # the version — only logout_all_devices does — so logging in on a new device
     # never invalidates the user's other devices.
-    version = _get_token_version(user_id)
-    payload = build_session_payload(guild_id, user_id, username, secret, version, aud)
+    version, web_version = _get_versions(user_id)
+    payload = build_session_payload(guild_id, user_id, username, secret, version, aud,
+                                    web_version=web_version)
     token = _sign_token(payload, secret)
 
     # Store session reference in Firestore. merge=True preserves token_version if
@@ -958,7 +1000,16 @@ def verify_session_token(token: str, secret: "str | list[str] | tuple") -> dict 
     # tell whether this token was revoked, which is neither "valid" (None would be
     # wrong) nor "invalid" (the client would clear a good session on the 401). The
     # dependency turns it into a 503 the client retries.
-    if int(payload.get("tv", 0)) < _get_token_version(payload["uid"]):
+    version, web_version = _get_versions(payload["uid"])
+    if int(payload.get("tv", 0)) < version:
+        return None
+
+    # A website token is additionally checked against the web-only counter, which the
+    # site's own "Log out" bumps. A KSP token never looks at it — that is the whole
+    # point of the split (see the note above `_TOKEN_VERSION_TTL`). A web token minted
+    # before this field existed carries no `wtv` and so reads as 0, which the first web
+    # sign-out after the upgrade retires — exactly what a sign-out is for.
+    if payload.get("aud") == AUD_WEB and int(payload.get("wtv", 0)) < web_version:
         return None
 
     return {
@@ -981,9 +1032,9 @@ def logout_all_devices(user_id: str) -> int:
     """
     doc = _sessions_col().document(user_id)
     snap = doc.get()
-    current = 0
-    if snap.exists:
-        current = int(snap.to_dict().get("token_version", 0) or 0)
+    data = (snap.to_dict() or {}) if snap.exists else {}
+    current = int(data.get("token_version", 0) or 0)
+    web_current = int(data.get("web_token_version", 0) or 0)
     new_version = current + 1
 
     doc.set({
@@ -991,11 +1042,44 @@ def logout_all_devices(user_id: str) -> int:
         "active": False,
         "logged_out_all_at": datetime.now(timezone.utc).isoformat(),
     }, merge=True)
-    # Update the in-process cache so revocation is effective immediately.
-    _token_versions[user_id] = (new_version, time.time())
+    # Update the in-process cache so revocation is effective immediately. The web
+    # counter is carried through unchanged: bumping the global one already retires
+    # every web token, and moving both would make the two counters meaningless as a
+    # record of which surface asked for what.
+    _token_versions[user_id] = (new_version, web_current, time.time())
 
     log.info("User %s logged out of all devices (token version → %d)", user_id, new_version)
     return new_version
+
+
+def logout_web_devices(user_id: str) -> int:
+    """Sign the user out of the WEBSITE only, leaving KSP clients linked.
+
+    Bumps the web counter, so every AUD_WEB token — this browser and any other —
+    fails its next call, while the account's KSP `session.token`s are untouched and
+    the game keeps playing. This is what the site's ordinary "Log out" calls.
+
+    Returns the new web token version. Like `logout_all_devices` this is the user's
+    own control, not an admin action.
+    """
+    doc = _sessions_col().document(user_id)
+    snap = doc.get()
+    data = (snap.to_dict() or {}) if snap.exists else {}
+    current = int(data.get("token_version", 0) or 0)
+    web_current = int(data.get("web_token_version", 0) or 0)
+    new_web = web_current + 1
+
+    # `active` is deliberately NOT touched. It answers "has this account ever linked
+    # and not logged out everywhere" (see `linked_user_ids`), and a browser sign-out
+    # is not an answer to that — the KSP client it describes is still linked.
+    doc.set({
+        "web_token_version": new_web,
+        "logged_out_web_at": datetime.now(timezone.utc).isoformat(),
+    }, merge=True)
+    _token_versions[user_id] = (current, new_web, time.time())
+
+    log.info("User %s signed out of the website (web token version → %d)", user_id, new_web)
+    return new_web
 
 
 def linked_user_ids() -> set:

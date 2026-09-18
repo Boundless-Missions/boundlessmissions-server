@@ -66,7 +66,7 @@ _LEAVE_ENV = "GUILD_GATE_LEAVE_ON_BOOT"
 REFUSAL = (
     "This bot is not available in this server. Boundless Missions runs in its own "
     "Discord, and its economy, contracts and player records are shared across "
-    "every account — so it only accepts commands from servers its owner has "
+    "every account, so it only accepts commands from servers its owner has "
     "approved."
 )
 

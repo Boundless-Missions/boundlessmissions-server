@@ -136,7 +136,7 @@ def global_records_refusal(interaction, tier: str = "mod") -> str | None:
         return None
     guild = getattr(interaction, "guild", None)
     if guild is None:
-        return ("That command has to be run in a server — it writes records shared "
+        return ("That command has to be run in a server. It writes records shared "
                 "across every server, so the authority for it has to come from one.")
     u = real_user(interaction)
     if not isinstance(u, discord.Member):
@@ -154,7 +154,7 @@ def global_records_refusal(interaction, tier: str = "mod") -> str | None:
         return (f"This server has no {label} role mapped, so nobody here can run "
                 f"that command yet. It moves coins, XP and contracts that every "
                 f"server shares, so it is deliberately not granted by a Discord "
-                f"permission — the bot owner maps a role to it with "
+                f"permission, the bot owner maps a role to it with "
                 f"`/admin setrole`.")
     names = ", ".join(f"@{role.name}" for _k, role in mapped if role is not None)
     return (f"That command needs {names} in this server. It moves coins, XP and "
@@ -253,8 +253,8 @@ def moderatable_here(interaction, target) -> str | None:
         return None
     guild = getattr(interaction, "guild", None)
     if guild is None:
-        return ("That command needs to be run in the server you moderate — "
-                "it cannot be used in a DM.")
+        return ("That command needs to be run in the server you moderate. "
+                "It cannot be used in a DM.")
     member = getattr(target, "member", None)
     if member is not None and getattr(member, "guild", None) is not None \
             and member.guild.id == guild.id:
@@ -266,7 +266,7 @@ def moderatable_here(interaction, target) -> str | None:
         return None
     return ("That player is not a member of this server, so this server's "
             "moderator role does not cover them. The wallet, XP and contracts are "
-            "shared across every server the bot is in — ask the bot owner, who can "
+            "shared across every server the bot is in, ask the bot owner, who can "
             "act on any account from the web console.")
 
 

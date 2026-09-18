@@ -197,7 +197,7 @@ class Contracts(commands.Cog, name="Contracts"):
             f"✅ Cancelled **{cancelled}** contract(s) for {tgt.mention}. "
             f"Refunded **{refunded}** {sym}. Cleared **{selections_cleared}** mission selection(s)."
             + (f" Kept **{selections_kept}** whose mission was already finished or "
-               f"predates selection tracking — clearing those would pay the reward twice."
+               f"predates selection tracking. Clearing those would pay the reward twice."
                if selections_kept else ""),
             ephemeral=True,
         )

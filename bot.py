@@ -21,6 +21,7 @@ from discord import app_commands
 from discord.ext import commands
 from config import cfg, insecure_gates
 import guild_gate
+import role_gate
 
 # Parse --sync flag before the bot starts
 _SYNC_COMMANDS = "--sync" in sys.argv
@@ -96,11 +97,16 @@ def _apply_mimic(bot, interaction, *, exclude=()):
 # than adding a third patch of discord.py internals.
 
 
-async def _refuse_interaction(interaction) -> None:
-    """Answer a gated-off interaction, best effort."""
+async def _refuse_interaction(interaction, reason: str = guild_gate.REFUSAL) -> None:
+    """Answer a gated-off interaction, best effort.
+
+    The sentence is a parameter because two different gates refuse here and they
+    are not the same news: "this server is not served" and "you are not a tester on
+    this instance" send the reader to different places.
+    """
     try:
         if not interaction.response.is_done():
-            await interaction.response.send_message(guild_gate.REFUSAL, ephemeral=True)
+            await interaction.response.send_message(reason, ephemeral=True)
     except Exception:                      # already answered, expired, 403 in a DM…
         pass
 
@@ -113,22 +119,42 @@ def _gate_component(interaction) -> bool:
     refusal — the same reason cogs/marketplace.py survives as a tombstone. Dispatch
     is synchronous, so the reply is scheduled onto the loop, and every failure in
     that scheduling is swallowed: the refusal must hold even if the reply cannot.
+
+    Two gates, checked in that order and never merged: the guild allowlist is an
+    authority boundary, while the role gate only narrows which members THIS
+    instance answers. A guild refused by the first stays refused whatever roles the
+    caller holds.
     """
     if guild_gate.is_allowed_interaction(interaction):
-        return True
+        if role_gate.is_allowed_interaction(interaction):
+            return True
+        log.info(
+            "Role gate: refused a component interaction from user %s in guild %s",
+            getattr(getattr(interaction, "user", None), "id", None),
+            getattr(interaction, "guild_id", None),
+        )
+        _schedule_refusal(interaction, role_gate.REFUSAL)
+        return False
     log.warning(
         "Guild gate: refused a component interaction from guild %s (user %s)",
         getattr(interaction, "guild_id", None),
         getattr(getattr(interaction, "user", None), "id", None),
     )
+    _schedule_refusal(interaction, guild_gate.REFUSAL)
+    return False
+
+
+def _schedule_refusal(interaction, reason: str) -> None:
+    """Put the refusal reply on the loop. Dispatch is synchronous, so this cannot
+    await; every failure in the scheduling is swallowed, because the refusal has to
+    hold even when the reply does not reach the user."""
     try:
         client = getattr(interaction, "client", None) or getattr(interaction, "_client", None)
         loop = getattr(client, "loop", None)
         if loop is not None:
-            loop.create_task(_refuse_interaction(interaction))
+            loop.create_task(_refuse_interaction(interaction, reason))
     except Exception:
         pass
-    return False
 
 
 # Patch CommandTree._from_interaction (slash commands + autocomplete)
@@ -187,17 +213,31 @@ class GatedCommandTree(app_commands.CommandTree):
     """
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        if guild_gate.is_allowed_interaction(interaction):
-            return True
-        log.warning(
-            "Guild gate: refused /%s from guild %s (user %s)",
-            getattr(getattr(interaction, "command", None), "qualified_name", "?"),
-            interaction.guild_id,
-            getattr(interaction.user, "id", None),
-        )
-        if interaction.type is discord.InteractionType.application_command:
-            await _refuse_interaction(interaction)
-        return False
+        if not guild_gate.is_allowed_interaction(interaction):
+            log.warning(
+                "Guild gate: refused /%s from guild %s (user %s)",
+                getattr(getattr(interaction, "command", None), "qualified_name", "?"),
+                interaction.guild_id,
+                getattr(interaction.user, "id", None),
+            )
+            if interaction.type is discord.InteractionType.application_command:
+                await _refuse_interaction(interaction, guild_gate.REFUSAL)
+            return False
+
+        # Narrower, and only ever narrower — see role_gate's docstring on why it is
+        # the mirror image of the allowlist above rather than part of it.
+        if not role_gate.is_allowed_interaction(interaction):
+            log.info(
+                "Role gate: refused /%s from user %s in guild %s",
+                getattr(getattr(interaction, "command", None), "qualified_name", "?"),
+                getattr(interaction.user, "id", None),
+                interaction.guild_id,
+            )
+            if interaction.type is discord.InteractionType.application_command:
+                await _refuse_interaction(interaction, role_gate.REFUSAL)
+            return False
+
+        return True
 
 
 # ── Bot subclass ─────────────────────────────────────────────────────────────
@@ -216,6 +256,7 @@ class GeneKermanBot(commands.Bot):
         # app-command tree, so the allowlist has to be added here too. A global check
         # is the whole surface: it runs for every prefix command in every cog.
         self.add_check(self._guild_gate_check)
+        self.add_check(self._role_gate_check)
 
     async def _guild_gate_check(self, ctx: commands.Context) -> bool:
         """Guild allowlist for prefix commands. Silent by design: an unapproved
@@ -227,6 +268,17 @@ class GeneKermanBot(commands.Bot):
             return True
         log.warning("Guild gate: refused prefix command in guild %s (user %s)",
                     ctx.guild.id, getattr(ctx.author, "id", None))
+        return False
+
+    async def _role_gate_check(self, ctx: commands.Context) -> bool:
+        """Role gate for prefix commands. Silent for the same reason the guild one
+        is: a `!` message that gets an answer confirms this instance is listening,
+        which is the opposite of what an isolated test bot wants."""
+        if role_gate.is_allowed_member(getattr(ctx, "author", None)):
+            return True
+        log.info("Role gate: refused prefix command from user %s in guild %s",
+                 getattr(ctx.author, "id", None),
+                 getattr(getattr(ctx, "guild", None), "id", None))
         return False
 
     async def close(self) -> None:
@@ -318,7 +370,7 @@ class GeneKermanBot(commands.Bot):
             raise RuntimeError(
                 "The user wallet did not load, so this bot will not start.\n"
                 + (f"Cogs that failed to load: {', '.join(failed_cogs)}\n" if failed_cogs else "")
-                + "Nothing has been written and no record was changed — the store "
+                + "Nothing has been written and no record was changed. The store "
                   "blocks its own writes in this state. Check the CRITICAL line above "
                   "for the Firestore error, then start the bot again."
             )
@@ -454,7 +506,7 @@ class GeneKermanBot(commands.Bot):
             log.info("Joined allowed guild %s (%s)", guild.name, guild.id)
             return
         log.warning(
-            "Guild gate: left %s (%s, owner %s) — not on the allowlist",
+            "Guild gate: left %s (%s, owner %s), not on the allowlist",
             guild.name, guild.id, getattr(guild.owner, "id", "?"),
         )
         try:
@@ -477,7 +529,7 @@ class GeneKermanBot(commands.Bot):
         if not stray:
             return
         for g in stray:
-            log.warning("Guild gate: in non-allowed guild %s (%s, %d members) — "
+            log.warning("Guild gate: in non-allowed guild %s (%s, %d members), "
                         "commands are refused there", g.name, g.id, g.member_count or 0)
         if not guild_gate.leave_on_boot():
             log.warning(
@@ -497,6 +549,10 @@ class GeneKermanBot(commands.Bot):
         log.info("Bot ready!  Logged in as %s (ID: %s)", self.user, self.user.id)
         log.info("Guilds: %d", len(self.guilds))
         log.info("Guild gate: %s", guild_gate.describe())
+        # ERROR, not info, when the gate is on with nothing listed: that instance
+        # answers nobody, and this line is the only thing that will say why.
+        (log.error if role_gate.misconfigured() else log.info)(
+            "Role gate: %s", role_gate.describe())
         log.info("=" * 50)
         await self._sweep_disallowed_guilds()
         await self.change_presence(

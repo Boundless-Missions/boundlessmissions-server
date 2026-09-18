@@ -119,6 +119,23 @@ class Config:
     # Default on (secure); set KSP_DEVICE_BINDING_ENABLED=false in .env to disable.
     KSP_DEVICE_BINDING_ENABLED: bool = _optional("KSP_DEVICE_BINDING_ENABLED", "true").lower() not in ("false", "0", "no", "off")
 
+    # The "Open a Ticket" panel embed, posted into each guild's configured ticket
+    # panel channel on startup and by /ticketpanel.
+    #
+    # Default on. Set TICKET_PANEL_ENABLED=false on any instance that shares a guild
+    # with another one — a dev or testing bot next to the live bot. The auto-post is
+    # idempotent only against *its own* previous panel: `_find_existing_panel` skips
+    # messages this bot user did not write, which is right (it must not adopt a
+    # message it cannot edit or attach its view to) and means a second bot cannot see
+    # the live panel and posts a duplicate underneath it. The button on that duplicate
+    # is served by whichever process posted it, so tickets opened from it land in the
+    # test bot's hands.
+    #
+    # This is a property of the *instance*, not of the guild, which is why it is an
+    # env var and not a `guild_config` channel setting: the two bots read the same
+    # Firestore config and would read the same answer out of it.
+    TICKET_PANEL_ENABLED: bool = _optional("TICKET_PANEL_ENABLED", "true").lower() not in ("false", "0", "no", "off")
+
     # Multiplayer account API (/api/v1/mp/*). Default **off**: this is a brand new
     # surface for a layer that is not built yet, and a live account service should
     # not carry an unfinished attack surface on the chance somebody finds it. Turn

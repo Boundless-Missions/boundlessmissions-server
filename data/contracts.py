@@ -33,6 +33,11 @@ CANCELLED = "cancelled"
 # Mission-type values (stored in the contract's "mission_type" field)
 CRAFT_BUILD = "craft_build"
 ACTIVE_VESSEL = "active_vessel"
+# A network mission ("deploy a relay network around the Mun"). Submits from flight
+# like ACTIVE_VESSEL and is gated on the same body/situation, but is judged on a
+# scan of every vessel in the target body's sphere of influence — see
+# data/fleet_constraints.py.
+CONSTELLATION = "constellation"
 RESCUE = "rescue"
 FLAG_DESIGN = "flag_design"
 

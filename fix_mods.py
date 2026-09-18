@@ -1,3 +1,10 @@
+# STALE — DO NOT RUN. This is a one-off scratch script from when a template in
+# data/mission_templates.py was a 7-tuple. Templates are 8-tuples now (the eighth
+# field is `requires`, the install tags that gate the mission — see
+# docs/design/bot/weekly-missions.md), so running this would append entries the
+# pool cannot read and break every weekly board. Kept only as a record of the edit
+# it made.
+
 import re
 
 with open('data/mission_templates.py', 'r', encoding='utf-8') as f:

@@ -498,7 +498,7 @@ def check(client_hash: str, client_version: str) -> dict:
                            f"Update through CKAN when you get the chance.")
     elif state == "grace":
         resp["message"] = (f"A new version ({latest_version}) is available. "
-                           f"This build stops working soon — update through CKAN.")
+                           f"This build stops working soon. Update through CKAN.")
     elif state == "blocked":
         resp["message"] = f"A new version ({latest_version}) is available."
     return resp

@@ -1179,9 +1179,16 @@ def _missing_required(constraints: dict, used_parts: list[dict]) -> list[str]:
     out: list[str] = []
 
     need_names, need_loose = _part_match_sets(constraints, "required")
+    # `part_titles` is what the contract author's install called each resolved part
+    # (api_server._freeze_author_parts). Used only to word the refusal: telling a
+    # player "Required part not found: 'sspx-inflatable-hab-25-2'" names the thing the
+    # check compares but not the thing they would recognise in the parts list.
+    titles = constraints.get("part_titles") or {}
     for need in need_names:
         if need.lower() not in used_names:
-            out.append(f"Required part not found: '{need}'.")
+            shown = titles.get(need)
+            out.append(f"Required part not found: '{shown}' ({need})." if shown
+                       else f"Required part not found: '{need}'.")
     for need in need_loose:
         if not any(need.lower() in t for t in titles):
             out.append(f"Required part not found: '{need}'.")

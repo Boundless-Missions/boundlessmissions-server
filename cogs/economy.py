@@ -28,7 +28,7 @@ S.update({
     # undone by the player, so a lookup that could not complete refuses the transfer
     # rather than guessing the snowflake is the account id.
     "eco.pay.lookup_failed": {"en": "❌ Couldn't check one of those accounts just now. "
-                                    "Nothing was transferred — try again in a moment."},
+                                    "Nothing was transferred. Try again in a moment."},
     "eco.balance.debt":     {"en": "Unpaid fines"},
     "eco.balance.debt_val": {"en": "**{amount}** ({pct}% of what you earn goes to it)"},
     "eco.pay.garnished":    {"en": "{amount} {currency} of this went to {name}'s unpaid fines."},

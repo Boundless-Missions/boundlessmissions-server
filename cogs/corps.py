@@ -783,7 +783,7 @@ class Corps(commands.Cog, name="Corps"):
                 log.debug("Could not deliver the corps error message", exc_info=True)
 
         if isinstance(error, app_commands.CommandOnCooldown):
-            await _say(f"⏳ Slow down — try again in {error.retry_after:.0f}s.")
+            await _say(f"⏳ Slow down, try again in {error.retry_after:.0f}s.")
             return
         if isinstance(error, app_commands.CheckFailure):
             await _say(tp(interaction.guild_id, interaction.user.id, "common.no_perm"))

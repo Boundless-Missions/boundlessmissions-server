@@ -416,7 +416,13 @@ class FinanceSendResult(BaseModel):
 # ── Missions ─────────────────────────────────────────────────────────────────
 
 class Mission(BaseModel):
+    # The claim key, derived from the mission text rather than its position on the
+    # board (cogs.weeklymissions._mission_id). Send this back to /missions/select.
     id: int
+    # The number the player sees — 1..20 down the board. Display only: two installs
+    # are shown different boards, so position identifies nothing on its own. 0 on a
+    # board stored before the two were split, where the id *was* the position.
+    n: int = 0
     desc_en: str
     desc_tr: str
     difficulty: int
@@ -425,18 +431,35 @@ class Mission(BaseModel):
     coins: int
     fine: int
     # AI-classified submission requirements (cached server-side)
-    mission_type: str = "active_vessel"  # "craft_build" or "active_vessel"
+    # "craft_build", "active_vessel" or "constellation" (a network mission judged
+    # on every vessel in the target body's SOI — see data/fleet_constraints.py).
+    mission_type: str = "active_vessel"
     required_situation: Optional[str] = None  # KSP situation: ORBITING, LANDED, FLYING, etc.
     required_body: Optional[str] = None  # Celestial body: Kerbin, Mun, Duna, etc.
+    # True on a mission from the test board — a second, admin-rotated board served
+    # only to an allow-listed dev client. Clients should say so on the card: a test
+    # mission mints a real contract, and by default it pays nothing.
+    test: bool = False
 
 class WeeklyMissionsResponse(BaseModel):
     week_key: str
     missions: list[Mission]
     is_locked: bool
     closes_at: str  # ISO timestamp
+    # Which board these came from: "live" or "test".
+    board: str = "live"
+    # Set when the caller asked for the test board and was given the live one
+    # instead. Serving live with a reason rather than failing keeps a dev client
+    # usable when the test board is off, which is most of the time — an outright
+    # 403 would read in game as "missions are broken".
+    test_refusal: Optional[str] = None
 
 class MissionSelectRequest(BaseModel):
     mission_id: int
+    # Which board the id came from. A test id is meaningless against the live board
+    # and vice versa, so this is not a hint — it selects the claim namespace
+    # (`_selection_ref` keys on the week, and a test board's week is its rotation).
+    board: str = "live"
 
 class MissionSelectResponse(BaseModel):
     success: bool
@@ -445,6 +468,31 @@ class MissionSelectResponse(BaseModel):
 
 
 # ── Contracts ────────────────────────────────────────────────────────────────
+
+class WreckMod(BaseModel):
+    """One mod the stranded vessel is built from, and the parts it supplies.
+
+    Resolved on the ISSUER's client at hand-over, because that is the only machine
+    that ever has this ship: every mod-detection path in the project walks an
+    *installed* part to its GameData folder, so the rescuer — who by definition may
+    be missing these mods — cannot work it out for themselves.
+
+    The wreck node already carries the same list in its GKMODS block, but that is
+    read only when the wreck is spawned, which is after the rescuer has accepted and
+    flown out. This is the same answer, placed where the offer can show it while it
+    is still an offer.
+
+    `parts` is trimmed (client and server both); `part_count` is how many distinct
+    parts the mod really supplies, so a trimmed list can say "and 6 more" rather than
+    quietly looking complete.
+    """
+    folder: str
+    path: str = ""
+    ckan: str = ""
+    name: str = ""
+    parts: list[str] = []
+    part_count: int = 0
+
 
 class RescueTarget(BaseModel):
     """Where stranded kerbals must be recovered from / delivered to.
@@ -503,6 +551,12 @@ class RescueTarget(BaseModel):
     # only on a "vessel" recovery — nobody else has anything to check them against,
     # and on a big craft this is the largest field on the contract.
     wreck_parts: list[str] = []
+    # Which mods the wreck is built from. Unlike wreck_parts this is sent to
+    # everyone and on every rescue: its whole purpose is to be read *before* the
+    # offer is accepted, so withholding it from a pending contractor — the one
+    # person it is for — would leave it useless. Empty for a stock wreck, and for
+    # every rescue issued before the issuer's client sent it.
+    wreck_mods: list[WreckMod] = []
 
 
 class PendingRequest(BaseModel):
@@ -626,6 +680,13 @@ class PartCatalogUpload(BaseModel):
     # Firestore write and lived on in memory alone, permanently. See
     # api_server.upload_part_catalog, which also caps each name and title.
     hash: str = Field(max_length=128)
+    # Every FlightGlobals.Bodies name, and every GameData folder that contributed a
+    # loaded part. Both optional: a client older than these fields sends neither and
+    # is read as a stock install, which is the board it was already being served.
+    # They exist for data/install_profile.py — see the note in upload_part_catalog
+    # on why it takes two signals rather than one.
+    bodies: list[str] = Field(default_factory=list, max_length=500)
+    mods: list[str] = Field(default_factory=list, max_length=500)
     # Deliberately NOT capped at the working limit (8000): the handler truncates to
     # that and returns 200, and turning the truncation into a 422 would fail the
     # upload outright on the heavily-modded installs this project exists for —
@@ -743,6 +804,24 @@ class ContractCreateRequest(BaseModel):
     # force the type and skip AI. (Rescue contracts use the separate multipart
     # /contracts/create_rescue endpoint.)
     contract_type: str = "auto"
+    # A relay-network contract states its terms here rather than in its prose. The
+    # count is what the issuer typed on the form; the spacing is derived from it
+    # (fleet_constraints.default_spread), so there is nothing else to ask for.
+    # Bounded at the model so a nonsense number never reaches the constraint.
+    relay_count: Optional[int] = Field(default=None, ge=2, le=64)
+    # The body the network has to be at. Only read for a constellation — every other
+    # type either has no body (craft_build, flag_design) or carries it in telemetry.
+    body: Optional[str] = Field(default=None, max_length=64)
+    # How strong each satellite's relay antenna must be, as antenna power. Omitted or 0
+    # means any relay-capable antenna, which is what a relay network has always meant.
+    # A number, not a part name: the issuer picks an antenna they own and the form sends
+    # what it is worth, so a contractor on a different mod set can meet it with an
+    # equivalent. Bounded well above any stock or modded antenna (the RA-100 is 1e11).
+    min_relay_power: Optional[float] = Field(default=None, ge=0, le=1e13)
+    # Which antenna model that number is written in ("stock", "realantennas", …). Sent
+    # by the issuer's client from its own install, because the figure is only
+    # comparable on an install sharing the model.
+    antenna_model: Optional[str] = Field(default=None, max_length=32)
 
 
 class AuctionCreateRequest(BaseModel):

@@ -20,7 +20,9 @@ from discord.ext import commands, tasks
 import settings
 from data.store import _db, store
 from data import guild_config
-from data.mission_templates import TEMPLATES
+from data.mission_templates import TEMPLATES, strip_mod_tag
+from data import install_profile as ip
+from data import mission_constraints as mc
 from i18n import t, S
 from cogs.corps import _get_corp
 
@@ -84,15 +86,94 @@ def _is_locked(now: datetime | None = None) -> bool:
 
 # ── Mission generation ───────────────────────────────────────────────────────
 
-def _generate_missions(week_key: str, count: int = 20) -> list[dict]:
-    """Deterministic random selection of missions for a given week."""
-    seed = int(hashlib.md5(week_key.encode()).hexdigest(), 16)
+# The Discord board has no idea who is reading it, so it is drawn for the stock
+# Kerbol system — the install all but a handful of this community runs. The in-game
+# board does know: api_server.get_weekly_missions passes the caller's own tags,
+# derived from the part catalog their client already uploads.
+DEFAULT_TAGS = frozenset({ip.SYS_STOCK})
+
+
+def _mission_id(desc_en: str) -> int:
+    """A mission's id, derived from its own text rather than its position.
+
+    The id is the claim key: `_selection_ref` is `{week}_{user}_{mission_id}`, and
+    that one document is what stands between a mission and two payouts. Positional
+    ids (1..20) were safe while every player was shown the same twenty missions.
+    They stop being safe the moment two players are shown different boards, because
+    then "#7" is one mission on the Discord board and a different one in the game —
+    and a mission that appears on both boards at different positions carries two
+    claim keys. One mission, two contracts, two payouts, which is the exact failure
+    `_selection_ref`'s own docstring was written about.
+
+    Deriving the id from the text makes the claim mean "this player took this
+    mission this week" whichever board they took it from. The board still counts
+    1..20 for the player: that is `n`, and it is display only.
+
+    Uniqueness across the whole resolved pool is asserted in
+    tests/bot/test_mission_templates.py — a collision would silently deny the
+    second mission rather than double-pay the first, but it would still be a
+    mission nobody could take.
+    """
+    return 1 + int(hashlib.sha1(desc_en.encode("utf-8")).hexdigest()[:10], 16) % 9_000_000
+
+
+def _eligible_templates(tags) -> list[tuple]:
+    """The templates this install can actually fly, with their body roles resolved.
+
+    Two ways a template drops out: it needs a tag this install has not got, or it
+    names a body role this system has no body for (`{moon2}` in the real solar
+    system — Earth has one moon).
+    """
+    roles = ip.roles_for(tags)
+    tagset = set(tags)
+    out = []
+    for desc_en, desc_tr, diff, cat, mtype, sit, body, requires in TEMPLATES:
+        if not set(requires) <= tagset:
+            continue
+        r_en = ip.resolve_roles(desc_en, roles)
+        r_tr = ip.resolve_roles(desc_tr, roles)
+        r_body = ip.resolve_roles(body, roles) if body else body
+        if r_en is None or r_tr is None or (body and r_body is None):
+            continue
+        out.append((r_en, r_tr, diff, cat, mtype, sit, r_body))
+    return out
+
+
+def _generate_missions(week_key: str, count: int = 20, tags=None, *,
+                       only: str | None = None, pay: bool = True) -> list[dict]:
+    """Deterministic selection of missions for a given week and a given install.
+
+    `tags` is an install profile (`data/install_profile.py`); omitted, it is the
+    stock system, which is what the Discord board is drawn for. The seed mixes in
+    the *bucket* rather than the player, so two installs carrying the same mods draw
+    the same board — the board is generated per distinct install, not per player,
+    which is what keeps this flat as the community grows.
+
+    `only` narrows the pool to templates whose English text contains it, and `pay`
+    set False zeroes the rewards. Both exist for the test board (`test_week_key`):
+    a rotation aimed at one mission is how you get that mission in front of a live
+    game, and a test contract that mints real coins is a test that costs money.
+    Neither is reachable from the live board, which passes neither.
+    """
+    tags = frozenset(tags) if tags else DEFAULT_TAGS
+    seed = int(hashlib.md5(f"{week_key}:{ip.bucket_id(tags)}".encode()).hexdigest(), 16)
     rng = random.Random(seed)
 
-    easy = [t for t in TEMPLATES if t[2] <= 3]
-    medium = [t for t in TEMPLATES if 4 <= t[2] <= 6]
-    hard = [t for t in TEMPLATES if 7 <= t[2] <= 8]
-    extreme = [t for t in TEMPLATES if t[2] >= 9]
+    pool = _eligible_templates(tags)
+    if only:
+        needle = only.strip().lower()
+        narrowed = [t for t in pool if needle in t[0].lower()]
+        if narrowed:
+            pool = narrowed
+        else:
+            # Refusing would leave the rotation with no board at all; the caller is
+            # told how many matched so a typo'd filter is visible rather than silent.
+            log.warning("Test board filter %r matched no eligible template; "
+                        "falling back to the whole pool.", only)
+    easy = [t for t in pool if t[2] <= 3]
+    medium = [t for t in pool if 4 <= t[2] <= 6]
+    hard = [t for t in pool if 7 <= t[2] <= 8]
+    extreme = [t for t in pool if t[2] >= 9]
 
     # Distribution: ~6 easy, ~6 medium, ~5 hard, ~3 extreme
     pick = []
@@ -101,17 +182,30 @@ def _generate_missions(week_key: str, count: int = 20) -> list[dict]:
     pick += rng.sample(hard, min(5, len(hard)))
     pick += rng.sample(extreme, min(3, len(extreme)))
 
+    # Top up from whatever is left in the pool. The tier split assumes a pool shaped
+    # like the stock one; a system that has no easy missions at all (the real solar
+    # system starts at "reach orbit", which is a 5 there) would otherwise hand back
+    # a board of twelve.
+    if len(pick) < count:
+        chosen = {t[0] for t in pick}
+        rest = [t for t in pool if t[0] not in chosen]
+        rng.shuffle(rest)
+        pick += rest[:count - len(pick)]
+
     # Sort by difficulty
     pick.sort(key=lambda x: x[2])
 
     missions = []
-    for i, tpl in enumerate(pick[:count], 1):
+    for n, tpl in enumerate(pick[:count], 1):
         desc_en, desc_tr, diff, cat, mtype, sit, body = tpl
-        xp = diff * settings.WEEKLY_XP_PER_DIFFICULTY
-        coins = diff * settings.WEEKLY_COINS_PER_DIFFICULTY
+        xp = diff * settings.WEEKLY_XP_PER_DIFFICULTY if pay else 0
+        coins = diff * settings.WEEKLY_COINS_PER_DIFFICULTY if pay else 0
         fine = int(coins * settings.WEEKLY_FINE_PERCENT / 100)
         missions.append({
-            "id": i,
+            # Stable across boards and positions — see _mission_id.
+            "id": _mission_id(desc_en),
+            # What the player sees and the buttons are labelled with.
+            "n": n,
             "desc_en": desc_en,
             "desc_tr": desc_tr,
             "difficulty": diff,
@@ -128,8 +222,52 @@ def _generate_missions(week_key: str, count: int = 20) -> list[dict]:
             "mission_type": mtype,
             "required_situation": sit,
             "required_body": body,
+            # Extracted once, here, from the text with its `[Mod Name]` tag removed —
+            # both selection paths prefer a stored `constraints` over re-reading the
+            # description, and re-reading it is what let the `Solar` in
+            # `[Real Solar System]` become an enforced solar-panel requirement.
+            # See data.mission_templates.strip_mod_tag.
+            "constraints": mc.extract_heuristic(strip_mod_tag(desc_en)),
         })
     return missions
+
+
+def _carry_over_ids(missions: list[dict], previous: list[dict] | None) -> int:
+    """Give a regenerated board the ids the board it replaces was using.
+
+    `/weeklymissions refresh` redraws the current week from the template pool, and the
+    week's claims are keyed on mission id (`_selection_ref`). A redraw that re-ids a
+    mission somebody already took makes it claimable again: the old claim document
+    still exists, but nothing looks that id up any more, so `_has_selected` says no —
+    one mission, two contracts, two payouts.
+
+    That was harmless while an id was a position and a redraw kept mission 1 at
+    position 1. It stopped being harmless when the id became a hash of the text,
+    because then every id on the board changes at once. So a mission that was on the
+    previous board keeps the id it had there, matched on its English description,
+    which is the mission's identity. Returns how many ids were carried over.
+    """
+    if not previous:
+        return 0
+    old_by_desc = {m.get("desc_en"): m.get("id") for m in previous if m.get("desc_en")}
+    taken = {m["id"] for m in missions}
+    carried = 0
+    for m in missions:
+        old_id = old_by_desc.get(m["desc_en"])
+        if old_id is None or old_id == m["id"]:
+            continue
+        if old_id in taken:
+            # Vanishingly unlikely — a text hash landing on another mission's id — and
+            # a duplicated id would leave one of the two unclaimable, so it is not a
+            # trade worth making. The mission keeps its new id and a fresh claim.
+            log.warning("Weekly refresh: not carrying id %s for %r, already in use.",
+                        old_id, m["desc_en"])
+            continue
+        taken.discard(m["id"])
+        m["id"] = old_id
+        taken.add(old_id)
+        carried += 1
+    return carried
 
 
 # ── Firestore helpers ────────────────────────────────────────────────────────
@@ -152,6 +290,109 @@ def _load_missions(guild_id: int, week_key: str) -> tuple[list[dict], int | None
         return [], None
     d = snap.to_dict()
     return d.get("missions", []), int(d["embed_message_id"]) if d.get("embed_message_id") else None
+
+
+# ── The test board ───────────────────────────────────────────────────────────
+#
+# A second board, rotated on demand, served only to an allow-listed account running a
+# dev client, and never posted to Discord. It exists because there was no way to put a
+# specific mission in front of a live KSP without editing the board everybody else is
+# playing — and the live board deliberately resists exactly that (`_generate_missions`
+# is deterministic from the week, and `regenmissions` is a blunt instrument that
+# re-rolls all twenty for the whole guild).
+#
+# The load-bearing decision is that a test board is just **another week**. Its key is
+# `TEST-<rotation>`, so `_selection_ref` ("{week}_{user}_{mission_id}"), the stored
+# board document and the classification cache all separate themselves with no new
+# concepts and no new collections. Two things follow from it for free:
+#
+#   • A claim on the test board cannot touch a live claim, because the week differs.
+#   • Rotating gives a fresh claim namespace, so the same mission can be taken again.
+#     That is the whole point of a rotation: without it the second attempt at a
+#     mission you already claimed this week is refused by the claim that protects the
+#     live board from paying twice.
+#
+# The rotation counter only ever goes up, and a retired number is never reused, so a
+# stale claim from rotation 3 can never be mistaken for one from rotation 7.
+
+
+def _test_meta_ref(guild_id: int):
+    """Where the rotation counter lives — beside the boards it numbers."""
+    return (_db.collection("guilds").document(str(guild_id))
+            .collection("weekly_missions").document("_test"))
+
+
+def test_week_key(rotation: int) -> str:
+    """The week key a test board is stored and claimed under."""
+    return f"TEST-{rotation}"
+
+
+def is_test_week(week_key: str) -> bool:
+    return bool(week_key) and week_key.startswith("TEST-")
+
+
+def load_test_meta(guild_id: int) -> dict:
+    """The active rotation, or a resting state when there has never been one.
+
+    `active` is separate from `rotation` on purpose: stopping the test board must not
+    reset the counter, or the next rotation would reuse a number whose claims still
+    exist and a mission already taken under it would be silently unclaimable.
+    """
+    try:
+        snap = _test_meta_ref(guild_id).get()
+        if snap.exists:
+            d = snap.to_dict() or {}
+            return {"rotation": int(d.get("rotation", 0)),
+                    "active": bool(d.get("active", False)),
+                    "only": d.get("only") or None,
+                    "rotated_at": d.get("rotated_at"),
+                    "rotated_by": d.get("rotated_by")}
+    except Exception as exc:  # noqa: BLE001 - no test board is a working state
+        log.warning("Could not read the test-board rotation for guild %s: %s", guild_id, exc)
+    return {"rotation": 0, "active": False, "only": None,
+            "rotated_at": None, "rotated_by": None}
+
+
+def rotate_test_board(guild_id: int, by_uid: str, only: str | None = None) -> dict:
+    """Start the next test rotation. Returns the new meta."""
+    meta = load_test_meta(guild_id)
+    new = {"rotation": meta["rotation"] + 1, "active": True,
+           "only": (only or "").strip() or None,
+           "rotated_at": datetime.now(TZ).isoformat(), "rotated_by": str(by_uid)}
+    _test_meta_ref(guild_id).set(new)
+    log.info("Test board rotated to %d for guild %s by %s (filter=%r)",
+             new["rotation"], guild_id, by_uid, new["only"])
+    return new
+
+
+def stop_test_board(guild_id: int) -> dict:
+    """Stop serving a test board. The counter is kept — see load_test_meta."""
+    meta = load_test_meta(guild_id)
+    meta["active"] = False
+    _test_meta_ref(guild_id).set(meta)
+    log.info("Test board stopped for guild %s (counter left at %d)",
+             guild_id, meta["rotation"])
+    return meta
+
+
+def generate_test_missions(guild_id: int, tags, count: int | None = None,
+                           meta: dict | None = None) -> tuple[str, list[dict]]:
+    """The current test board for one install, as (week_key, missions).
+
+    Generated rather than stored, exactly like an install-specific live board: it is
+    a pure function of (rotation, bucket), so every client asking for it — and
+    `select_mission` resolving an id from it — sees the same thing without a read.
+    """
+    meta = meta or load_test_meta(guild_id)
+    wk = test_week_key(meta["rotation"])
+    missions = _generate_missions(
+        wk, count or settings.WEEKLY_MISSIONS_COUNT, tags,
+        only=meta.get("only"),
+        pay=bool(getattr(settings, "WEEKLY_TEST_MISSIONS_PAY", False)),
+    )
+    for m in missions:
+        m["test"] = True
+    return wk, missions
 
 
 def _selection_ref(guild_id: int, week_key: str, user_id: int, mission_id: int):
@@ -306,7 +547,10 @@ def _build_embed(guild_id: int, missions: list[dict], week_key: str) -> discord.
             continue
         lines = []
         for m in tier_missions:
-            lines.append(f"**{m['id']}.** {m['desc_en']}\n　　`+{m['xp']} XP` · `+{m['coins']}` {sym}")
+            # `n` is the display number, `id` is the claim key — see _mission_id.
+            # A board stored before the two were split has no `n` and its id IS the
+            # position, which is exactly what the fallback wants.
+            lines.append(f"**{m.get('n', m['id'])}.** {m['desc_en']}\n　　`+{m['xp']} XP` · `+{m['coins']}` {sym}")
         embed.add_field(
             name=t(guild_id, tier_key),
             value="\n".join(lines),
@@ -336,11 +580,15 @@ class MissionSelectView(discord.ui.View):
                          else discord.ButtonStyle.blurple if m["difficulty"] <= 6
                          else discord.ButtonStyle.red if m["difficulty"] <= 8
                          else discord.ButtonStyle.grey)
+                n = m.get("n", m["id"])
                 btn = discord.ui.Button(
-                    label=str(m["id"]),
+                    label=str(n),
                     style=style,
+                    # The custom_id carries the claim key, never the display number:
+                    # this view is persistent, so the id it encodes has to be the one
+                    # `_selection_ref` will key the claim on.
                     custom_id=f"wm:{week_key}:{guild_id}:{m['id']}",
-                    row=min((m["id"] - 1) // 5, 4),
+                    row=min((n - 1) // 5, 4),
                 )
                 btn.callback = self._make_callback(m)
                 self.add_item(btn)
@@ -488,7 +736,7 @@ async def _handle_selection(interaction: discord.Interaction, week_key: str, gui
 
     # Build embed for corp channel
     embed = discord.Embed(
-        title=t(guild_id, "wm.contract_title", n=mission["id"]),
+        title=t(guild_id, "wm.contract_title", n=mission.get("n", mission["id"])),
         description=desc,
         color=discord.Color.gold(),
     )
@@ -762,7 +1010,43 @@ class WeeklyMissions(commands.Cog, name="WeeklyMissions"):
                     self._ensured[guild_id] = week_key
                     continue
                 except discord.NotFound:
+                    # The board is gone — fall through and post a replacement.
                     pass
+                except discord.Forbidden as exc:
+                    # 50005: "Cannot edit a message authored by another user". The
+                    # board exists and belongs to a DIFFERENT bot account — which is
+                    # what a dev instance pointed at the same guild and the same
+                    # Firestore always sees, because the board in the channel was
+                    # posted by production.
+                    #
+                    # Deliberately NOT falling through to the post below. A new
+                    # message would put a second board in the channel and
+                    # `_save_missions` would repoint `embed_message_id` at it, so the
+                    # two bots would then take the board off each other every refresh
+                    # — each one's edit 403ing against the other's message. Leaving it
+                    # alone is the only move that converges.
+                    #
+                    # `_ensured` is set so this is reported once per week per guild
+                    # rather than every tick of `refresh_loop`: the condition is a
+                    # deployment fact, not a transient one, and it will not clear by
+                    # being retried.
+                    log.warning(
+                        "Weekly board for guild %s (msg %d) was posted by another bot "
+                        "account, so this instance cannot edit it (%s). Leaving it "
+                        "alone, a second board would fight the first. This is normal "
+                        "for a dev bot sharing a guild and a database with production.",
+                        guild_id, msg_id, exc.text or exc)
+                    self._ensured[guild_id] = week_key
+                    continue
+                except discord.HTTPException as exc:
+                    # Transient (rate limit, 5xx). Unlike the two above this WILL clear
+                    # on its own, so `_ensured` is deliberately left unset and the next
+                    # tick tries again. What matters is that it no longer escapes into
+                    # `discord.ext.tasks`, which stops the loop dead for the life of
+                    # the process — one failed edit used to cost every later refresh.
+                    log.warning("Could not edit the weekly board for guild %s (msg %d): %s",
+                                guild_id, msg_id, exc)
+                    continue
 
             # Post new message — ping the guild's notification role if mapped.
             notif = guild_config.resolve_role(guild, "notifications")
@@ -847,6 +1131,80 @@ class WeeklyMissions(commands.Cog, name="WeeklyMissions"):
         await interaction.response.send_message("✅ Custom mission posted to mission-control.", ephemeral=True)
 
     @app_commands.command(
+        name="rotatetestmissions",
+        description="Start a new test-mission rotation for dev clients (Admin only)")
+    @app_commands.describe(
+        only="Optional: only missions whose text contains this (e.g. 'Mars', 'relay')")
+    @app_commands.default_permissions(administrator=True)
+    async def rotatetestmissions(self, interaction: discord.Interaction,
+                                 only: str | None = None):
+        """Roll the test board forward one rotation.
+
+        The test board is never posted here and never served to an ordinary client —
+        it exists so a mission can be put in front of a live KSP without touching the
+        board the guild is playing. `regenmissions` is the blunt instrument for that
+        and re-rolls all twenty for everybody; this changes nothing anyone else sees.
+
+        Rotating rather than editing is what makes a mission re-testable: a claim is
+        keyed on (week, player, mission) and the test board's week key carries the
+        rotation number, so a new rotation is a fresh claim namespace and the same
+        mission can be taken again. The counter only goes up, so a claim from an old
+        rotation can never be confused for a current one.
+        """
+        from cogs.perms import is_admin_user
+        if not is_admin_user(interaction):
+            await interaction.response.send_message("❌ Admin only.", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True)
+
+        gid = interaction.guild_id
+        from data import accounts as _accounts
+        uid = await asyncio.to_thread(_accounts.account_for_discord, interaction.user.id)
+        meta = await asyncio.to_thread(rotate_test_board, gid, uid or "0", only)
+        wk, preview = generate_test_missions(gid, DEFAULT_TAGS, meta=meta)
+
+        pays = bool(getattr(settings, "WEEKLY_TEST_MISSIONS_PAY", False))
+        lines = [f"**Test board rotated → `{wk}`**",
+                 f"Filter: `{meta['only']}`" if meta["only"] else "Filter: none",
+                 f"Rewards: {'REAL (this mints coins and XP)' if pays else 'zero (WEEKLY_TEST_MISSIONS_PAY is off)'}",
+                 ""]
+
+        # The three conditions api_server._test_board_refusal checks, reported here so
+        # a rotation that nothing will ever be served is visible at the moment it is
+        # made rather than as silence in the game.
+        problems = []
+        if not getattr(settings, "WEEKLY_TEST_BOARD_ENABLED", False):
+            problems.append("`WEEKLY_TEST_BOARD_ENABLED` is off. Nothing will be served.")
+        if not getattr(settings, "WEEKLY_TEST_ACCOUNT_IDS", []):
+            problems.append("`WEEKLY_TEST_ACCOUNT_IDS` is empty. No account is allowed.")
+        if problems:
+            lines += ["⚠️ " + p for p in problems] + [""]
+
+        lines.append("Preview for a **stock** install. Each dev client is served the "
+                     "board for its own install:")
+        for m in preview[:20]:
+            gate = m["required_body"] or "editor"
+            lines.append(f"`#{m['n']:>2}` d{m['difficulty']} · {gate} · {m['desc_en']}")
+        await interaction.followup.send("\n".join(lines)[:1990], ephemeral=True)
+
+    @app_commands.command(
+        name="stoptestmissions",
+        description="Stop serving the test-mission board (Admin only)")
+    @app_commands.default_permissions(administrator=True)
+    async def stoptestmissions(self, interaction: discord.Interaction):
+        """Stop serving a test board. The rotation counter is deliberately kept."""
+        from cogs.perms import is_admin_user
+        if not is_admin_user(interaction):
+            await interaction.response.send_message("❌ Admin only.", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True)
+        meta = await asyncio.to_thread(stop_test_board, interaction.guild_id)
+        await interaction.followup.send(
+            f"✅ Test board stopped. Dev clients are back on the live board.\n"
+            f"The counter stays at **{meta['rotation']}**. Reusing a rotation number "
+            f"would collide with claims already made under it.", ephemeral=True)
+
+    @app_commands.command(
         name="regenmissions",
         description="Rebuild this week's mission board from the current mission pool (Admin only)")
     @app_commands.default_permissions(administrator=True)
@@ -886,8 +1244,14 @@ class WeeklyMissions(commands.Cog, name="WeeklyMissions"):
             return
 
         wk = _week_key()
+        # Loaded BEFORE the redraw, because the board being replaced is what says
+        # which ids this week's claims are keyed on — see _carry_over_ids.
+        previous, old_msg_id = _load_missions(gid, wk)
         missions = _generate_missions(wk, settings.WEEKLY_MISSIONS_COUNT)
-        _, old_msg_id = _load_missions(gid, wk)
+        carried = _carry_over_ids(missions, previous)
+        if carried:
+            log.info("Weekly refresh (guild %s, %s): carried %d mission id(s) over from "
+                     "the board being replaced.", gid, wk, carried)
 
         embed = _build_embed(gid, missions, wk)
         view = MissionSelectView(wk, gid, missions)

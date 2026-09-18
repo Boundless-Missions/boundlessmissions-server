@@ -894,6 +894,37 @@ async def review(gid: int, contract_id: str, *, actor_id: int, actor_name: str,
                 "Your rescue craft and the rescued kerbals were delivered to the issuer.",
                 contract_id)
 
+    # A bought relay network moves the same way a rescue craft does, and in the same
+    # order, which is the part that matters: deliver FIRST, and send the removal notice
+    # only if the delivery was actually queued. Telling the contractor's client to
+    # delete satellites the issuer never received destroys them for nothing, and
+    # nothing gives them back.
+    #
+    # Bot-issued networks are excluded deliberately: there is no Boundless Missions
+    # save for satellites to arrive in, so a weekly relay mission verifies the network
+    # and leaves it alone.
+    #
+    # The notification TYPE is `rescue_craft_removed` because that is the one the
+    # client's contract-scoped removal reads (GeneKermanMod.MaybeHandleRescueRemoval →
+    # PeekRescueSubmissions → queue every recorded pid). The name is historical; the
+    # behaviour behind it was never rescue-specific, it removes whatever this contract
+    # recorded as handed over, which is exactly what a network needs.
+    if c.get("mission_type") == cdb.CONSTELLATION and not _is_bot_issued(c):
+        delivered = False
+        try:
+            delivered = await _api()._deliver_network_craft(gid, contract_id, c)
+        except Exception as exc:
+            log.error("Constellation %s approved but network delivery failed: %s",
+                      contract_id, exc)
+        if delivered:
+            _notify(gid, contractor_id, "rescue_craft_removed",
+                    "📡 Relay Network Transferred",
+                    "The satellites you handed over were delivered to the issuer.",
+                    contract_id)
+        else:
+            log.warning("Constellation %s: no removal notice sent, nothing was delivered.",
+                        contract_id)
+
     # Flag design: the full-res flag was gated behind approval; queue it for the
     # issuer's in-game flag picker now that it is paid for.
     if c.get("mission_type") == cdb.FLAG_DESIGN and c.get("flag_fullres_url"):

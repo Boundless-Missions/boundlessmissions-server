@@ -28,6 +28,11 @@ The geometry checks run only for bound orbits (ORBITING with eccentricity < 1); 
 sub-orbital and hyperbolic states have no apoapsis to anchor the identity, so they are
 left to the body-radius signal and the existing per-mission situation/body gates.
 
+A constellation submission (mission_type "constellation" — see data/fleet_constraints.py)
+carries many snapshots instead of one, and gets a third signal the single-vessel case
+cannot have: every member's own claimed sma and period must imply the SAME standard
+gravitational parameter, because they orbit the same body. See check_fleet.
+
 Pure functions over the snapshot dict — no Firestore, no I/O — so the API layer can call
 this synchronously and decide (per settings.TELEMETRY_CHECK_MODE) whether to reject, flag
 via flag_suspicion(), or both.
@@ -137,6 +142,70 @@ def check_snapshot(snap: dict) -> list[Violation]:
     return out
 
 
+def check_fleet(snaps: list[dict]) -> list[Violation]:
+    """Violations that only a *set* of snapshots can show.
+
+    A constellation submission (see data/fleet_constraints.py) carries one snapshot
+    per vessel in a body's sphere of influence, which multiplies the forgery surface:
+    a fabricated network is many snapshots, and each of them can be made
+    self-consistent on its own by anyone who read check_snapshot. What a forger has
+    to keep consistent *across* them is physics they cannot choose.
+
+    Every vessel orbiting one body obeys the same Kepler's third law, so each
+    member's own claimed semi-major axis and period imply the same standard
+    gravitational parameter:
+
+        mu = 4 * pi^2 * a^3 / T^2
+
+    The check never assumes a value for mu — it has none to assume, since a rescale
+    pack changes it and the body may be modded — only that the set agrees on one.
+    That is the fleet-sized version of the argument the per-snapshot geometry checks
+    already make: the payload is over-determined, and a hand-edited member drifts off
+    a constant the honest ones all sit on.
+
+    Members are compared against the MEDIAN mu rather than the mean, so one forged
+    entry cannot drag the reference far enough to accuse the real ones alongside it.
+    """
+    if not isinstance(snaps, list) or len(snaps) < 2:
+        return []
+
+    mus: list[tuple[float, dict]] = []
+    for snap in snaps:
+        if not isinstance(snap, dict):
+            continue
+        if (snap.get("situation") or "").upper() not in _ORBITAL_SITUATIONS:
+            continue
+        sma, period = _num(snap, "sma"), _num(snap, "period")
+        ecc = _num(snap, "eccentricity")
+        if sma is None or period is None or sma <= 0 or period <= 0:
+            continue
+        if ecc is not None and ecc >= 1.0:      # unbound: no period to speak of
+            continue
+        mus.append((4.0 * math.pi ** 2 * sma ** 3 / (period ** 2), snap))
+
+    if len(mus) < 2:
+        return []
+
+    ordered = sorted(mu for mu, _ in mus)
+    median = ordered[len(ordered) // 2]
+    if median <= 0:
+        return []
+
+    out: list[Violation] = []
+    tol = getattr(settings, "FLEET_MU_TOLERANCE", 0.02)
+    for mu, snap in mus:
+        rel = abs(mu - median) / median
+        if rel > tol:
+            name = snap.get("vessel_name") or "a vessel"
+            out.append(Violation(
+                True, "fleet_mu_mismatch",
+                f"'{name}' reports a semi-major axis and orbital period that imply a "
+                f"different {snap.get('body') or 'body'} than the other vessels "
+                f"submitted with it ({rel*100:.0f}% off). Vessels orbiting one body "
+                "cannot disagree about its gravity."))
+    return out
+
+
 # How many extra vessels one submission may be judged on. `sent_vessels` is a
 # client-supplied list with no bound of its own, and every entry here becomes a
 # full telemetry pass — the same list that, unbounded, made api_server render and
@@ -165,6 +234,26 @@ def _snapshots(vessel_data: dict) -> list[dict]:
     return snaps
 
 
+def _fleet_snapshots(vessel_data: dict) -> list[dict]:
+    """The constellation members in a submission payload, capped at
+    settings.FLEET_MAX_MEMBERS.
+
+    Kept apart from _snapshots because the two lists are bounded for different
+    reasons and by different numbers. `sent_vessels` is capped at MAX_SNAPSHOTS
+    because every entry becomes an uploaded render; a constellation member is
+    telemetry only — nothing is rendered, nothing is transferred — so it is capped
+    where fleet_constraints caps it, which is high enough for a real network.
+    """
+    out: list[dict] = []
+    limit = getattr(settings, "FLEET_MAX_MEMBERS", 24)
+    for m in (vessel_data.get("constellation") or []):
+        if isinstance(m, dict):
+            out.append(m)
+        if len(out) >= limit:
+            break
+    return out
+
+
 class Result(NamedTuple):
     reject: bool                 # caller should refuse the submission
     flag: bool                   # caller should record a suspicion
@@ -187,6 +276,13 @@ def evaluate(vessel_data: dict | None) -> Result:
         violations: list[Violation] = []
         for snap in _snapshots(vessel_data):
             violations.extend(check_snapshot(snap))
+        # A constellation payload is checked per member and then across members —
+        # the cross-check is the only one that can see a fabricated network whose
+        # entries are each individually plausible.
+        fleet = _fleet_snapshots(vessel_data)
+        for snap in fleet:
+            violations.extend(check_snapshot(snap))
+        violations.extend(check_fleet(fleet))
     except Exception:
         # Defensive: a bug in the checker must never block a legitimate submission.
         return none

@@ -39,6 +39,27 @@ def _env_int(key: str, default: int) -> int:
         return default
 
 
+def _env_bool(key: str, default: bool) -> bool:
+    """Read a flag from .env, falling back to the default below if unset/blank.
+
+    Anything unrecognised is the default rather than False, so a typo'd value cannot
+    quietly switch a feature off.
+    """
+    raw = _os.getenv(key, "").strip().lower()
+    if not raw:
+        return default
+    if raw in ("1", "true", "yes", "on"):
+        return True
+    if raw in ("0", "false", "no", "off"):
+        return False
+    return default
+
+
+def _env_csv(key: str) -> list[str]:
+    """Read a comma-separated list from .env; empty list when unset/blank."""
+    return [part.strip() for part in _os.getenv(key, "").split(",") if part.strip()]
+
+
 def _env_id(key: str) -> int | None:
     """Read a Discord snowflake from .env; None when unset/blank/unparseable."""
     raw = _os.getenv(key, "")
@@ -604,6 +625,52 @@ WEEKLY_FINE_PERCENT = 50
 # Allow mods to select missions even when the week is locked (e.g., Sundays)
 WEEKLY_MISSIONS_MODS_IGNORE_LOCK = False
 
+# Serve each player the board their install can actually fly, instead of the stock
+# board everybody currently gets (data/install_profile.py + the `requires` field in
+# data/mission_templates.py). OFF by default, because it is only half useful until
+# the mod update that uploads the body and GameData lists is published: until then
+# every catalog reads as a stock install anyway, and turning it on early would only
+# mean that whoever *has* updated starts drawing a different board mid-week from
+# everyone else.
+#
+# Safe to flip at any time — an in-flight week is protected independently of this
+# flag, see api_server._weekly_board — but a Monday is still the tidy moment, since
+# that is when the board everybody is looking at is redrawn anyway.
+WEEKLY_INSTALL_BOARDS_ENABLED: bool = _env_bool("WEEKLY_INSTALL_BOARDS_ENABLED", False)
+
+# ── The test mission board ───────────────────────────────────────────────────
+# A second, parallel weekly board for trying missions out against a live game
+# without touching the one everybody else is playing. It is never posted to
+# Discord and never served to an ordinary client: see api_server._test_board_refusal
+# and docs/design/bot/weekly-missions.md.
+#
+# Three independent conditions have to hold before a single test mission is handed
+# out, because a weekly mission mints a real contract and the wallet is global.
+WEEKLY_TEST_BOARD_ENABLED: bool = _env_bool("WEEKLY_TEST_BOARD_ENABLED", False)
+
+# The accounts that may be served it. Either form works — an **account id**, or the
+# **Discord snowflake** of the account that owns it (api_server._account_is_listed
+# resolves the second to the first). Both are accepted because the answer is
+# genuinely ambiguous: per data/accounts.py a Discord-origin account's id *is* its
+# snowflake, so for most people the two strings are identical — but a player who
+# signed up on the website and linked Discord afterwards keeps an `a_<firebase uid>`
+# account id, and the snowflake is the number you can actually right-click in
+# Discord. Listing the wrong one used to fail as a silent "not on the list", so the
+# refusal now names the caller's account id too.
+#
+# Empty means nobody, which is the right default: an allowlist that defaults to
+# "everyone" is not an allowlist. The *server* deciding this is the point — the
+# client's dev flag is an opt-in, and a client is not a thing this codebase trusts
+# (see data/suspicion.py), so a forged "I am a dev build" must never be enough on
+# its own.
+WEEKLY_TEST_ACCOUNT_IDS: list[str] = _env_csv("WEEKLY_TEST_ACCOUNT_IDS")
+
+# Whether a test mission pays. OFF by default: the test board exists to exercise the
+# board, the gate and the submit path, none of which need real money to be minted,
+# and coins from a test rotation are indistinguishable from earned ones once they are
+# in the wallet. Turn it on only for a deliberate run at the payout path itself.
+WEEKLY_TEST_MISSIONS_PAY: bool = _env_bool("WEEKLY_TEST_MISSIONS_PAY", False)
+
 # ── Checkpoint Photos ────────────────────────────────────────────────────────
 
 # Master switch for the auto-screenshot ("hero shot") feature. When False the
@@ -729,6 +796,56 @@ ORBIT_TUNDRA_ECC_MIN = 0.20
 # "100 km" doesn't demand a 100.0 km orbit while "2,000 km" isn't held to ±10 km.
 ORBIT_ALT_MARGIN_MIN = 10_000.0   # m — floor on the ± tolerance for Ap/Pe targets
 ORBIT_ALT_MARGIN_FRAC = 0.05      # fraction of the target used when it is larger
+
+# ── Constellation ("relay network") enforcement ───────────────────────────────
+# A mission that asks for a *network* rather than a craft ("deploy a relay network
+# around the Mun") is judged on every vessel in the target body's sphere of
+# influence, not on the one the player happens to be flying — see
+# data/fleet_constraints.py and VesselDataCollector.CaptureBodyFleet. The client
+# enumerates FlightGlobals.Vessels, which lists unloaded vessels too, so physics
+# range is not the bound; MAX_FLEET_MEMBERS is.
+FLEET_CHECK_ENABLED = True
+# Vessels one constellation payload may carry. The list is client-supplied and has
+# no bound of its own, and every entry costs a telemetry pass — the same reasoning
+# as telemetry_check.MAX_SNAPSHOTS, but a larger number because a constellation is
+# legitimately many craft. Extra members are truncated, not refused: the check is a
+# floor ("at least N qualify"), so dropping surplus entries can only make it stricter.
+FLEET_MAX_MEMBERS = 24
+# What a bare "network"/"constellation" means when the text names no number. Three
+# is the smallest count for which the word is not a lie: two satellites are a pair,
+# and no two-satellite arrangement gives continuous coverage of a body.
+FLEET_DEFAULT_COUNT = 3
+# Members must be spread around the body, not flying in formation. The requirement
+# is a fraction of the even spacing (360/N degrees), so an imperfect network passes
+# and a clump does not: at N=3 the even spacing is 120°, and 0.5 of it demands 60°
+# between neighbours. Written into the constraint at extraction time — like the
+# orbit altitude margin — so client and server can never derive it apart.
+FLEET_SPREAD_FRAC = 0.5
+# Members' semi-major axes must be within this fraction of each other. A relay
+# network is a shell; one satellite in a 2,000 km orbit and two skimming the
+# surface is not the thing the mission asked for. Generous, because hand-flown
+# networks are never exactly matched.
+FLEET_SMA_TOLERANCE = 0.35
+# Fractional spread in the standard gravitational parameter (mu = 4*pi^2*a^3/T^2)
+# implied by each member's own claimed sma and period, above which the set is
+# internally impossible — every vessel orbiting one body must imply one mu. This
+# is the fleet analogue of the per-snapshot Kepler identity in telemetry_check:
+# it never assumes a value for mu (so rescale packs are unaffected), only that the
+# set agrees on one. See data/telemetry_check.check_fleet.
+FLEET_MU_TOLERANCE = 0.02
+
+# Whether a *player* may issue a relay-network (constellation) contract to another
+# player. Off by default and deliberately undocumented in any shipped .env: a
+# relay-network contract is player-to-player content this deployment does not want
+# offered unless an operator explicitly opts in with PLAYER_RELAY_CONTRACTS=on.
+# This gates only the player-issued create path (create_contract_from_ksp); it does
+# NOT touch Boundless-Missions-issued relay missions (the weekly board), whose
+# creation, submission, grading and delivery run unchanged regardless of this flag —
+# those are issued by the bot, not through this endpoint. The server is the
+# authoritative gate: the mod has its own client-side switch (settings.cfg
+# `enablePlayerRelayContracts`, also off by default), but a client that bypasses it
+# still meets this refusal. See PLAYER-RELAY-CONTRACTS.md at the workspace root.
+PLAYER_RELAY_CONTRACTS_ENABLED: bool = _env_bool("PLAYER_RELAY_CONTRACTS", False)
 
 # ── Rescue target: orbital plane ─────────────────────────────────────────────
 # A rescue in "orbit" mode names an Ap/Pe the rescuer has to reach, which says

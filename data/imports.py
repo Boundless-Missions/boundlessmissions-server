@@ -129,10 +129,14 @@ def enqueue(
 ) -> ImportEntry:
     """Queue a craft for the player's KSP client to auto-import.
 
-    `source` is "contract", "market", "rescue_delivery", or "flag"; `ref_id` is
+    `source` is "contract", "market", "rescue_delivery", "network_delivery", or
+    "flag"; `ref_id` is
     the contract_id or listing_id. "contract"/"market" deliver a .craft blueprint
     (installed to the Ships folder); "rescue_delivery" carries a vessel_node_url
-    and is imported as a LIVE vessel (the rescued craft, spawned in-save); "flag"
+    and is imported as a LIVE vessel (the rescued craft, spawned in-save);
+    "network_delivery" is the same live-vessel import for a relay network bought
+    through a constellation contract, kept separate because rescue_delivery also
+    carries rescue semantics on the client that a bought satellite has none of; "flag"
     carries a flag_url (PNG) installed into the KSP Flags dir — never a
     craft/vessel. If an identical entry is already queued (same source + ref_id)
     the existing entry is returned instead of creating a duplicate.

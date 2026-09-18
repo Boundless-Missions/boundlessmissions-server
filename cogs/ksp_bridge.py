@@ -465,7 +465,7 @@ class DeleteDataModal(discord.ui.Modal):
             "nothing new is sold.\n\n"
             "Kept, because they are also somebody else's record: contracts and "
             "auctions you were party to, support tickets, and craft files already "
-            "bought by other players — a buyer's download has to keep working. Ask a "
+            "bought by other players, a buyer's download has to keep working. Ask a "
             "moderator if you need any of those looked at.",
             ephemeral=True,
         )

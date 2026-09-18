@@ -105,7 +105,7 @@ async def run_grant(args) -> int:
 
     users = store.get_all_users(0)
     if not users:
-        print("No user records loaded — refusing to act on an empty store.")
+        print("No user records loaded, refusing to act on an empty store.")
         return 1
 
     targets, skipped = [], []
@@ -125,7 +125,7 @@ async def run_grant(args) -> int:
             print(f"  would grant {uid}: {bal} -> {bal + args.amount}")
         if len(targets) > 10:
             print(f"  ... and {len(targets) - 10} more")
-        print("\nDRY RUN — nothing written. Re-run with --apply.")
+        print("\nDRY RUN, nothing written. Re-run with --apply.")
         return 0
 
     granted = []
@@ -165,7 +165,7 @@ async def run_revert(args) -> int:
 
     print(f"reverting:  {receipt['grant_id']}  ({len(receipt['granted'])} users)")
     if not args.apply:
-        print("DRY RUN — nothing written. Re-run with --apply.")
+        print("DRY RUN, nothing written. Re-run with --apply.")
         return 0
 
     for row in receipt["granted"]:
