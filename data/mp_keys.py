@@ -73,6 +73,20 @@ SIGNING_KEY_LIFETIME_SECONDS = 90 * 24 * 3600
 #: server; it is not a player token and must never be usable as one.
 MASTER_AUDIENCE = "boundlessmissions-master"
 SCOPE_GAME_SERVER = "game-server"
+
+#: The allow-set token (presence visibility, `ksp-mp-presence-visibility.md` §6.4).
+#: Minted here, carried by the client, verified OFFLINE by the game server against
+#: the same JWKS as a player token. It shares the universe audience with a player
+#: token, so — exactly like a service credential — the scope is what actually
+#: keeps the two apart and the verifier checks it explicitly.
+SCOPE_ALLOW_SET = "allow-set"
+#: The three discovery tiers (§2). `public` admits everyone minus blocks,
+#: `friends` admits only the hashed allow list, `hidden` admits no one.
+ALLOW_TIERS = ("public", "friends", "hidden")
+#: Backstop lifetime. Freshness is event-driven (the client re-fetches on a
+#: tier/friend/block edit); this is only the worst-case latency for a block to
+#: bite if that signal is missed, so it matches the player token's short life.
+ALLOW_SET_TTL_SECONDS = 15 * 60
 # ─────────────────────────────────────────────────────────────────────────────
 
 # The JWKS is read by every game server on a schedule and by every joining
@@ -98,6 +112,17 @@ def _now_iso() -> str:
 
 def _b64u(raw: bytes) -> str:
     return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
+
+
+def _allow_hash(salt: bytes, account: str) -> str:
+    """``H(salt, account)`` — a 128-bit tag, base64url, for one allow/deny entry.
+
+    Kept byte-for-byte identical to `common/tokens.py::_allow_hash` in the
+    Multiplayer-Server repo: the game server tests membership by hashing a
+    *connected* viewer's account with the subject's salt, so the two hashers must
+    agree exactly or every membership test silently misses.
+    """
+    return _b64u(hashlib.sha256(salt + b"\x00" + account.encode("utf-8")).digest()[:16])
 
 
 def key_id(public: Ed25519PublicKey) -> str:
@@ -343,3 +368,73 @@ def mint_service_credential(
     token = jwt.encode(claims, entry["pem"], algorithm=ALGORITHM,
                        headers={"kid": entry["kid"]})
     return token, jti, expires
+
+
+def mint_allow_set_token(
+    *,
+    account_id: str,
+    universe_id: str,
+    tier: str,
+    set_version: int,
+    allow_accounts=(),
+    block_accounts=(),
+    ttl_seconds: int = ALLOW_SET_TTL_SECONDS,
+    at_wc: float | None = None,
+    salt: bytes | None = None,
+) -> tuple[str, int]:
+    """Mint an allow-set token for one ``(account, universe)``. Returns ``(token, expires_wc)``.
+
+    The subject's exposure, signed. ``allow_accounts`` is the friends set the bot
+    resolved for the friends tier (already block-excluded); ``block_accounts`` is
+    an absolute deny applied at every tier, which is what lets ``public`` still
+    exclude a blocker. Both are **hashed** with a fresh per-token ``salt`` before
+    they leave the bot, so the raw account ids never reach an untrusted game-server
+    operator, and one subject's set cannot be correlated with another's.
+
+    Why a client courier is acceptable here when it would be a smell for a token
+    that granted sight of *others*: this set governs exposure of *its own holder*.
+    Withholding or replaying a stale one only makes the holder more invisible —
+    there is no permissive direction to cheat. The lone exception, downgrade-replay
+    (a stale set still listing a since-blocked account), is closed by ``set_version``
+    plus the game server refusing a version lower than it has already seen.
+
+    **Kept in sync by comment with `common/tokens.py::mint_allow_set_token`** in
+    the Multiplayer-Server repo — the claim shape below is the wire contract its
+    ``verify_allow_set_token`` reads, and the two are separate reimplementations
+    on purpose (this mints, the game server only verifies).
+    """
+    account_id = str(account_id or "").strip()
+    universe_id = str(universe_id or "").strip()
+    if not account_id:
+        raise MpKeyError("cannot mint an allow-set with no account id")
+    if not universe_id:
+        raise MpKeyError("cannot mint an allow-set with no universe")
+    if tier not in ALLOW_TIERS:
+        raise MpKeyError(f"unknown visibility tier {tier!r}")
+    if int(set_version) < 0:
+        raise MpKeyError("set_version must be non-negative")
+
+    now = float(at_wc if at_wc is not None else time.time())
+    entry = get_keyset(at_wc=now)["current"]
+    expires = int(now + ttl_seconds)
+    if salt is None:
+        salt = uuid.uuid4().bytes
+
+    claims = {
+        "iss": ISSUER,
+        "sub": account_id,
+        "aud": universe_id,
+        "iat": int(now),
+        "nbf": int(now),
+        "exp": expires,
+        "jti": uuid.uuid4().hex,
+        "scope": SCOPE_ALLOW_SET,
+        "tier": tier,
+        "sv": int(set_version),
+        "salt": _b64u(salt),
+        "allow": sorted({_allow_hash(salt, a) for a in allow_accounts if a}),
+        "block": sorted({_allow_hash(salt, a) for a in block_accounts if a}),
+    }
+    token = jwt.encode(claims, entry["pem"], algorithm=ALGORITHM,
+                       headers={"kid": entry["kid"]})
+    return token, expires

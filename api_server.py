@@ -86,6 +86,7 @@ from data import mp_servers
 from data import blocks as blocks_db
 from data import mp_visibility
 from data import mp_profiles
+from data import mp_allow_set as mp_allow_set_mod
 from data import policy as policy
 from data import suspensions
 from data import suspicion as susp
@@ -10796,7 +10797,7 @@ MP_PROFILES_MAX = 50
 
 
 @app.post("/api/v1/mp/profiles")
-async def mp_profiles(body: MpProfilesRequest, user: dict = Depends(get_current_user)):
+async def mp_resolve_profiles(body: MpProfilesRequest, user: dict = Depends(get_current_user)):
     """Resolve handles to the public profiles the caller is allowed to see.
 
     The filter IS the visibility model, applied server-side against the
@@ -10826,6 +10827,43 @@ async def mp_profiles(body: MpProfilesRequest, user: dict = Depends(get_current_
 
     profiles = await asyncio.to_thread(mp_profiles.resolve, account_id, uniq)
     return {"profiles": profiles}
+
+
+@app.get("/api/v1/mp/allow-set")
+async def mp_issue_allow_set(universe_id: str = "", user: dict = Depends(get_current_user)):
+    """Mint the caller's presence allow-set for one universe (§6.4).
+
+    A separate signed token from the player token — different cadence and
+    revocation shape — that the client carries and the game server verifies
+    OFFLINE to enforce the presence tiers without ever touching Firestore or
+    carrying identity. It governs the *caller's own* exposure ("who may see me"),
+    resolved here from their tier + friends + blocks and handed over as salted
+    hashes, so no account ids and no raw friend/block ids leave the account layer.
+
+    Behind the same full KSP-tier gate as the token mint (`get_current_user`): a
+    suspended or unverified client never receives one. Fails closed — if the tier,
+    block or friend state cannot be read, no token is issued rather than a
+    permissive one, matching `data/mp_allow_set.py`.
+    """
+    _require_multiplayer()
+    account_id = str(user["user_id"])
+    _rate_limit(f"mp_allow_set:{account_id}", max_hits=60, window=300.0)
+
+    universe_id = (universe_id or "").strip()
+    if not universe_id or len(universe_id) > 64:
+        raise HTTPException(status_code=400, detail="A universe id is required.")
+
+    try:
+        return await asyncio.to_thread(mp_allow_set_mod.mint, account_id, universe_id)
+    except mp_allow_set_mod.AllowSetUnavailable:
+        # Fail closed: withhold the set rather than issue one that might over-expose.
+        raise HTTPException(status_code=503,
+                            detail="Couldn't refresh your visibility right now.")
+    except mp_keys.MpKeyError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception:
+        log.exception("mp allow-set mint failed for %s", account_id)
+        raise HTTPException(status_code=503, detail="Could not issue an allow-set right now.")
 
 
 # ══════════════════════════════════════════════════════════════════════════════

@@ -72,13 +72,14 @@ def normalize_tier(tier) -> str | None:
     return t if t in TIERS else None
 
 
-def get_tier(account_id) -> str:
-    """This account's visibility tier.
+def get_setting(account_id) -> tuple[str, float]:
+    """This account's ``(tier, updated_epoch)`` in one read.
 
-    An absent document is the default (`friends`); a read error raises
-    `VisibilityUnavailable`. A stored value that is somehow not one of the three
-    tiers is treated as the default rather than trusted — a malformed setting must
-    not read as `public`.
+    The stamp is what the allow-set mint folds into its ``set_version`` (a tier
+    change must bump the version so the game server refuses the older set) — so it
+    is read here alongside the tier rather than in a second Firestore round trip.
+    An absent document is the default tier at stamp ``0.0``; a read error raises
+    `VisibilityUnavailable`; a malformed stored tier reads back as the default.
     """
     aid = str(account_id)
     try:
@@ -87,8 +88,25 @@ def get_tier(account_id) -> str:
         log.warning("Visibility tier read failed for %s: %s", aid, exc)
         raise VisibilityUnavailable(str(exc)) from exc
     if not snap.exists:
-        return DEFAULT_TIER
-    return normalize_tier((snap.to_dict() or {}).get("tier")) or DEFAULT_TIER
+        return DEFAULT_TIER, 0.0
+    d = snap.to_dict() or {}
+    tier = normalize_tier(d.get("tier")) or DEFAULT_TIER
+    try:
+        updated = float(d.get("updated") or 0.0)
+    except (TypeError, ValueError):
+        updated = 0.0
+    return tier, updated
+
+
+def get_tier(account_id) -> str:
+    """This account's visibility tier.
+
+    An absent document is the default (`friends`); a read error raises
+    `VisibilityUnavailable`. A stored value that is somehow not one of the three
+    tiers is treated as the default rather than trusted — a malformed setting must
+    not read as `public`.
+    """
+    return get_setting(account_id)[0]
 
 
 def set_tier(account_id, tier) -> tuple[bool, str]:
