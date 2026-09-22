@@ -87,6 +87,7 @@ from data import blocks as blocks_db
 from data import mp_visibility
 from data import mp_profiles
 from data import mp_allow_set as mp_allow_set_mod
+from data import mp_rendezvous
 from data import policy as policy
 from data import suspensions
 from data import suspicion as susp
@@ -10864,6 +10865,108 @@ async def mp_issue_allow_set(universe_id: str = "", user: dict = Depends(get_cur
     except Exception:
         log.exception("mp allow-set mint failed for %s", account_id)
         raise HTTPException(status_code=503, detail="Could not issue an allow-set right now.")
+
+
+# ── Rendezvous / access auto-approval policy (data/mp_rendezvous.py) ──────────
+#
+#  The standing answer to an inbound access/rendezvous request: mode
+#  (manual/friends/all) + an explicit always-approve list. Durable and cross-device
+#  by design, so it lives in the bot and the CLIENT fetches it at join (like the
+#  allow-set) and applies it locally — the game server holds no policy and still
+#  demands an owner-attested resolve for every grant. This surface only changes
+#  whether the owner's client prompts or auto-answers; it can grant nothing.
+
+class MpRendezvousModeBody(BaseModel):
+    mode: str
+
+
+class MpRendezvousAutoBody(BaseModel):
+    handle: str
+    action: str   # allow | remove
+
+
+@app.get("/api/v1/mp/rendezvous-policy")
+async def mp_get_rendezvous_policy(user: dict = Depends(get_current_user)):
+    """The caller's own auto-approval policy, resolved for the client to apply.
+
+    Returns the mode, the block-filtered explicit allow list (as handles — no
+    account ids leave the account layer), and the choices/default for a settings
+    UI. Fails **closed** to `manual` with an empty list: a read error must make the
+    client *prompt*, never auto-approve. The `friends` mode is applied client-side
+    off the profile the client already resolves for the requester, so no friend
+    list is enumerated here.
+    """
+    _require_multiplayer()
+    account_id = str(user["user_id"])
+    try:
+        resolved = await asyncio.to_thread(mp_rendezvous.resolve, account_id)
+    except mp_rendezvous.RendezvousPolicyUnavailable:
+        resolved = {"mode": mp_rendezvous.DEFAULT_MODE, "auto_handles": [], "updated": 0.0}
+    return {
+        "mode": resolved["mode"],
+        "auto_handles": resolved["auto_handles"],
+        "updated": resolved["updated"],
+        "modes": list(mp_rendezvous.MODES),
+        "default": mp_rendezvous.DEFAULT_MODE,
+    }
+
+
+@app.put("/api/v1/mp/rendezvous-policy")
+async def mp_set_rendezvous_mode(body: MpRendezvousModeBody, user: dict = Depends(get_current_user)):
+    """Set the caller's own auto-approval mode (manual | friends | all)."""
+    _require_multiplayer()
+    account_id = str(user["user_id"])
+    _rate_limit(f"mp_rdv_mode:{account_id}", max_hits=30, window=300.0)
+    try:
+        ok, msg = await asyncio.to_thread(mp_rendezvous.set_mode, account_id, body.mode)
+    except mp_rendezvous.RendezvousPolicyUnavailable:
+        raise HTTPException(status_code=503, detail="Couldn't save that setting right now.")
+    normalized = mp_rendezvous.normalize_mode(body.mode)
+    if normalized is None:
+        raise HTTPException(status_code=400, detail=msg)
+    # `set_mode` returns (False, "already your setting") for a no-op; that is not an
+    # error, so report the current mode either way.
+    return {"mode": normalized, "message": msg}
+
+
+@app.post("/api/v1/mp/rendezvous-policy/auto")
+async def mp_rendezvous_auto_action(body: MpRendezvousAutoBody, user: dict = Depends(get_current_user)):
+    """Add or remove a handle on the caller's always-auto-approve list."""
+    _require_multiplayer()
+    account_id = str(user["user_id"])
+    _rate_limit(f"mp_rdv_auto:{account_id}", max_hits=60, window=300.0)
+
+    action = str(body.action or "").strip().lower()
+    if action not in ("allow", "remove"):
+        raise HTTPException(status_code=400, detail="Unknown action.")
+    handle = str(body.handle or "").strip()
+    if not handle:
+        raise HTTPException(status_code=400, detail="A player handle is required.")
+
+    target = await asyncio.to_thread(accounts.account_for_username, handle)
+    if not target:
+        raise HTTPException(status_code=404, detail="No player by that name.")
+    target = str(target)
+    if target == account_id:
+        raise HTTPException(status_code=400, detail="You can't add yourself.")
+
+    def _do() -> tuple[bool, str]:
+        if action == "remove":
+            return mp_rendezvous.disallow(account_id, target)
+        h, name = handle, ""
+        acct = accounts.get_account(target)
+        if acct:
+            h = str(acct.get("username") or handle)
+            name = _account_display(acct)
+        return mp_rendezvous.allow(account_id, target, handle=h, name=name)
+
+    try:
+        ok, msg = await asyncio.to_thread(_do)
+    except mp_rendezvous.RendezvousPolicyUnavailable:
+        raise HTTPException(status_code=503, detail="Couldn't update your auto-approve list right now.")
+    if not ok:
+        raise HTTPException(status_code=400, detail=msg)
+    return {"ok": True, "message": msg}
 
 
 # ══════════════════════════════════════════════════════════════════════════════

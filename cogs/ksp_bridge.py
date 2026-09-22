@@ -339,6 +339,23 @@ def _purge_player_records(uid: str) -> dict:
 
     out["catalogs"] = _delete_part_catalogs_everywhere(uid)
 
+    # The multiplayer presence self-documents: the discovery tier, the block/mute
+    # list and the rendezvous auto-approval policy. Each is one document keyed by
+    # this player and holds only their own choices; an entry naming this player on
+    # ANOTHER player's list (a block they received, an auto-approve someone set for
+    # them) lives under that other id and is theirs to keep, exactly as a received
+    # friend edge is (which the friend-graph purge handles separately). Best-effort,
+    # one delete each.
+    for mod_name, key in (("mp_visibility", "mp_visibility"),
+                          ("blocks", "mp_blocks"),
+                          ("mp_rendezvous", "mp_rendezvous")):
+        try:
+            mod = __import__("data." + mod_name, fromlist=["forget_account"])
+            mod.forget_account(uid)
+            out[key] = True
+        except Exception as exc:
+            log.warning("Could not purge %s for %s: %s", mod_name, uid, exc)
+
     # The notification feed and the craft-import queue are per-guild subtrees. The feed
     # is unbounded (reads cap at 50, the collection does not) and holds a readable
     # history of who this player dealt with; the import queue holds pending deliveries.
