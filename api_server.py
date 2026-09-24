@@ -88,6 +88,7 @@ from data import mp_visibility
 from data import mp_profiles
 from data import mp_allow_set as mp_allow_set_mod
 from data import mp_rendezvous
+from data import mp_social
 from data import policy as policy
 from data import suspensions
 from data import suspicion as susp
@@ -4835,6 +4836,18 @@ async def _friends_payload(user: dict) -> FriendListResponse:
     )
 
 
+async def _refuse_if_blocked(a: str, b: str) -> None:
+    """Raise unless neither of `a` and `b` has blocked the other."""
+    try:
+        blocked = await asyncio.to_thread(blocks_db.either_blocks, a, b)
+    except blocks_db.BlocksUnavailable:
+        raise HTTPException(status_code=503,
+                            detail="Couldn't check that right now. Try again in a moment.")
+    if blocked:
+        raise HTTPException(status_code=403,
+                            detail="That player can't take a friend request right now.")
+
+
 async def _resolve_friend_target(req: FriendRequestPayload) -> tuple[str, str]:
     """The account id a friend request names, plus what to call them.
 
@@ -4901,6 +4914,12 @@ async def _friend_request(user: dict, req: FriendRequestPayload,
     # `MAX_INCOMING` remains the ceiling on the inbox itself.
     _rate_limit(f"friendreq:{uid}:{target}", max_hits=5, window=3600.0)
 
+    # A block in either direction forbids contact (data/blocks.py), and a friend
+    # request is contact — it lands in the target's feed with the sender's name on
+    # it. Refused with the same vague sentence as a full inbox, so the refusal does
+    # not tell the sender they were blocked. Fails closed, like every block read.
+    await _refuse_if_blocked(uid, target)
+
     try:
         ok, state, message = await asyncio.to_thread(friends_db.send_request, uid, target)
     except friends_db.FriendsUnavailable:
@@ -4962,6 +4981,11 @@ async def _friend_action(user: dict, other_id: str, action: str) -> FriendAction
     other = str(other_id or "").strip()
     if not other or other == uid:
         return FriendActionResult(success=False, message="That isn't a player.")
+
+    if action == "accept":
+        # A request that predates a block is still sitting in the inbox; accepting
+        # it must not quietly undo the block's "no contact".
+        await _refuse_if_blocked(uid, other)
 
     try:
         if action == "accept":
@@ -10779,8 +10803,251 @@ async def mp_block_action(body: MpBlockBody, user: dict = Depends(get_current_us
             await asyncio.to_thread(friends_db.remove_friend, account_id, target)
         except Exception:                                  # pragma: no cover - best effort
             log.warning("block %s: could not also unfriend %s", account_id, target)
+        # A pending request either way is contact still in flight — withdraw a sent
+        # one and turn down a received one (one edit, see `cancel_request`). The
+        # accept path also refuses a blocked pair, so this is tidiness, not the gate.
+        try:
+            await asyncio.to_thread(friends_db.cancel_request, account_id, target)
+        except Exception:                                  # pragma: no cover - best effort
+            log.warning("block %s: could not also clear requests with %s", account_id, target)
 
     return {"ok": True, "message": msg}
+
+
+# ── Presence: friend / message / report by handle (data/mp_social.py) ─────────
+#
+#  The owner cards' social actions. The MP client only ever holds HANDLES — the
+#  account id stays in the account layer (§5) — so these take a handle and resolve
+#  it here, then reuse the existing friend and ticket machinery rather than
+#  growing a second copy of either.
+
+class MpFriendBody(BaseModel):
+    handle: str
+    action: str   # request | accept | decline | remove
+
+
+class MpMessageBody(BaseModel):
+    handle: str
+    text: str
+
+
+class MpReportBody(BaseModel):
+    handle: str
+    category: str = "other"
+    reason: str = ""
+    vessel_id: str = ""
+    vessel_name: str = ""
+    universe_id: str = ""
+
+
+async def _mp_owner_of_handle(handle: str) -> str:
+    """Account id for a handle, or "" when nobody owns it. A failed read is a 503,
+    never "no such player" (the `owner_of_username` distinction)."""
+    try:
+        owner = await asyncio.to_thread(accounts.owner_of_username, handle)
+    except Exception:                                      # pragma: no cover - defensive
+        owner = None
+    if owner is None:
+        raise HTTPException(status_code=503,
+                            detail="Couldn't look that player up. Try again in a moment.")
+    return str(owner)
+
+
+@app.post("/api/v1/mp/friends")
+async def mp_friend_action(body: MpFriendBody, request: Request,
+                           user: dict = Depends(get_current_user)):
+    """Request / accept / decline / remove a friendship by handle.
+
+    A thin adapter over the `/friends/*` handlers — same rate limits, block gate,
+    notifications and storage — that differs only in taking the handle the overlay
+    holds instead of an account id it must never see.
+    """
+    _require_multiplayer()
+    account_id = str(user["user_id"])
+    action = str(body.action or "").strip().lower()
+    if action not in ("request", "accept", "decline", "remove"):
+        raise HTTPException(status_code=400, detail="Unknown action.")
+    handle = str(body.handle or "").strip()
+    if not handle:
+        raise HTTPException(status_code=400, detail="A player handle is required.")
+
+    target = await _mp_owner_of_handle(handle)
+    if not target:
+        raise HTTPException(status_code=404, detail="No player by that name.")
+    if target == account_id:
+        raise HTTPException(status_code=400, detail="That's you.")
+
+    if action in ("request", "accept"):
+        # Both publish our name into someone else's feed — the onboarded gate the
+        # /friends/request and /accept routes carry.
+        user = await asyncio.to_thread(_require_username, user)
+    if action == "request":
+        result = await _friend_request(user, FriendRequestPayload(username=handle), request)
+    else:
+        result = await _friend_action(user, target, action)
+
+    # The relationship on both sides' cached profiles just changed.
+    mp_profiles.clear_requester(account_id)
+    mp_profiles.clear_requester(target)
+    return {"ok": result.success, "message": result.message, "state": result.state}
+
+
+@app.post("/api/v1/mp/message")
+async def mp_send_message(body: MpMessageBody, user: dict = Depends(get_current_user_onboarded)):
+    """Send a short note to a player you can see, delivered to their notification feed.
+
+    Contactable-only, decided by the overlay's own visibility filter, uncached. An
+    unknown handle, a block either way and an excluding tier all return the SAME
+    refusal — the refusal must not be the thing that tells you that you were
+    blocked. A recipient who muted the sender gets nothing, and the sender is told
+    it was sent (`mp_social.message_gate`).
+    """
+    _require_multiplayer()
+    account_id = str(user["user_id"])
+    gid = int(user["guild_id"])
+    _rate_limit(f"mp_msg:{account_id}", max_hits=30, window=3600.0)
+
+    handle = str(body.handle or "").strip()
+    if not handle:
+        raise HTTPException(status_code=400, detail="A player handle is required.")
+    text = mp_social.clean_message(body.text)
+    if not text:
+        raise HTTPException(status_code=400, detail="Write something to send.")
+
+    unreachable = HTTPException(status_code=403, detail="You can't message that player.")
+    target = await _mp_owner_of_handle(handle)
+    if not target or target == account_id:
+        raise unreachable
+    # Per pair, as friend requests are: bounds what one player can do to another
+    # without letting anyone spend a victim's allowance.
+    _rate_limit(f"mp_msg:{account_id}:{target}", max_hits=10, window=3600.0)
+
+    decision = await asyncio.to_thread(
+        mp_social.message_gate, account_id, target, handle,
+        resolve=lambda s, hs: mp_profiles.resolve(s, hs, use_cache=False),
+        is_muted=blocks_db.is_muted)
+    if decision == mp_social.UNREACHABLE:
+        raise unreachable
+    if decision == mp_social.DELIVER:
+        me = str(user.get("username") or "A player")
+
+        def _deliver() -> None:
+            tgid = _recipient_guild(target, gid)
+            _create_notification(
+                tgid, target, "mp_message", f"✉️ Message from {me}", text,
+                {"from_handle": me})
+
+        try:
+            await asyncio.to_thread(_deliver)
+        except Exception:
+            log.exception("mp message %s -> %s failed", account_id, target)
+            raise HTTPException(status_code=503, detail="Couldn't send that right now.")
+        log.info("MP message %s -> %s (%d chars)", account_id, target, len(text))
+    return {"ok": True, "message": "Message sent."}
+
+
+@app.post("/api/v1/mp/report", response_model=ReportResult)
+async def mp_report_player(body: MpReportBody, request: Request,
+                           user: dict = Depends(get_current_user)):
+    """Report a player (optionally about one craft) into the moderation ticket stack.
+
+    The contract report's shape pointed at a multiplayer peer: the shared report
+    allowance, one private ticket in the reporter's guild, and a keyed record so the
+    same reporter cannot file the same complaint twice inside the cool-down.
+    Reporting is not contact, so it is not gated on visibility — you can report a
+    player who has since blocked or hidden from you.
+    """
+    _require_multiplayer()
+    uid = str(user["user_id"])
+    gid = int(user["guild_id"])
+    _limit_reports(uid, gid, request)
+    if not _bot_instance:
+        raise HTTPException(status_code=503, detail="The bot is not available right now.")
+
+    reason = mp_social.clean_reason(body.reason)
+    if not reason:
+        raise HTTPException(status_code=400, detail="Say what happened.")
+    handle = str(body.handle or "").strip()
+    if not handle:
+        raise HTTPException(status_code=400, detail="A player handle is required.")
+    target = await _mp_owner_of_handle(handle)
+    if not target:
+        raise HTTPException(status_code=404, detail="No player by that name.")
+    if target == uid:
+        raise HTTPException(status_code=400, detail="You can't report yourself.")
+
+    try:
+        existing = await asyncio.to_thread(mp_social.get_report, target, uid)
+    except mp_social.SocialUnavailable:
+        raise HTTPException(status_code=503, detail="Couldn't file that right now.")
+    if mp_social.report_blocked_by_cooldown(existing):
+        raise HTTPException(status_code=409,
+                            detail="You've already reported this player recently; the mods have it.")
+
+    guild = _bot_instance.get_guild(gid)
+    if guild is None:
+        raise HTTPException(status_code=503,
+                            detail="Your Discord server is not reachable right now.")
+
+    acct = await asyncio.to_thread(accounts.get_account, target)
+    subject_handle = str((acct or {}).get("username") or handle)
+    subject_name = _account_display(acct) if acct else subject_handle
+    category = mp_social.normalize_category(body.category)
+    vessel_id = str(body.vessel_id or "").strip()[:64]
+    vessel_name = str(body.vessel_name or "").strip()[:128]
+    universe_id = str(body.universe_id or "").strip()[:64]
+
+    import discord
+    from cogs.tickets import create_ticket
+
+    # Every string here is player-authored and lands in an embed description, which
+    # renders Discord markdown (masked links included) — escaped at display, stored raw.
+    _esc = discord.utils.escape_markdown
+    lines = [
+        f"**Reported player:** {_esc(subject_name)} (@{_esc(subject_handle)}, "
+        f"{_mention(target, 'no Discord')}, `{target}`)",
+        f"**Category:** {category.replace('_', ' ')}",
+    ]
+    if vessel_id or vessel_name:
+        lines.append(f"**Craft:** {_esc(vessel_name or 'unnamed')} (`{_esc(vessel_id) or '—'}`)")
+    if universe_id:
+        lines.append(f"**Universe:** `{_esc(universe_id)}`")
+    lines.append(f"**Reported by:** {_esc(str(user.get('username', 'Unknown')))} "
+                 f"({_mention(uid, 'no Discord')}, `{uid}`)")
+    if existing:
+        lines.append(f"**Earlier reports by this reporter:** {int(existing.get('count') or 0)}")
+    e = discord.Embed(title="🛰️ Multiplayer player report", description="\n".join(lines),
+                      color=discord.Color.orange())
+
+    channel = await create_ticket(
+        _bot_instance, guild,
+        opener_id=uid,
+        subject_user_id=int(target) if target.isdigit() else None,
+        kind="user",
+        title="Multiplayer report",
+        description=f"**What happened**\n{_esc(reason)}",
+        color=discord.Color.orange(),
+        extra_embeds=[e],
+    )
+    if channel is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Couldn't open a ticket; this server's ticket system isn't set up.")
+
+    try:
+        await asyncio.to_thread(
+            mp_social.record_report,
+            subject_id=target, subject_handle=subject_handle, subject_name=subject_name,
+            reporter_id=uid, reporter_name=user.get("username", ""), category=category,
+            reason=reason, vessel_id=vessel_id, vessel_name=vessel_name,
+            universe_id=universe_id, guild_id=gid, ticket_channel_id=channel.id)
+    except mp_social.SocialUnavailable:
+        # The ticket — the part a moderator acts on — exists; only the counter missed.
+        log.warning("mp report %s -> %s: ticket opened but record write failed", uid, target)
+    log.info("%s reported MP player %s (%s)", user.get("username"), target, category)
+    return ReportResult(
+        success=True,
+        message=f"Reported. A private ticket (#{channel.name}) is open in Discord.")
 
 
 class MpProfilesRequest(BaseModel):
