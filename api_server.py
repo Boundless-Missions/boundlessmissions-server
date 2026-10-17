@@ -13044,6 +13044,26 @@ def set_bot_instance(bot):
     global _bot_instance
     _bot_instance = bot
 
+
+def _discord_avatar_url(did: int) -> str | None:
+    """A Discord user's picture from the bot's user cache (no fetch), as a 64 px
+    PNG — the same form the friends list and player picker send, since the mod
+    only decodes PNG/JPEG and a Nitro avatar's default URL is a .gif."""
+    if _bot_instance is None:
+        return None
+    user_obj = _bot_instance.get_user(int(did))
+    if user_obj is None:
+        return None
+    asset = user_obj.display_avatar
+    try:
+        return asset.replace(size=64, format="png").url
+    except Exception:
+        return asset.url
+
+
+# The MP profile resolve (data/mp_profiles.py) has no bot of its own.
+mp_profiles.discord_avatar = _discord_avatar_url
+
 def _get_bot_user_id() -> int:
     return _bot_user_id
 

@@ -37,6 +37,32 @@ from data.store import sign_stored, SIGNED_URL_MAX_TTL
 log = logging.getLogger(__name__)
 
 
+# ── The Discord picture ──────────────────────────────────────────────────────
+#
+# Set by api_server at import: `discord_avatar(discord_id: int) -> str | None`,
+# answering from the bot's in-memory user cache only (never a Discord fetch — this
+# runs per resolved profile). Most accounts are Discord accounts that never uploaded
+# a picture, so with only the stored `avatar_url` nearly every overlay face was
+# initials (2026-10: "player profile pictures are not visible"). Order matches the
+# friends list and the player picker: the Discord picture first, the uploaded one
+# for an account without Discord (or when the bot does not have the user cached).
+discord_avatar = None
+
+
+def _avatar_for(aid: str, acct: dict) -> str:
+    did = str(acct.get("discord_id") or "")
+    if not did.isdigit() and aid.isdigit():
+        did = aid
+    if did.isdigit() and discord_avatar is not None:
+        try:
+            url = discord_avatar(int(did))
+            if url:
+                return str(url)
+        except Exception as exc:                      # pragma: no cover - defensive
+            log.warning("Discord avatar lookup failed for %s: %s", aid, exc)
+    return sign_stored(acct.get("avatar_url"), ttl=SIGNED_URL_MAX_TTL) or ""
+
+
 # ── The resolve cache (design §6.4) ──────────────────────────────────────────
 #
 # The overlay resolves the visible owner set on a slow cadence, and a name or
@@ -173,7 +199,7 @@ def profile_one(aid, handle, requester, requester_blocked,
         # surface).
         "display_name": _display(acct),
         # A signed platform URL, never an arbitrary one the mod would fetch blindly.
-        "avatar_url": sign_stored(acct.get("avatar_url"), ttl=SIGNED_URL_MAX_TTL) or "",
+        "avatar_url": _avatar_for(aid, acct),
         "relationship": rel,
         "contactable": (not is_self),
     }
