@@ -10444,6 +10444,10 @@ class MpTokenRequest(BaseModel):
     # naming only the account would let a host admit a player into a universe
     # they hold nothing in, or replay a token it received into a different one.
     universe_id: str
+    # The server the client is about to join (the master listing's id). Binds
+    # the token to it (`srv`) and asks for its registered TLS pins. Optional
+    # so an older client still gets an unbound token.
+    server_id: str = ""
 
 
 @app.get("/api/v1/mp/jwks")
@@ -10464,7 +10468,7 @@ async def mp_jwks(request: Request):
     _require_multiplayer()
     _rate_limit_ip("mp_jwks_ip", request, max_hits=240, window=3600.0)
     try:
-        return await asyncio.to_thread(mp_keys.jwks)
+        out = await asyncio.to_thread(mp_keys.jwks)
     except Exception:
         log.exception("mp jwks read failed")
         # Fails CLOSED, unlike /version/check. An empty key set is not a
@@ -10472,6 +10476,18 @@ async def mp_jwks(request: Request):
         # and report the tokens as forged, which is a far worse failure than a
         # host that retries. There is nothing safe to substitute.
         raise HTTPException(status_code=503, detail="Key set unavailable.")
+    # The registered game servers' RS256 transition keys, each under its
+    # `server_id`. This route is the base mod's ONE compiled-in key origin
+    # (`SanctionedTransition.KeyOrigin`); game servers' Ed25519 verifiers skip
+    # RSA keys and the base mod skips OKP ones, so one set serves both. A read
+    # failure here degrades only sanctioned transitions (judged as if no
+    # multiplayer existed) — it must not take the player-token keys down too.
+    try:
+        extra = await asyncio.to_thread(mp_servers.transition_jwks)
+    except Exception:
+        log.exception("mp transition key read failed")
+        extra = []
+    return {"keys": list(out.get("keys", [])) + extra}
 
 
 @app.post("/api/v1/mp/token")
@@ -10501,6 +10517,9 @@ async def mp_token(body: MpTokenRequest, user: dict = Depends(get_current_user))
     universe_id = (body.universe_id or "").strip()
     if not universe_id or len(universe_id) > 64:
         raise HTTPException(status_code=400, detail="A universe id is required.")
+    server_id = (body.server_id or "").strip()
+    if len(server_id) > 64 or any(not ch.isprintable() for ch in server_id):
+        raise HTTPException(status_code=400, detail="Bad server id.")
 
     account = await asyncio.to_thread(accounts.get_account, account_id)
     handle = str((account or {}).get("username") or "").strip()
@@ -10522,6 +10541,7 @@ async def mp_token(body: MpTokenRequest, user: dict = Depends(get_current_user))
             handle=handle,
             universe_id=universe_id,
             display_name=str((account or {}).get("display_name") or ""),
+            server_id=server_id,
         )
     except mp_keys.MpKeyError as exc:
         log.warning("mp token mint refused for %s: %s", account_id, exc)
@@ -10530,7 +10550,7 @@ async def mp_token(body: MpTokenRequest, user: dict = Depends(get_current_user))
         log.exception("mp token mint failed for %s", account_id)
         raise HTTPException(status_code=503, detail="Could not issue a token right now.")
 
-    return {
+    out = {
         "token": token,
         "expires_wc": expires_wc,
         "universe_id": universe_id,
@@ -10538,6 +10558,17 @@ async def mp_token(body: MpTokenRequest, user: dict = Depends(get_current_user))
         # Deliberately not the account id: the client already knows who it is, and
         # this response is one copy-paste away from a server operator's logs.
     }
+    if server_id:
+        # The pins the server registered with its own credential. The client
+        # checks the game server's (self-signed, raw-IP) certificate against
+        # them — this answer travels over our CA-validated HTTPS, which is what
+        # makes it trustworthy where the master listing may not be.
+        try:
+            out["server"] = await asyncio.to_thread(mp_servers.tls_pins_for, server_id)
+        except Exception:
+            log.exception("mp tls pin read failed for %s", server_id)
+            # Omitted, not faked: the client then falls back to the listing.
+    return out
 
 
 class MpServerRegister(BaseModel):
@@ -10593,6 +10624,47 @@ async def mp_server_register(body: MpServerRegister, user: dict = Depends(get_us
         "expires_wc": expires,
         "note": "Store this credential now. It is not shown again. Re-issue if you lose it.",
     }
+
+
+class MpServerKeys(BaseModel):
+    transition_jwk: dict | None = None
+    tls_pins: list[str] = []
+    universe_id: str = ""
+
+
+@app.put("/api/v1/mp/servers/keys")
+async def mp_server_keys(body: MpServerKeys, authorization: str = Header(default="")):
+    """A game server registers its own PUBLIC keys: transition key + TLS pins.
+
+    Authenticated by the server's **service credential** (bearer), the first
+    route a game server calls on this API. Identity is the credential's `sub`;
+    it must be the server's live credential (not superseded, not revoked). See
+    `data/mp_servers.py` for why each key is needed and what is checked.
+    """
+    _require_multiplayer()
+    token = authorization[7:].strip() if authorization[:7].lower() == "bearer " else ""
+    if not token:
+        raise HTTPException(status_code=401, detail="Service credential required.")
+    try:
+        claims = await asyncio.to_thread(mp_keys.verify_service_credential, token)
+    except mp_keys.MpKeyError:
+        raise HTTPException(status_code=401, detail="Service credential refused.")
+    server_id = str(claims.get("sub") or "")
+    _rate_limit(f"mp_server_keys:{server_id}", max_hits=30, window=3600.0)
+    try:
+        rec = await asyncio.to_thread(
+            mp_servers.set_keys, server_id, str(claims.get("jti") or ""),
+            transition_jwk=body.transition_jwk, tls_pins=body.tls_pins,
+            universe_id=body.universe_id)
+    except mp_servers.MpServerError as exc:
+        msg = str(exc)
+        status = 401 if "live credential" in msg else 400
+        raise HTTPException(status_code=status, detail=msg)
+    except Exception:
+        log.exception("mp server keys write failed for %s", server_id)
+        raise HTTPException(status_code=503, detail="Could not store the keys right now.")
+    return {"server_id": server_id, "tls_pins": rec.get("tls_pins", []),
+            "transition_key": "transition_jwk" in rec}
 
 
 @app.get("/api/v1/mp/servers")

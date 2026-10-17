@@ -260,8 +260,15 @@ def mint_player_token(
     display_name: str = "",
     ttl_seconds: int = PLAYER_TOKEN_TTL_SECONDS,
     at_wc: float | None = None,
+    server_id: str = "",
 ) -> tuple[str, int]:
     """Mint a token scoped to exactly one ``(account, universe)``.
+
+    ``server_id`` (the server the client says it is joining) binds the token to
+    that server too, as the optional ``srv`` claim: a game server refuses a
+    token bound to another (`common/tokens.py::verify_player_token`), so a token
+    a player was tricked into handing to an impostor cannot be replayed at the
+    real host.
 
     Returns ``(token, expires_wc)``.
 
@@ -307,6 +314,9 @@ def mint_player_token(
         "handle": handle,
         "name": display_name or "",
     }
+    server_id = str(server_id or "").strip()
+    if server_id:
+        claims["srv"] = server_id
     token = jwt.encode(
         claims,
         entry["pem"],
@@ -368,6 +378,42 @@ def mint_service_credential(
     token = jwt.encode(claims, entry["pem"], algorithm=ALGORITHM,
                        headers={"kid": entry["kid"]})
     return token, jti, expires
+
+
+def verify_service_credential(token: str, *, at_wc: float | None = None) -> dict:
+    """Verify a game server's service credential; returns its claims.
+
+    The bot's own check of what it minted, for the one route a game server calls
+    here (`PUT /api/v1/mp/servers/keys`). Same rules as the master's offline
+    check (`common/tokens.py::verify_service_credential`): pinned algorithm,
+    master audience, game-server scope, a known `kid`. Revocation is the
+    caller's to check against the registry, which knows the live `jti`.
+    Raises :class:`MpKeyError` on any failure.
+    """
+    try:
+        header = jwt.get_unverified_header(token)
+    except Exception as exc:
+        raise MpKeyError("malformed credential") from exc
+    kid = header.get("kid")
+    data = get_keyset(at_wc=at_wc)
+    entry = next((e for e in (data.get("current"), data.get("previous"))
+                  if e and e.get("kid") == kid and "pem" in e), None)
+    if entry is None:
+        raise MpKeyError("credential signed by an unknown key")
+    try:
+        claims = jwt.decode(
+            token, _load_private(entry).public_key(), algorithms=[ALGORITHM],
+            audience=MASTER_AUDIENCE, issuer=ISSUER, leeway=30,
+            options={"require": ["exp", "iat", "sub", "aud", "iss", "jti"],
+                     "verify_exp": at_wc is None},
+        )
+    except Exception as exc:
+        raise MpKeyError(f"credential rejected: {type(exc).__name__}") from exc
+    if at_wc is not None and float(claims["exp"]) < at_wc:
+        raise MpKeyError("credential expired")
+    if claims.get("scope") != SCOPE_GAME_SERVER:
+        raise MpKeyError("not a game-server credential")
+    return claims
 
 
 def mint_allow_set_token(

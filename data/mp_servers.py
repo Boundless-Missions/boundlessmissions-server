@@ -41,7 +41,9 @@ the registry row outlives it on purpose, because the row is the audit record and
 a host whose credential lapsed is still the account that ran it.
 """
 
+import base64
 import logging
+import re
 import secrets
 import threading
 import time
@@ -193,6 +195,7 @@ def invalidate() -> None:
     with _cache_lock:
         _cache["ids"] = None
         _cache["at"] = 0.0
+    invalidate_keys()     # a revoked server's transition key goes with it
 
 
 def revoked_jtis(*, fresh: bool = False) -> list[str]:
@@ -232,3 +235,155 @@ def revoked_jtis(*, fresh: bool = False) -> list[str]:
         _cache["ids"] = list(out)
         _cache["at"] = time.time()
     return out
+
+
+# ── Public keys a server registers about itself ───────────────────────────────
+#
+# Two pieces of PUBLIC material, sent by the game server itself with its service
+# credential (`PUT /api/v1/mp/servers/keys`, `game/production.py` in the
+# Multiplayer-Server repo):
+#
+# * **The transition key** — the RS256 key the server signs sanctioned
+#   transitions with. The base mod verifies those against keys fetched from ONE
+#   compiled-in origin (this bot's `/api/v1/mp/jwks`), selected by the token's
+#   `srv`, so a server's key is only ever trusted because this registry vouches
+#   that the credential holder for that server id published it. Before this the
+#   bot published none, every sanctioned transition failed to verify, and the
+#   watchdog judged bubble form/dissolve and clock relabels as teleports.
+# * **TLS pins** — SPKI SHA-256 of the server's (self-signed, raw-IP)
+#   certificate. The client reads them back in the token-mint response, over
+#   this bot's CA-validated HTTPS, and refuses any other certificate.
+#
+# Kept in sync by comment with `common/tlspin.py` (pin shape, MAX_PINS) and
+# `common/transitions.py::TransitionSigner.public_jwk` (JWK shape).
+
+MAX_TLS_PINS = 2
+_PIN_RE = re.compile(r"^sha256/[A-Za-z0-9+/]{43}=$")
+_B64U_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+#: RSA modulus bounds, in bytes: 2048..4096-bit keys. Smaller is forgeable,
+#: larger only costs every base mod a slower verify.
+_MIN_N, _MAX_N = 256, 512
+
+_keys_lock = threading.Lock()
+_keys_cache: dict = {"at": 0.0, "jwks": None}
+_KEYS_CACHE_TTL = 60.0
+
+
+def clean_tls_pins(value) -> list[str]:
+    if not isinstance(value, (list, tuple)):
+        return []
+    out: list[str] = []
+    for v in value:
+        if isinstance(v, str) and _PIN_RE.match(v) and v not in out:
+            out.append(v)
+        if len(out) >= MAX_TLS_PINS:
+            break
+    return out
+
+
+def _b64u_decode(s: str) -> bytes:
+    return base64.urlsafe_b64decode(s + "=" * (-len(s) % 4))
+
+
+def clean_transition_jwk(jwk, server_id: str) -> dict:
+    """The stored (and published) form of a server's transition key.
+
+    Strict, because the base mod trusts whatever this publishes under the
+    server's id: RSA only, RS256, a 2048–4096-bit modulus, e = 65537, and
+    `server_id` set from the CREDENTIAL — never from the body, so one server
+    cannot publish a key under another's id. Unknown members are dropped.
+    """
+    if not isinstance(jwk, dict):
+        raise MpServerError("transition_jwk must be an object")
+    if jwk.get("kty") != "RSA" or jwk.get("alg", "RS256") != "RS256" \
+            or jwk.get("use", "sig") != "sig":
+        raise MpServerError("transition_jwk must be an RS256 signing key")
+    n, e = jwk.get("n"), jwk.get("e")
+    if not isinstance(n, str) or not isinstance(e, str) \
+            or not _B64U_RE.match(n) or not _B64U_RE.match(e):
+        raise MpServerError("transition_jwk needs base64url n and e")
+    try:
+        nb, eb = _b64u_decode(n), _b64u_decode(e)
+    except Exception:
+        raise MpServerError("transition_jwk n/e are not base64url")
+    nb = nb.lstrip(b"\x00")
+    if not (_MIN_N <= len(nb) <= _MAX_N):
+        raise MpServerError("transition_jwk must be a 2048–4096-bit RSA key")
+    if int.from_bytes(eb, "big") != 65537:
+        raise MpServerError("transition_jwk exponent must be 65537")
+    return {"kty": "RSA", "alg": "RS256", "use": "sig",
+            "server_id": str(server_id), "n": n, "e": e}
+
+
+def set_keys(server_id: str, jti: str, *, transition_jwk=None, tls_pins=None,
+             universe_id: str = "") -> dict:
+    """Record the public keys a server states about itself.
+
+    ``server_id`` and ``jti`` come from the verified credential. The credential
+    must be the server's LIVE one: a superseded or revoked credential (which may
+    be in someone else's hands — that is why it was re-issued) cannot rewrite
+    the keys the base mod and every client trust for this id.
+    """
+    server_id = str(server_id)
+    rec = get(server_id)
+    if not rec or rec.get("revoked") or str(rec.get("credential_jti") or "") != str(jti):
+        raise MpServerError("Credential is not the server's live credential.")
+    updates = {
+        "tls_pins": clean_tls_pins(tls_pins),
+        "keys_universe_id": str(universe_id or "")[:64],
+        "keys_updated_at": _now_iso(),
+    }
+    if transition_jwk is not None:
+        updates["transition_jwk"] = clean_transition_jwk(transition_jwk, server_id)
+    _col().document(server_id).update(updates)
+    invalidate_keys()
+    log.info("game server %s registered keys (transition=%s, %d tls pin(s))",
+             server_id, "yes" if transition_jwk is not None else "no",
+             len(updates["tls_pins"]))
+    rec.update(updates)
+    return rec
+
+
+def invalidate_keys() -> None:
+    with _keys_lock:
+        _keys_cache["jwks"] = None
+        _keys_cache["at"] = 0.0
+
+
+def transition_jwks(*, fresh: bool = False) -> list[dict]:
+    """Every live server's transition key, as the base mod's `ParseJwks` reads them.
+
+    A revoked server's key is withdrawn with it. Memoised like the revoked
+    list: the JWKS route is anonymous and on every host's schedule.
+    """
+    if not fresh:
+        with _keys_lock:
+            keys, at = _keys_cache["jwks"], float(_keys_cache["at"])
+        if keys is not None and (time.time() - at) < _KEYS_CACHE_TTL:
+            return [dict(k) for k in keys]
+    out: list[dict] = []
+    for snap in _col().stream():
+        d = snap.to_dict() or {}
+        jwk = d.get("transition_jwk")
+        if d.get("revoked") or not isinstance(jwk, dict):
+            continue
+        # Re-derive the id from the document, never trust a stored copy of it.
+        out.append(dict(jwk, server_id=str(d.get("server_id") or snap.id)))
+    with _keys_lock:
+        _keys_cache["jwks"] = [dict(k) for k in out]
+        _keys_cache["at"] = time.time()
+    return out
+
+
+def tls_pins_for(server_id: str) -> dict:
+    """What the token-mint response tells the client about the server it is joining.
+
+    ``registered`` is false for an unknown or revoked id; ``tls_pins`` is what the
+    server registered (possibly none, from a server older than pinning).
+    """
+    sid = str(server_id or "").strip()
+    rec = get(sid) if sid else None
+    if not rec or rec.get("revoked"):
+        return {"server_id": sid, "registered": False, "tls_pins": []}
+    return {"server_id": sid, "registered": True,
+            "tls_pins": clean_tls_pins(rec.get("tls_pins"))}
