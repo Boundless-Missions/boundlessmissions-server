@@ -2039,9 +2039,10 @@ async def version_check(request: Request, hash: str = "", version: str = ""):
     # worse error.
     try:
         pver = policy.get_version()
+        peff = policy.get_effective_wc()
     except Exception as exc:
         log.warning("version_check: policy read failed (%s), serving the default.", exc)
-        pver = policy.DEFAULT_VERSION
+        pver, peff = policy.DEFAULT_VERSION, None
     if not cfg.KSP_VERSION_CHECK_ENABLED:
         # Gate disabled — never tell a client to update, but still advertise the
         # published DLL hash so the client can always confirm the expected build.
@@ -2056,9 +2057,10 @@ async def version_check(request: Request, hash: str = "", version: str = ""):
             latest_version=cfg_doc.get("latest_version"),
             latest_hash=(cfg_doc.get("latest_hash") or None),
             your_version=version or None,
-            policy_version=pver)
+            policy_version=pver, policy_effective_wc=peff)
     resp = mver.check(hash, version)
     resp["policy_version"] = pver
+    resp["policy_effective_wc"] = peff
     return VersionCheckResponse(**resp)
 
 

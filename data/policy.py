@@ -85,6 +85,28 @@ def get_version() -> int:
         return DEFAULT_VERSION
 
 
+def get_effective_wc() -> int | None:
+    """Unix seconds when the current version took effect, or None when unknown.
+
+    `version_since` when stamped; a document published before that field existed
+    falls back to `updated_at` — which is never EARLIER than the version's real
+    start (it only moves later on a re-save), so the fallback can only ask for
+    consent again, never skip it."""
+    cfg = get_config()
+    for key in ("version_since", "updated_at"):
+        raw = cfg.get(key)
+        if not raw:
+            continue
+        try:
+            dt = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return int(dt.timestamp())
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
 def set_version(version: int, updated_by: str, summary: str | None = None,
                 privacy_url: str | None = None, terms_url: str | None = None) -> dict:
     """Publish a new policy version. Bumping this forces every client that
@@ -94,6 +116,13 @@ def set_version(version: int, updated_by: str, summary: str | None = None,
     snap = ref.get()
     data = snap.to_dict() if snap.exists else {}
 
+    # When this version first took effect — stamped only when the number goes up, so
+    # editing the summary or a URL of the current version never moves it. A client
+    # consented before any server contact (it transmits nothing until it has) can
+    # only know the baseline number, but it showed the live policy link, so consent
+    # given on or after this moment counts for this version (get_effective_wc).
+    if int(version) > int(data.get("version") or 0) or not data.get("version_since"):
+        data["version_since"] = datetime.now(timezone.utc).isoformat()
     data["version"] = int(version)
     if summary is not None:
         data["summary"] = summary

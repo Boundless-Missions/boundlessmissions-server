@@ -290,6 +290,10 @@ class VersionCheckResponse(BaseModel):
     # this exceeds the version recorded in the client's consent.cfg, the mod
     # re-prompts the opt-in gate and stops transmitting until the player re-accepts.
     policy_version: Optional[int] = None
+    # Unix seconds when policy_version took effect (None: unknown). A fresh client's
+    # consent given at or after this counts for policy_version — it cannot have
+    # learned the number before consenting, since it transmits nothing until then.
+    policy_effective_wc: Optional[int] = None
 
 
 # ── User Profile ─────────────────────────────────────────────────────────────
