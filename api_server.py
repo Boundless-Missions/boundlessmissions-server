@@ -30,7 +30,7 @@ from pydantic import BaseModel, Field
 
 import settings
 from config import cfg
-from api_auth import AUD_KSP, AUD_WEB
+from api_auth import AUD_KSP, AUD_WEB, AUD_LAUNCHER
 from cost_guard import FirebaseBudgetExceeded, guard as cost_guard
 from api_auth import (
     validate_link_code, create_session_token, verify_session_token,
@@ -46,6 +46,7 @@ from api_auth import (
 from api_models import (
     MODLIST_MAX_LENGTH,
     LinkRequest, LinkResponse, PollRequest, DeviceStatusResponse,
+    LauncherLinkRequest, LauncherProfileSessionRequest,
     UserProfile,
     PreferencesUpdate,
     WebSignInRequest, WebSignInResponse, AccountProfile, ClaimUsernameRequest,
@@ -905,6 +906,13 @@ async def get_user_allow_suspended(authorization: str = Header(default="")) -> d
     The header is optional-with-default so a MISSING header is our 401, not
     FastAPI's 422 — the mod's session handling treats 401 as the single "this
     session is finished" signal, and every no-token shape must speak it."""
+    return await _verify_bearer(authorization, allow_launcher=False)
+
+
+async def _verify_bearer(authorization: str, *, allow_launcher: bool) -> dict:
+    """The bearer-token check under every auth dependency. A plain function, never a
+    dependency itself: `allow_launcher` must not be something a request can set (as a
+    dependency's parameter it would become a query parameter)."""
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Invalid authorization header")
     # Off the loop: on a token-version cache miss this is a blocking Firestore
@@ -925,6 +933,12 @@ async def get_user_allow_suspended(authorization: str = Header(default="")) -> d
                             detail="Sign-in is temporarily unavailable. Try again shortly.")
     if user is None:
         raise HTTPException(status_code=401, detail="Invalid or expired token")
+    # A launcher token is accepted by `get_launcher_user` alone. Refusing it HERE,
+    # at the base every other dependency is built on (token-only, KSP, web), means
+    # no route — including one written later — can be opened with it by accident.
+    if user.get("aud") == AUD_LAUNCHER and not allow_launcher:
+        raise HTTPException(status_code=401,
+                            detail="This session belongs to the launcher. Sign in here separately.")
     return user
 
 
@@ -1170,6 +1184,8 @@ def _issue_link_token(result: dict, device_id: str = "", aud: str = AUD_KSP) -> 
     )
     if device_id and aud == AUD_KSP:
         add_allowed_device(result["user_id"], device_id)
+    elif device_id and aud == AUD_LAUNCHER:
+        add_allowed_device(result["user_id"], device_id, label="Boundless Missions launcher")
     return LinkResponse(
         status="ok",
         token=token,
@@ -1249,11 +1265,18 @@ async def _dm_login_approval(user_id: int, challenge_id: str, client_ip: str,
         when = datetime.now(TZ).strftime("%Y-%m-%d %H:%M")
         where = client_ip or "unknown"
         web = aud == AUD_WEB
-        what = "A web browser" if web else "A KSP client"
-        doing = "sign in to the website as you" if web else "sign in as you"
-        undo = "didn't try to sign in" if web else "didn't try to link KSP"
+        launcher = aud == AUD_LAUNCHER
+        what = ("A web browser" if web else
+                "The Boundless Missions launcher" if launcher else "A KSP client")
+        doing = ("sign in to the website as you" if web else
+                 "sign in as you (it can then sign your KSP profiles in)" if launcher
+                 else "sign in as you")
+        undo = ("didn't try to sign in" if web else
+                "didn't try to sign in to the launcher" if launcher else "didn't try to link KSP")
+        title = ("🔐 Approve Website Login" if web else
+                 "🔐 Approve Launcher Login" if launcher else "🔐 Approve KSP Login")
         e = discord.Embed(
-            title="🔐 Approve Website Login" if web else "🔐 Approve KSP Login",
+            title=title,
             description=(
                 f"{what} just entered your link code and wants to {doing}.\n\n"
                 f"**When:** {when}\n**From IP:** `{where}`\n\n"
@@ -1308,10 +1331,11 @@ async def auth_link_totp(req: TwoFactorLoginRequest, request: Request,
         twofa.resolve_login_challenge, req.challenge_id, req.code)
     if not account_id:
         raise HTTPException(status_code=401, detail=message)
-    if not payload:
+    if not payload or payload.get("aud", AUD_KSP) != AUD_KSP:
         # A challenge with no link result is a sign-in challenge, not a link one.
         # Completing it here would hand out a KSP session for a flow that never
-        # presented a link code.
+        # presented a link code. A launcher sign-in's challenge carries
+        # aud=launcher, and finishing it here would turn it into a KSP session.
         raise HTTPException(status_code=400,
                             detail="That code belongs to a different sign-in. Start again.")
 
@@ -1414,6 +1438,202 @@ async def auth_link_poll(req: PollRequest, request: Request,
     if state["state"] == "denied":
         raise HTTPException(status_code=403, detail="Login request was denied.")
     raise HTTPException(status_code=400, detail="Login request expired. Request a new link code.")
+
+
+# ── Launcher sign-in (BM Launcher) ──────────────────────────────────────────
+#
+# The launcher signs in with the same link code and the same second factor as the
+# mod (DM approval, panel approval or an authenticator), but under its own token
+# audience. A launcher token opens only `get_launcher_user` routes; everything else
+# refuses it at `_verify_bearer`. What it adds is one power: minting a fresh KSP
+# session for a profile it assembled, bound to that profile's own new device id, so
+# a new install is signed in without the player typing a code per profile — and
+# each profile is its own device in the account's list, revocable on its own.
+# No credential is ever copied between profiles.
+
+_LAUNCHER_DEVICE_RE = re.compile(r"^[0-9a-f]{32}$")
+# Sessions the launcher may mint per account per hour. A player making profiles
+# makes a handful; this only bounds a stolen launcher token.
+LAUNCHER_PROFILE_SESSIONS_PER_HOUR = 30
+
+
+def _launcher_device(device_id: str) -> str:
+    d = (device_id or "").strip().lower()
+    if not _LAUNCHER_DEVICE_RE.match(d):
+        raise HTTPException(status_code=400, detail="Missing or malformed device id.")
+    return d
+
+
+async def get_launcher_user(request: Request,
+                            authorization: str = Header(default=""),
+                            x_device_id: str = Header(default="", alias="X-Device-Id")) -> dict:
+    """The launcher's dependency: a launcher-audience token from a trusted device,
+    on an account that is not suspended."""
+    user = await _verify_bearer(authorization, allow_launcher=True)
+    _require_audience(user, AUD_LAUNCHER,
+                      "This session is not the launcher's. Sign in to the launcher again.",
+                      allow_legacy=False)
+    await asyncio.to_thread(enforce_not_suspended, user["user_id"])
+    _rate_limit(f"acct:{user['user_id']}", max_hits=600, window=60.0)
+    if cfg.KSP_DEVICE_BINDING_ENABLED and check_device(user["user_id"], x_device_id) != "ok":
+        # Same gate as the KSP tier: a launcher token turning up from another
+        # device id is a copied token until the owner says otherwise.
+        client_ip = _client_ip(request)
+        challenge_id, created = create_device_challenge(
+            user["guild_id"], user["user_id"], user["username"], x_device_id, client_ip)
+        if created:
+            await _dm_device_approval(user["user_id"], challenge_id, x_device_id, client_ip)
+        raise HTTPException(status_code=403, detail={
+            "code": "device_unverified",
+            "challenge_id": challenge_id,
+            "message": "A new device is using your account. Approve it from your Discord DM.",
+        })
+    return user
+
+
+@app.post("/api/v1/launcher/auth/link", response_model=LinkResponse)
+async def launcher_auth_link(req: LauncherLinkRequest, request: Request,
+                             x_device_id: str = Header(default="", alias="X-Device-Id")):
+    """Exchange a 6-digit link code for a launcher session (or a second-factor step).
+
+    The KSP link flow with three differences: no mod-hash gate (the launcher is not
+    the mod), the Terms must have been accepted in the launcher, and every token and
+    challenge is minted for the launcher audience."""
+    _guard_link_attempt(request)
+    if not req.terms_accepted:
+        raise HTTPException(status_code=400,
+                            detail="Accept the Terms and Privacy Policy in the launcher first.")
+    device_id = _launcher_device(x_device_id)
+
+    result = validate_link_code(req.code)
+    if result is None:
+        _note_failed_link_guess(_client_ip(request))
+        raise HTTPException(status_code=400, detail="Invalid or expired link code")
+
+    # The challenge carries the audience, so it can only be finished at
+    # /launcher/auth/totp (the KSP one refuses it, the website one refuses any link).
+    totp_challenge = await _maybe_totp_link_challenge({**result, "aud": AUD_LAUNCHER})
+    if totp_challenge:
+        return totp_challenge
+
+    if not cfg.KSP_2FA_ENABLED:
+        return _issue_link_token(result, device_id, aud=AUD_LAUNCHER)
+
+    client_ip = _client_ip(request)
+    panel = result.get("source") == SOURCE_PANEL
+    challenge_id = create_approval_challenge(
+        result["guild_id"], result["user_id"], result["username"], client_ip,
+        source=SOURCE_PANEL if panel else SOURCE_DISCORD, device_id=device_id,
+        aud=AUD_LAUNCHER)
+    if panel:
+        return LinkResponse(status="approval_required", challenge_id=challenge_id,
+                            approve_via="panel")
+    sent = await _dm_login_approval(result["user_id"], challenge_id, client_ip, aud=AUD_LAUNCHER)
+    if not sent:
+        raise HTTPException(
+            status_code=502,
+            detail="Couldn't DM your login approval. Enable DMs from server members in "
+                   "Discord, then request a new link code, or get one from your account "
+                   "page on the website and approve it there.",
+        )
+    log.info("LAUNCHER: login-approval challenge issued for %s", result["username"])
+    return LinkResponse(status="approval_required", challenge_id=challenge_id,
+                        approve_via="discord")
+
+
+@app.post("/api/v1/launcher/auth/link/poll", response_model=LinkResponse)
+async def launcher_auth_link_poll(req: PollRequest, request: Request,
+                                  x_device_id: str = Header(default="", alias="X-Device-Id")):
+    """Poll a launcher login approval; the token once the player approved."""
+    _rate_limit_ip("lpoll", request, max_hits=120, window=60.0)
+    _rate_limit("poll:global", max_hits=settings.KSP_POLL_RATELIMIT_GLOBAL, window=60.0)
+    device_id = _launcher_device(x_device_id)
+    # poll_approval refuses a challenge minted for another audience (reads as expired).
+    state = await asyncio.to_thread(poll_approval, req.challenge_id, AUD_LAUNCHER)
+    if state["state"] == "pending":
+        return LinkResponse(status="pending")
+    if state["state"] == "approved":
+        log.info("LAUNCHER: login approved for %s", state["username"])
+        return _issue_link_token(state, device_id, aud=AUD_LAUNCHER)
+    if state["state"] == "denied":
+        raise HTTPException(status_code=403, detail="Login request was denied.")
+    raise HTTPException(status_code=400, detail="Login request expired. Request a new link code.")
+
+
+@app.post("/api/v1/launcher/auth/totp", response_model=LinkResponse)
+async def launcher_auth_totp(req: TwoFactorLoginRequest, request: Request,
+                             x_device_id: str = Header(default="", alias="X-Device-Id")):
+    """Finish a launcher sign-in that stopped for an authenticator code."""
+    _rate_limit_ip("ltotp", request, max_hits=20, window=300.0)
+    device_id = _launcher_device(x_device_id)
+    account_id, message, payload = await asyncio.to_thread(
+        twofa.resolve_login_challenge, req.challenge_id, req.code)
+    if not account_id:
+        raise HTTPException(status_code=401, detail=message)
+    if not payload or payload.get("aud") != AUD_LAUNCHER:
+        raise HTTPException(status_code=400,
+                            detail="That code belongs to a different sign-in. Start again.")
+    result = {k: payload[k] for k in ("guild_id", "user_id", "username") if k in payload}
+    log.info("LAUNCHER: authenticator accepted for %s", account_id)
+    return _issue_link_token(result, device_id, aud=AUD_LAUNCHER)
+
+
+@app.get("/api/v1/launcher/me")
+async def launcher_me(user: dict = Depends(get_launcher_user)):
+    """Who the launcher is signed in as."""
+    acct = await asyncio.to_thread(accounts.get_account, str(user["user_id"]))
+    return {
+        "user_id": str(user["user_id"]),
+        "username": (acct or {}).get("username") or user["username"],
+        "display_name": (acct or {}).get("display_name") or user["username"],
+        "guild_id": str(user["guild_id"]),
+    }
+
+
+@app.post("/api/v1/launcher/profile-session")
+async def launcher_profile_session(body: LauncherProfileSessionRequest,
+                                   user: dict = Depends(get_launcher_user),
+                                   x_device_id: str = Header(default="", alias="X-Device-Id")):
+    """Mint a KSP session for a profile the launcher assembled.
+
+    The session is the same one a KSP link would produce — `_issue_ksp_link_token`,
+    so the account record and the corporation follow exactly as for a link — bound
+    to the profile's own device id, which is trusted and labelled. The launcher
+    writes the token to that profile's PluginData; nothing is shared with any other
+    profile. The mod's own consent screen still stands in game: this does not answer
+    it."""
+    uid = str(user["user_id"])
+    device_id = _launcher_device(body.device_id)
+    if device_id == (x_device_id or "").strip().lower():
+        raise HTTPException(status_code=400, detail="A profile needs its own device id.")
+    _rate_limit(f"launcher-mint:{uid}", max_hits=LAUNCHER_PROFILE_SESSIONS_PER_HOUR,
+                window=3600.0)
+    label = _device_label(body.label)
+    result = {"guild_id": str(user["guild_id"]), "user_id": uid, "username": user["username"]}
+    resp = await _issue_ksp_link_token(result, device_id)
+    await asyncio.to_thread(add_allowed_device, uid, device_id,
+                            f"{label} (via launcher)" if label else "Profile (via launcher)")
+    log.info("LAUNCHER: profile session minted for %s (device %s…)", uid, device_id[:8])
+    return {"token": resp.token, "user_id": uid, "username": resp.username,
+            "guild_id": str(resp.guild_id)}
+
+
+def _device_label(label: str) -> str:
+    """A device label as plain one-line text: control characters dropped, spaces
+    collapsed, 60 characters at most. It is shown in the account's device list."""
+    cleaned = "".join(ch for ch in (label or "") if ch.isprintable())
+    return " ".join(cleaned.split())[:60]
+
+
+@app.post("/api/v1/launcher/auth/logout")
+async def launcher_logout(user: dict = Depends(get_launcher_user),
+                          x_device_id: str = Header(default="", alias="X-Device-Id")):
+    """Sign this launcher out: its device stops being trusted, so its token (which
+    is stateless until it expires) is refused at the device gate from now on.
+    Profiles it signed in keep their own sessions — each is listed and removable."""
+    device_id = _launcher_device(x_device_id)
+    await asyncio.to_thread(remove_allowed_device, str(user["user_id"]), device_id)
+    return {"status": "ok"}
 
 
 # ── Device binding ───────────────────────────────────────────────────────────

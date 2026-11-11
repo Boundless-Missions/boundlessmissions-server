@@ -37,6 +37,12 @@ TOKEN_LIFETIME = 30 * 24 * 3600
 # 30-day life rather than logging everybody out at once.
 AUD_KSP = "ksp"
 AUD_WEB = "web"
+# The Boundless Missions launcher (BM Launcher). Its one power beyond reading who
+# it is signed in as is minting a fresh KSP session for a profile it assembled
+# (`/api/v1/launcher/profile-session`), so it is refused by every other dependency
+# — `get_user_allow_suspended` turns it away at the base — and accepted only by
+# `get_launcher_user`. Never legacy-accepted: it did not exist before audiences.
+AUD_LAUNCHER = "launcher"
 
 
 def _mask(code: str) -> str:
@@ -533,20 +539,23 @@ def _get_allowed_devices(user_id: str) -> set | None:
     return devices
 
 
-def add_allowed_device(user_id: str, device_id: str) -> None:
+def add_allowed_device(user_id: str, device_id: str, label: str = "") -> None:
     """Trust a device for this user (idempotent). Updates the in-process cache so
     the device's very next request passes without waiting for the cache TTL.
     Alongside the id, a device_meta entry records when trust was granted — that's
-    what the "your devices" listing shows, and what remove_allowed_device drops."""
+    what the "your devices" listing shows, and what remove_allowed_device drops.
+    `label` names what the device is when the server knows (the launcher, or a
+    profile the launcher signed in); a device the mod linked itself has none."""
     if not device_id:
         return
+    meta = {"added_at": datetime.now(timezone.utc).isoformat()}
+    if label:
+        meta["label"] = label
     _sessions_col().document(user_id).set({
         "allowed_devices": firestore.ArrayUnion([device_id]),
         # set(merge=True) treats nested dict keys as literal map keys (no field-
         # path parsing), so a raw device id is safe here; sibling entries survive.
-        "device_meta": {device_id: {
-            "added_at": datetime.now(timezone.utc).isoformat(),
-        }},
+        "device_meta": {device_id: meta},
     }, merge=True)
     base = _get_allowed_devices(user_id)
     if base is not None:
@@ -593,7 +602,8 @@ def list_devices(user_id: str) -> list[dict]:
     d = snap.to_dict() or {}
     meta = d.get("device_meta", {}) or {}
     return [
-        {"device_id": did, "added_at": (meta.get(did) or {}).get("added_at")}
+        {"device_id": did, "added_at": (meta.get(did) or {}).get("added_at"),
+         "label": (meta.get(did) or {}).get("label") or ""}
         for did in (d.get("allowed_devices", []) or [])
     ]
 

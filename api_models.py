@@ -11,6 +11,19 @@ from typing import Optional
 class LinkRequest(BaseModel):
     code: str = Field(..., min_length=6, max_length=6, description="6-digit link code from Discord")
 
+class LauncherLinkRequest(LinkRequest):
+    # The launcher shows the Terms and Privacy Policy before a code can be entered;
+    # this is its statement that the player accepted them. A launcher sign-in is
+    # then the same proof of consent a KSP link is (`_issue_ksp_link_token`).
+    terms_accepted: bool = False
+
+class LauncherProfileSessionRequest(BaseModel):
+    # The profile's own device id: what the launcher writes to its
+    # GameData/BoundlessMissions/PluginData/device.id (the mod's format, 32 hex).
+    device_id: str = Field(..., min_length=32, max_length=32)
+    # Shown in the account's device list ("Dev Universe (via launcher)").
+    label: str = Field("", max_length=60)
+
 class PollRequest(BaseModel):
     challenge_id: str = Field(..., description="Challenge id returned by the link step")
 
