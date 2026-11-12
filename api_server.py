@@ -84,6 +84,7 @@ from data import guild_config
 from data import mod_version as mver
 from data import mp_keys
 from data import mp_servers
+from data import mp_host_commands
 from data import blocks as blocks_db
 from data import mp_visibility
 from data import mp_profiles
@@ -10916,9 +10917,12 @@ async def mp_server_revoke(server_id: str, user: dict = Depends(get_user_token_o
         rec = await asyncio.to_thread(mp_servers.revoke, server_id, account_id)
     except mp_servers.MpServerError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
+
     except Exception:
         log.exception("mp server revoke failed for %s", server_id)
         raise HTTPException(status_code=503, detail="Could not revoke that server right now.")
+    # The agent's poll check is memoised; a revoke cuts it off now, not in a minute.
+    mp_host_commands.forget_credential(server_id)
     return {"server_id": rec["server_id"], "revoked": True}
 
 
@@ -10948,6 +10952,177 @@ async def mp_revoked_credentials(request: Request):
     except Exception:
         log.exception("mp revoked list read failed")
         raise HTTPException(status_code=503, detail="Revocation list unavailable.")
+
+
+# ── Remote host admin (ksp-mp-remote-host-admin.md) ───────────────────────────
+#
+#  The owner manages their own game server from the website; the server's agent
+#  (bm-hostd) PULLS signed commands over its service credential, so nothing on
+#  the host listens. Two halves:
+#
+#    - /api/v1/mp/host/*      the agent: long-poll + result, service credential;
+#    - /api/v1/web/mp/servers the owner: list, issue, history — website tier,
+#                             404 (never 403) for a server the caller does not
+#                             operate, like the admin console.
+#
+#  Commands are signed with the HOST-COMMAND key (`mp_keys.HOSTCMD_KEYS_DOC`),
+#  never the player key; its JWKS is a separate route the agent alone fetches.
+#  All of it is behind MULTIPLAYER_ENABLED like the rest of /mp.
+
+def _service_claims(authorization: str) -> dict:
+    token = authorization[7:].strip() if authorization[:7].lower() == "bearer " else ""
+    if not token:
+        raise HTTPException(status_code=401, detail="Service credential required.")
+    try:
+        return mp_keys.verify_service_credential(token)
+    except mp_keys.MpKeyError:
+        raise HTTPException(status_code=401, detail="Service credential refused.")
+
+
+@app.get("/api/v1/mp/host-cmd/jwks")
+async def mp_hostcmd_jwks(request: Request):
+    """The host-command key's PUBLIC half. Anonymous: public material, and the
+    agent must be able to fetch it before trusting anything. Fails closed (503)
+    for the same reason as `/mp/jwks`."""
+    _require_multiplayer()
+    _rate_limit_ip("mp_hostcmd_jwks_ip", request, max_hits=120, window=3600.0)
+    try:
+        return await asyncio.to_thread(mp_keys.hostcmd_jwks)
+    except Exception:
+        log.exception("mp host-command jwks read failed")
+        raise HTTPException(status_code=503, detail="Key set unavailable.")
+
+
+class HostPoll(BaseModel):
+    agent: dict = {}
+
+
+@app.post("/api/v1/mp/host/commands")
+async def mp_host_poll(body: HostPoll, authorization: str = Header(default="")):
+    """The agent's long-poll: report state, receive queued signed commands.
+
+    Held up to 25 s. Only the server's LIVE credential polls — a superseded one
+    (re-issued because it may be in someone else's hands) is 401.
+    """
+    _require_multiplayer()
+    claims = _service_claims(authorization)
+    server_id = str(claims.get("sub") or "")
+    live = await asyncio.to_thread(mp_host_commands.credential_is_live, server_id,
+                                   str(claims.get("jti") or ""))
+    if not live:
+        raise HTTPException(status_code=401, detail="Service credential refused.")
+    # A well-behaved agent polls about every 25 s; this only stops a loop.
+    _rate_limit(f"mp_host_poll:{server_id}", max_hits=600, window=3600.0)
+    mp_host_commands.note_agent(server_id, body.agent)
+    tokens = await mp_host_commands.wait_for_commands(server_id, timeout=25.0)
+    return {"commands": tokens}
+
+
+class HostResult(BaseModel):
+    cid: str = ""
+    ok: bool = False
+    error: str = ""
+    problems: list = []
+    result: dict | None = None
+
+
+@app.post("/api/v1/mp/host/commands/{cid}/result")
+async def mp_host_result(cid: str, body: HostResult, authorization: str = Header(default="")):
+    """The agent's result for a command issued to IT; anything else is ignored."""
+    _require_multiplayer()
+    claims = _service_claims(authorization)
+    server_id = str(claims.get("sub") or "")
+    if not await asyncio.to_thread(mp_host_commands.credential_is_live, server_id,
+                                   str(claims.get("jti") or "")):
+        raise HTTPException(status_code=401, detail="Service credential refused.")
+    _rate_limit(f"mp_host_result:{server_id}", max_hits=120, window=600.0)
+    try:
+        stored = await asyncio.to_thread(mp_host_commands.complete, server_id, cid,
+                                         body.model_dump())
+    except Exception:
+        log.exception("mp host result write failed for %s", cid)
+        raise HTTPException(status_code=503, detail="Could not record the result.")
+    return {"recorded": bool(stored)}
+
+
+@app.get("/api/v1/web/mp/servers")
+async def web_mp_servers(user: dict = Depends(get_web_user)):
+    """The caller's own servers, with each one's admin-agent state."""
+    _require_multiplayer()
+    account_id = str(user["user_id"])
+    try:
+        return {"servers": await asyncio.to_thread(mp_host_commands.servers_for, account_id)}
+    except Exception:
+        log.exception("web mp server list failed for %s", account_id)
+        raise HTTPException(status_code=503, detail="Could not read your servers right now.")
+
+
+class HostCommandRequest(BaseModel):
+    cmd: str
+    args: dict = {}
+    # Only for actions that need step-up (service.stop): a TOTP or recovery
+    # code, checked here and spent — so `step_up` in the signed command means
+    # "this person proved it just now", not "the browser said so".
+    totp_code: str = ""
+
+
+@app.post("/api/v1/web/mp/servers/{server_id}/commands")
+async def web_mp_issue(server_id: str, body: HostCommandRequest,
+                       user: dict = Depends(get_web_user)):
+    _require_multiplayer()
+    account_id = str(user["user_id"])
+    _rate_limit(f"mp_host_issue:{account_id}", max_hits=60, window=600.0)
+    step_up = False
+    if body.cmd in mp_host_commands.STEP_UP_ACTIONS:
+        if not await asyncio.to_thread(twofa.is_enabled, account_id):
+            raise HTTPException(status_code=403, detail=(
+                "Stopping a server remotely needs two-factor authentication on your "
+                "account. Turn it on under Account → Security, or restart instead."))
+        code = "".join(ch for ch in body.totp_code if not ch.isspace())[:32]
+        ok, msg = await asyncio.to_thread(twofa.verify, account_id, code) if code \
+            else (False, "Enter your two-factor code to confirm.")
+        if not ok:
+            raise HTTPException(status_code=403, detail=msg)
+        step_up = True
+    try:
+        row = await asyncio.to_thread(mp_host_commands.issue, server_id, account_id,
+                                      body.cmd, body.args, step_up=step_up)
+    except mp_host_commands.HostCmdNotFound:
+        raise HTTPException(status_code=404, detail="Not found.")
+    except mp_host_commands.HostCmdError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    except Exception:
+        log.exception("mp host command issue failed for %s", server_id)
+        raise HTTPException(status_code=503, detail="Could not send that right now.")
+    mp_host_commands._wake(server_id)
+    return {"command": mp_host_commands._present(row)}
+
+
+@app.get("/api/v1/web/mp/servers/{server_id}/commands")
+async def web_mp_history(server_id: str, user: dict = Depends(get_web_user)):
+    _require_multiplayer()
+    try:
+        rows = await asyncio.to_thread(mp_host_commands.history, server_id,
+                                       str(user["user_id"]))
+    except mp_host_commands.HostCmdNotFound:
+        raise HTTPException(status_code=404, detail="Not found.")
+    except Exception:
+        log.exception("mp host history failed for %s", server_id)
+        raise HTTPException(status_code=503, detail="Could not read the history right now.")
+    return {"commands": rows}
+
+
+@app.get("/api/v1/web/mp/servers/{server_id}/commands/{cid}")
+async def web_mp_command(server_id: str, cid: str, user: dict = Depends(get_web_user)):
+    _require_multiplayer()
+    try:
+        return {"command": await asyncio.to_thread(
+            mp_host_commands.get_result, server_id, str(user["user_id"]), cid)}
+    except mp_host_commands.HostCmdNotFound:
+        raise HTTPException(status_code=404, detail="Not found.")
+    except Exception:
+        log.exception("mp host command read failed for %s", cid)
+        raise HTTPException(status_code=503, detail="Could not read that right now.")
 
 
 # ── Presence: visibility, blocks and identity resolution ──────────────────────

@@ -95,15 +95,32 @@ ALLOW_SET_TTL_SECONDS = 15 * 60
 # as a backstop for a rotation performed by another process.
 _CACHE_TTL = 60.0
 _cache_lock = threading.Lock()
-_cache: dict = {"at": 0.0, "doc": None}
+#: One cache entry per key document: the player/credential key and the
+#: host-command key (`ksp-mp-remote-host-admin.md` §2.3) rotate independently.
+_caches: dict = {}
+
+#: The player-token / service-credential key.
+KEYS_DOC = "mp_signing_keys"
+#: The remote-admin command key. A DIFFERENT key on purpose: domain separation
+#: by key, not only by claim — a leak or misuse of one signs nothing the other
+#: domain accepts, and the host agent fetches only this one's JWKS.
+HOSTCMD_KEYS_DOC = "mp_hostcmd_keys"
+
+# ── Kept in sync with common/hostcmd.py in the Multiplayer-Server repo ───────
+HOSTCMD_TYPE = "bm-host-cmd/1"
+HOSTCMD_TTL_SECONDS = 90          # the verifier caps exp - iat at 120
+HOSTCMD_ACTIONS = ("status", "settings.get", "settings.set", "modset.set",
+                   "service.reload", "service.restart", "service.stop", "service.start")
+HOSTCMD_STEP_UP_ACTIONS = frozenset({"service.stop"})
+# ─────────────────────────────────────────────────────────────────────────────
 
 
 class MpKeyError(RuntimeError):
     pass
 
 
-def _doc():
-    return _db.collection("config").document("mp_signing_keys")
+def _doc(name: str = KEYS_DOC):
+    return _db.collection("config").document(name)
 
 
 def _now_iso() -> str:
@@ -176,27 +193,29 @@ def _public_jwk(entry: dict) -> dict:
     }
 
 
-def invalidate() -> None:
+def invalidate(name: str | None = None) -> None:
+    """Drop the cached key document (``name``), or every one."""
     with _cache_lock:
-        _cache["doc"] = None
-        _cache["at"] = 0.0
+        if name is None:
+            _caches.clear()
+        else:
+            _caches.pop(name, None)
 
 
-def _read(*, fresh: bool = False) -> dict:
+def _read(*, fresh: bool = False, name: str = KEYS_DOC) -> dict:
     if not fresh:
         with _cache_lock:
-            doc, at = _cache["doc"], float(_cache["at"])
+            doc, at = _caches.get(name, (None, 0.0))
         if doc is not None and (time.time() - at) < _CACHE_TTL:
             return doc
-    snap = _doc().get()
+    snap = _doc(name).get()
     data = snap.to_dict() if snap.exists else {}
     with _cache_lock:
-        _cache["doc"] = data
-        _cache["at"] = time.time()
+        _caches[name] = (data, time.time())
     return data
 
 
-def get_keyset(*, at_wc: float | None = None) -> dict:
+def get_keyset(*, at_wc: float | None = None, name: str = KEYS_DOC) -> dict:
     """The live key set, creating or rotating it if due.
 
     Rotation is **lazy, on read**, rather than a scheduled job. That is the same
@@ -207,15 +226,15 @@ def get_keyset(*, at_wc: float | None = None) -> dict:
     that signs nothing is a key nobody is verifying against.
     """
     now = float(at_wc if at_wc is not None else time.time())
-    data = _read()
+    data = _read(name=name)
     current = data.get("current")
 
     if not current or "pem" not in current:
         current = _new_key_entry(now)
         data = {"current": current, "rotated_at": _now_iso()}
-        _doc().set(data)
-        invalidate()
-        log.info("minted the first multiplayer signing key (kid=%s)", current["kid"])
+        _doc(name).set(data)
+        invalidate(name)
+        log.info("minted the first %s key (kid=%s)", name, current["kid"])
         return data
 
     if now - float(current.get("created_wc", 0.0)) >= SIGNING_KEY_LIFETIME_SECONDS:
@@ -229,14 +248,14 @@ def get_keyset(*, at_wc: float | None = None) -> dict:
             "previous": current,
             "rotated_at": _now_iso(),
         }
-        _doc().set(data)
-        invalidate()
-        log.info("rotated the multiplayer signing key (new kid=%s, previous=%s)",
-                 data["current"]["kid"], current["kid"])
+        _doc(name).set(data)
+        invalidate(name)
+        log.info("rotated the %s key (new kid=%s, previous=%s)",
+                 name, data["current"]["kid"], current["kid"])
     return data
 
 
-def jwks(*, at_wc: float | None = None) -> dict:
+def jwks(*, at_wc: float | None = None, name: str = KEYS_DOC) -> dict:
     """Public keys, in the shape a JWKS endpoint publishes.
 
     Public material only, built from the private keys rather than stored
@@ -244,7 +263,7 @@ def jwks(*, at_wc: float | None = None) -> dict:
     private field could be served. Both keys appear whenever a previous one
     exists.
     """
-    data = get_keyset(at_wc=at_wc)
+    data = get_keyset(at_wc=at_wc, name=name)
     keys = [_public_jwk(data["current"])]
     prev = data.get("previous")
     if prev and "pem" in prev:
@@ -480,6 +499,72 @@ def mint_allow_set_token(
         "salt": _b64u(salt),
         "allow": sorted({_allow_hash(salt, a) for a in allow_accounts if a}),
         "block": sorted({_allow_hash(salt, a) for a in block_accounts if a}),
+    }
+    token = jwt.encode(claims, entry["pem"], algorithm=ALGORITHM,
+                       headers={"kid": entry["kid"]})
+    return token, expires
+
+
+def hostcmd_jwks(*, at_wc: float | None = None) -> dict:
+    """The host-command key's public half, for `bm-hostd` (and nothing else)."""
+    return jwks(at_wc=at_wc, name=HOSTCMD_KEYS_DOC)
+
+
+def mint_host_command(
+    *,
+    server_id: str,
+    actor_account: str,
+    cid: str,
+    cmd: str,
+    args: dict,
+    seq: int,
+    step_up: bool = False,
+    ttl_seconds: int = HOSTCMD_TTL_SECONDS,
+    at_wc: float | None = None,
+) -> tuple[str, int]:
+    """Sign one remote-admin command for one server. Returns ``(token, expires_wc)``.
+
+    `ksp-mp-remote-host-admin.md` §2.3. Verified OFFLINE on the host by
+    `common/hostcmd.py::verify_host_command`, which checks every claim below —
+    kept in sync by comment, not shared code, for the same reason as the
+    player token. ``aud`` is the one server it may run on, ``seq`` is the
+    per-server counter the host's replay guard requires to increase, and the
+    lifetime is short because a queued "restart" the owner forgot about must
+    not fire tomorrow.
+
+    The caller (`data/mp_host_commands.py`) has already checked who may issue
+    it; this only refuses what no caller may ask for.
+    """
+    server_id = str(server_id or "").strip()
+    if not server_id:
+        raise MpKeyError("a host command needs a server")
+    if cmd not in HOSTCMD_ACTIONS:
+        raise MpKeyError(f"unknown host action {cmd!r}")
+    if cmd in HOSTCMD_STEP_UP_ACTIONS and not step_up:
+        raise MpKeyError(f"{cmd} needs a fresh two-factor confirmation")
+    if not isinstance(args, dict):
+        raise MpKeyError("host command args must be an object")
+    if int(seq) <= 0:
+        raise MpKeyError("host command seq must be positive")
+    if not 0 < ttl_seconds <= 120:
+        raise MpKeyError("host command lifetime must be 1-120 s")
+
+    now = float(at_wc if at_wc is not None else time.time())
+    entry = get_keyset(at_wc=now, name=HOSTCMD_KEYS_DOC)["current"]
+    expires = int(now + ttl_seconds)
+    claims = {
+        "iss": ISSUER,
+        "aud": server_id,
+        "sub": str(actor_account),
+        "typ": HOSTCMD_TYPE,
+        "cid": str(cid),
+        "cmd": cmd,
+        "args": args,
+        "seq": int(seq),
+        "nonce": uuid.uuid4().hex,
+        "iat": int(now),
+        "exp": expires,
+        "step_up": bool(step_up),
     }
     token = jwt.encode(claims, entry["pem"], algorithm=ALGORITHM,
                        headers={"kid": entry["kid"]})
