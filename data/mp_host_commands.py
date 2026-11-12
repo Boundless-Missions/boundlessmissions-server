@@ -65,8 +65,20 @@ STEP_UP_ACTIONS = mp_keys.HOSTCMD_STEP_UP_ACTIONS
 #: Actions that interrupt players. Rate-limited on their own, so a runaway UI
 #: or a stolen session cannot turn a server into a restart loop.
 DISRUPTIVE_ACTIONS = frozenset({"service.restart", "service.stop"})
+#: Change nothing on the host. Counted against their own, larger budget, so a
+#: page browsing graphs cannot use up the allowance that guards edits/restarts.
+READ_ACTIONS = frozenset({"status", "settings.get", "metrics.get"})
 
-RATE_ALL = (30, 600.0)          # 30 commands / server / 10 min
+#: Not written to Firestore at all: no audit row, no history entry. A usage
+#: chart refreshing every 30 s would otherwise cost ~4 writes per refresh for a
+#: read with nothing to audit. Kept in memory for the browser to collect.
+EPHEMERAL_ACTIONS = frozenset({"metrics.get"})
+#: The per-server seq is reserved in blocks and written once per block (the
+#: agent only needs it to increase, so a restart skipping ahead is harmless).
+SEQ_BLOCK = 1000
+
+RATE_ALL = (30, 600.0)          # 30 changing commands / server / 10 min
+RATE_READS = (240, 600.0)       # 240 reads / server / 10 min (a graph refresh is one)
 RATE_DISRUPTIVE = (5, 3600.0)   # 5 restarts+stops / server / hour
 #: An agent that has not polled for this long is reported offline.
 AGENT_STALE_SECONDS = 90.0
@@ -104,13 +116,15 @@ _agents: dict[str, dict] = {}               # server_id -> {"state": {...}, "see
 _results: dict[str, dict] = {}              # cid -> {"server_id", "result", "at"}
 _issued: dict[str, deque] = {}              # server_id -> deque[(t, cmd)]
 _events: dict[str, asyncio.Event] = {}
+_seq: dict[str, list[int]] = {}             # server_id -> [next to hand out, reserved up to]
+_ephemeral: dict[str, dict] = {}            # cid -> in-memory row for EPHEMERAL_ACTIONS
 _loop: asyncio.AbstractEventLoop | None = None
 
 
 def _reset_for_tests() -> None:
     global _loop
     with _lock:
-        for d in (_pending, _agents, _results, _issued, _events, _live):
+        for d in (_pending, _agents, _results, _issued, _events, _live, _seq, _ephemeral):
             d.clear()
     _loop = None
 
@@ -189,6 +203,11 @@ async def wait_for_commands(server_id: str, timeout: float = 25.0) -> list[str]:
             pass
         items = _take(server_id)
     for i in items:
+        if i.get("ephemeral"):
+            with _lock:
+                if i["cid"] in _ephemeral:
+                    _ephemeral[i["cid"]]["state"] = "delivered"
+            continue
         try:
             await asyncio.to_thread(
                 lambda cid=i["cid"]: _col().document(cid).update({"state": "delivered"}))
@@ -203,6 +222,22 @@ async def wait_for_commands(server_id: str, timeout: float = 25.0) -> list[str]:
 def complete(server_id: str, cid: str, outcome: dict) -> bool:
     """Record the agent's result. Only for a cid issued TO this server."""
     server_id, cid = str(server_id), str(cid)
+    with _lock:
+        eph = _ephemeral.get(cid)
+    if eph is not None:
+        if eph["server_id"] != server_id or eph["state"] in ("done", "failed"):
+            return False
+        ok = outcome.get("ok") is True
+        result = outcome.get("result") if isinstance(outcome.get("result"), dict) else None
+        if result is not None and len(json.dumps(result, default=str)) > 512 * 1024:
+            result = {"note": "result too large to relay"}
+        with _lock:
+            eph.update(state="done" if ok else "failed",
+                       error=str(outcome.get("error") or "")[:500],
+                       problems=[str(p)[:500] for p in (outcome.get("problems") or [])][:20],
+                       finished_at=_now_iso())
+            _results[cid] = {"server_id": server_id, "result": result, "at": time.time()}
+        return True
     doc = _col().document(cid)
     snap = doc.get()
     rec = snap.to_dict() if snap.exists else None
@@ -303,6 +338,28 @@ def _clean_args(cmd: str, args: dict) -> dict:
         if not isinstance(modset, (dict, str)):
             raise HostCmdError("Upload the modset.json exported from your install.")
         return {"modset": modset}
+    if cmd == "metrics.get":
+        out = {}
+        for k in ("from", "to", "max_points"):
+            v = args.get(k)
+            if v is None:
+                continue
+            if isinstance(v, bool) or not isinstance(v, (int, float)):
+                raise HostCmdError("The time range must be numbers.")
+            out[k] = v
+        return out
+    if cmd == "metrics.set":
+        out = {}
+        for k, kind in (("enabled", bool), ("clear", bool), ("retention_days", int)):
+            v = args.get(k)
+            if v is None:
+                continue
+            if not isinstance(v, kind) or (kind is int and isinstance(v, bool)):
+                raise HostCmdError(f"{k} has the wrong type.")
+            out[k] = v
+        if not out:
+            raise HostCmdError("Nothing to change.")
+        return out
     if cmd in ("service.restart", "service.stop"):
         warn = args.get("warn_seconds", DEFAULT_WARN_SECONDS)
         if isinstance(warn, bool) or not isinstance(warn, int) \
@@ -319,8 +376,10 @@ def _rate_check(server_id: str, cmd: str) -> None:
         q = _issued.setdefault(server_id, deque())
         while q and now - q[0][0] > max(RATE_ALL[1], RATE_DISRUPTIVE[1]):
             q.popleft()
-        recent = [c for t, c in q if now - t <= RATE_ALL[1]]
-        if len(recent) >= RATE_ALL[0]:
+        reads = cmd in READ_ACTIONS
+        limit, window = RATE_READS if reads else RATE_ALL
+        recent = [c for t, c in q if now - t <= window and (c in READ_ACTIONS) == reads]
+        if len(recent) >= limit:
             raise HostCmdError("Too many commands to this server. Wait a few minutes.")
         if cmd in DISRUPTIVE_ACTIONS:
             n = sum(1 for t, c in q if c in DISRUPTIVE_ACTIONS and now - t <= RATE_DISRUPTIVE[1])
@@ -357,10 +416,19 @@ def issue(server_id: str, actor: str, cmd: str, args: dict | None = None,
 
     with _lock:
         # The seq lives on the server row so it survives a bot restart; the
-        # agent refuses anything not above the last one it ran. One bot
-        # process, so the lock is the serialisation.
-        seq = int(rec.get("hostcmd_seq") or 0) + 1
-        mp_servers._col().document(server_id).update({"hostcmd_seq": seq})
+        # agent refuses anything not above the last one it ran. Reserved in
+        # blocks so a command does not cost a write; after a restart the next
+        # block starts above everything the old process could have issued.
+        # One bot process, so the lock is the serialisation.
+        cur = _seq.get(server_id)
+        if cur is None or cur[0] > cur[1]:
+            base = int(rec.get("hostcmd_seq") or 0) if cur is None else cur[1]
+            reserved = base + SEQ_BLOCK
+            mp_servers._col().document(server_id).update({"hostcmd_seq": reserved})
+            rec["hostcmd_seq"] = reserved
+            cur = _seq[server_id] = [base + 1, reserved]
+        seq = cur[0]
+        cur[0] += 1
     cid = "hc_" + secrets.token_hex(10)
     token, expires = mp_keys.mint_host_command(
         server_id=server_id, actor_account=actor, cid=cid, cmd=cmd, args=clean,
@@ -374,10 +442,18 @@ def issue(server_id: str, actor: str, cmd: str, args: dict | None = None,
         "expires_wc": expires, "state": "pending", "error": "", "problems": [],
         "finished_at": None,
     }
-    _col().document(cid).set(row)
+    ephemeral = cmd in EPHEMERAL_ACTIONS
+    if ephemeral:
+        with _lock:
+            _ephemeral[cid] = dict(row)
+            for k in [k for k, v in _ephemeral.items()
+                      if time.time() - float(v.get("expires_wc") or 0) > RESULT_TTL_SECONDS]:
+                _ephemeral.pop(k, None)
+    else:
+        _col().document(cid).set(row)
     with _lock:
         _pending.setdefault(server_id, []).append(
-            {"cid": cid, "token": token, "expires_wc": expires})
+            {"cid": cid, "token": token, "expires_wc": expires, "ephemeral": ephemeral})
     log.info("host command %s %s -> %s by %s (seq %d)", cid, cmd, server_id, actor, seq)
     return row
 
@@ -395,8 +471,13 @@ def _present(row: dict) -> dict:
 def get_result(server_id: str, actor: str, cid: str) -> dict:
     """One command, with the full result while it is still in memory."""
     _owned(server_id, actor)
-    snap = _col().document(str(cid)).get()
-    row = snap.to_dict() if snap.exists else None
+    with _lock:
+        eph = _ephemeral.get(str(cid))
+    if eph is not None:
+        row = dict(eph)
+    else:
+        snap = _col().document(str(cid)).get()
+        row = snap.to_dict() if snap.exists else None
     if not row or row.get("server_id") != str(server_id):
         raise HostCmdNotFound("No such command.")
     out = _present(row)
