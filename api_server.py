@@ -85,6 +85,7 @@ from data import mod_version as mver
 from data import mp_keys
 from data import mp_servers
 from data import mp_host_commands
+from data import testers
 from data import blocks as blocks_db
 from data import mp_visibility
 from data import mp_profiles
@@ -11045,8 +11046,37 @@ async def mp_host_result(cid: str, body: HostResult, authorization: str = Header
     return {"recorded": bool(stored)}
 
 
+async def get_server_operator(user: dict = Depends(get_web_user)) -> dict:
+    """Who may use the server-management page: the owner, mapped guild admins,
+    and accounts on the owner's tester list (`data/testers.py`). 404 for
+    everyone else — the page is not open yet, so it should be invisible rather
+    than merely closed, the same posture as the admin console.
+
+    Registering a server (`POST /api/v1/mp/servers`) stays open to every
+    account by design; only managing one from the website is gated here.
+    Ownership of each server is still checked per call on top of this.
+    """
+    uid = user.get("user_id")
+    if _is_owner_id(uid):
+        user["server_access"] = "owner"
+    elif await asyncio.to_thread(testers.is_tester, uid):
+        user["server_access"] = "tester"
+    elif _admin_role_guild_ids(uid):
+        user["server_access"] = "admin"
+    else:
+        raise HTTPException(status_code=404, detail="Not found.")
+    return user
+
+
+@app.get("/api/v1/web/mp/access")
+async def web_mp_access(user: dict = Depends(get_server_operator)):
+    """The header's cheap probe: 200 → draw the Servers link, 404 → don't."""
+    _require_multiplayer()
+    return {"servers": True, "access": user["server_access"]}
+
+
 @app.get("/api/v1/web/mp/servers")
-async def web_mp_servers(user: dict = Depends(get_web_user)):
+async def web_mp_servers(user: dict = Depends(get_server_operator)):
     """The caller's own servers, with each one's admin-agent state."""
     _require_multiplayer()
     account_id = str(user["user_id"])
@@ -11068,7 +11098,7 @@ class HostCommandRequest(BaseModel):
 
 @app.post("/api/v1/web/mp/servers/{server_id}/commands")
 async def web_mp_issue(server_id: str, body: HostCommandRequest,
-                       user: dict = Depends(get_web_user)):
+                       user: dict = Depends(get_server_operator)):
     _require_multiplayer()
     account_id = str(user["user_id"])
     _rate_limit(f"mp_host_issue:{account_id}", max_hits=60, window=600.0)
@@ -11099,7 +11129,7 @@ async def web_mp_issue(server_id: str, body: HostCommandRequest,
 
 
 @app.get("/api/v1/web/mp/servers/{server_id}/commands")
-async def web_mp_history(server_id: str, user: dict = Depends(get_web_user)):
+async def web_mp_history(server_id: str, user: dict = Depends(get_server_operator)):
     _require_multiplayer()
     try:
         rows = await asyncio.to_thread(mp_host_commands.history, server_id,
@@ -11113,7 +11143,7 @@ async def web_mp_history(server_id: str, user: dict = Depends(get_web_user)):
 
 
 @app.get("/api/v1/web/mp/servers/{server_id}/commands/{cid}")
-async def web_mp_command(server_id: str, cid: str, user: dict = Depends(get_web_user)):
+async def web_mp_command(server_id: str, cid: str, user: dict = Depends(get_server_operator)):
     _require_multiplayer()
     try:
         return {"command": await asyncio.to_thread(
@@ -11930,6 +11960,54 @@ async def admin_whoami(user: dict = Depends(get_admin)):
         "user_id": user["user_id"],
         "username": user["username"],
     }
+
+
+# ── Testers (owner) ───────────────────────────────────────────────────────────
+#  Accounts with early access to surfaces not open to everyone yet: today the
+#  multiplayer server-management page. `data/testers.py`.
+
+def _tester_row(row: dict) -> dict:
+    acct = accounts.get_account(row["account_id"]) or {}
+    return {**row, "username": acct.get("username") or "",
+            "display_name": acct.get("display_name") or ""}
+
+
+@app.get("/api/v1/web/admin/testers")
+async def admin_testers(user: dict = Depends(get_owner)):
+    rows = await asyncio.to_thread(testers.list_testers)
+    return {"testers": [await asyncio.to_thread(_tester_row, r) for r in rows],
+            "max": testers.MAX_TESTERS}
+
+
+class TesterAdd(BaseModel):
+    username: str
+    note: str = ""
+
+
+@app.post("/api/v1/web/admin/testers")
+async def admin_tester_add(body: TesterAdd, user: dict = Depends(get_owner)):
+    """Add by Boundless username — the immutable handle, so a rename cannot move
+    tester access to someone else."""
+    name = (body.username or "").strip().lstrip("@")
+    account_id = await asyncio.to_thread(accounts.account_for_username, name) if name else None
+    if not account_id:
+        raise HTTPException(status_code=404, detail="No account has that username.")
+    try:
+        row = await asyncio.to_thread(testers.add, account_id, note=body.note,
+                                      by=str(user["user_id"]))
+    except testers.TesterError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    _admin_audit(user, "tester.add", f"{name} ({account_id})")
+    return {"tester": await asyncio.to_thread(_tester_row, row)}
+
+
+@app.delete("/api/v1/web/admin/testers/{account_id}")
+async def admin_tester_remove(account_id: str, user: dict = Depends(get_owner)):
+    removed = await asyncio.to_thread(testers.remove, account_id, by=str(user["user_id"]))
+    if not removed:
+        raise HTTPException(status_code=404, detail="Not a tester.")
+    _admin_audit(user, "tester.remove", account_id)
+    return {"removed": True}
 
 
 @app.get("/api/v1/web/admin/overview")
