@@ -70,12 +70,13 @@ STEP_UP_ACTIONS = mp_keys.HOSTCMD_STEP_UP_ACTIONS
 DISRUPTIVE_ACTIONS = frozenset({"service.restart", "service.stop"})
 #: Change nothing on the host. Counted against their own, larger budget, so a
 #: page browsing graphs cannot use up the allowance that guards edits/restarts.
-READ_ACTIONS = frozenset({"status", "settings.get", "metrics.get"})
+READ_ACTIONS = frozenset({"status", "settings.get", "metrics.get", "modset.get",
+                          "files.inspect"})
 
 #: Not written to Firestore at all: no audit row, no history entry. A usage
 #: chart refreshing every 30 s would otherwise cost ~4 writes per refresh for a
 #: read with nothing to audit. Kept in memory for the browser to collect.
-EPHEMERAL_ACTIONS = frozenset({"metrics.get"})
+EPHEMERAL_ACTIONS = frozenset({"metrics.get", "modset.get", "files.inspect"})
 #: The per-server seq is reserved in blocks and written once per block (the
 #: agent only needs it to increase, so a restart skipping ahead is harmless).
 SEQ_BLOCK = 1000
@@ -365,6 +366,17 @@ def _clean_args(cmd: str, args: dict) -> dict:
                 raise HostCmdError("Tags must be a short list of names.")
             clean["tags"] = tags
         return {"base_hash": base, "listing": clean}
+    if cmd == "files.inspect":
+        url = args.get("url")
+        # A first look only; the agent applies the modset's exact rule
+        # (common/modset.py github_url_ok) before downloading anything.
+        if not isinstance(url, str) or len(url) > 300 or \
+                not url.startswith("https://github.com/") or "/releases/download/" not in url:
+            raise HostCmdError("Paste a GitHub release download link "
+                               "(github.com/…/releases/download/…).")
+        return {"url": url}
+    if cmd == "modset.get":
+        return {}
     if cmd == "metrics.get":
         out = {}
         for k in ("from", "to", "max_points"):

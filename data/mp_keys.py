@@ -111,7 +111,8 @@ HOSTCMD_TYPE = "bm-host-cmd/1"
 HOSTCMD_TTL_SECONDS = 90          # the verifier caps exp - iat at 120
 HOSTCMD_ACTIONS = ("status", "settings.get", "settings.set", "modset.set",
                    "service.reload", "service.restart", "service.stop", "service.start",
-                   "metrics.get", "metrics.set", "listing.set")
+                   "metrics.get", "metrics.set", "listing.set", "modset.get",
+                   "files.inspect")
 HOSTCMD_STEP_UP_ACTIONS = frozenset({"service.stop"})
 # ─────────────────────────────────────────────────────────────────────────────
 
