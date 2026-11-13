@@ -12,6 +12,7 @@ import hashlib
 import io
 import logging
 import math
+import os
 import re
 import secrets
 import time
@@ -24,7 +25,7 @@ from fastapi import (
     WebSocket, WebSocketDisconnect,
 )
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
 from firebase_admin import firestore
 from pydantic import BaseModel, Field
 
@@ -86,6 +87,7 @@ from data import mp_keys
 from data import mp_servers
 from data import mp_host_commands
 from data import testers
+from data import mp_pairing
 from data import blocks as blocks_db
 from data import mp_visibility
 from data import mp_profiles
@@ -11153,6 +11155,142 @@ async def web_mp_command(server_id: str, cid: str, user: dict = Depends(get_serv
     except Exception:
         log.exception("mp host command read failed for %s", cid)
         raise HTTPException(status_code=503, detail="Could not read that right now.")
+
+
+# ── Pairing, installer and releases (ksp-mp-remote-host-admin.md §12) ─────────
+#
+#  `curl -fsSL https://mainserver.boundlessmissions.com/api/v1/mp/install.sh | sudo bash`
+#  checks the VPS, asks for a pairing code (`data/mp_pairing.py`) and waits; the
+#  owner confirms the code on boundlessmissions.com → Servers; the installer
+#  receives its service credential directly and downloads the server release
+#  WITH it — so the (private) server code reaches registered servers only, and
+#  the installer script itself carries none.
+
+# Readable to the bot under ProtectSystem=strict and ProtectHome=yes alike.
+MP_RELEASE_DIR = os.getenv("MP_RELEASE_DIR", "/var/lib/bm-mp-releases")
+
+
+def _release_manifest() -> dict:
+    import json as _json
+    try:
+        with open(os.path.join(MP_RELEASE_DIR, "manifest.json"), encoding="utf-8") as fh:
+            m = _json.load(fh)
+        return m if isinstance(m, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+@app.get("/api/v1/mp/install.sh")
+async def mp_install_script(request: Request):
+    """The installer. Public: it holds no server code and no secret."""
+    _require_multiplayer()
+    _rate_limit_ip("mp_install_ip", request, max_hits=60, window=3600.0)
+    path = os.path.join(MP_RELEASE_DIR, "install.sh")
+    if not os.path.isfile(path):
+        raise HTTPException(status_code=404, detail="No installer is published yet.")
+    return FileResponse(path, media_type="text/x-shellscript",
+                        headers={"Cache-Control": "no-store"})
+
+
+class PairStart(BaseModel):
+    hostname: str = ""
+    os: str = ""
+    public_ip: str = ""
+    server_type: str = ""
+    name_hint: str = ""
+    installer: str = ""
+
+
+@app.post("/api/v1/mp/pair/start")
+async def mp_pair_start(body: PairStart, request: Request):
+    _require_multiplayer()
+    _rate_limit_ip("mp_pair_ip", request, max_hits=20, window=3600.0)
+    try:
+        return await asyncio.to_thread(mp_pairing.start, host=body.model_dump(),
+                                       observed_ip=_client_ip(request))
+    except mp_pairing.PairingError as exc:
+        raise HTTPException(status_code=429, detail=str(exc))
+
+
+class PairWait(BaseModel):
+    secret: str
+
+
+@app.post("/api/v1/mp/pair/{pair_id}/wait")
+async def mp_pair_wait(pair_id: str, body: PairWait):
+    """The installer's long-poll. Returns the credential exactly once."""
+    _require_multiplayer()
+    _rate_limit(f"mp_pair_wait:{pair_id[:32]}", max_hits=200, window=3600.0)
+    try:
+        return await mp_pairing.wait(pair_id, body.secret, timeout=25.0)
+    except mp_pairing.PairingNotFound:
+        raise HTTPException(status_code=404, detail="Unknown or expired pairing.")
+
+
+@app.get("/api/v1/web/mp/pair/{code}")
+async def web_mp_pair_lookup(code: str, user: dict = Depends(get_server_operator)):
+    """Which machine is asking — shown to the owner before they confirm."""
+    _require_multiplayer()
+    _rate_limit(f"mp_pair_lookup:{user['user_id']}", max_hits=20, window=600.0)
+    try:
+        return await asyncio.to_thread(mp_pairing.lookup, code)
+    except mp_pairing.PairingNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+
+
+class PairClaim(BaseModel):
+    name: str = ""
+
+
+@app.post("/api/v1/web/mp/pair/{code}")
+async def web_mp_pair_claim(code: str, body: PairClaim, user: dict = Depends(get_server_operator)):
+    _require_multiplayer()
+    account_id = str(user["user_id"])
+    _rate_limit(f"mp_pair_lookup:{account_id}", max_hits=20, window=600.0)
+    try:
+        return await asyncio.to_thread(mp_pairing.claim, code, account_id, body.name)
+    except mp_pairing.PairingNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except mp_servers.MpServerError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+def _live_service(authorization: str) -> dict:
+    claims = _service_claims(authorization)
+    if not mp_host_commands.credential_is_live(str(claims.get("sub") or ""),
+                                               str(claims.get("jti") or "")):
+        raise HTTPException(status_code=401, detail="Service credential refused.")
+    return claims
+
+
+@app.get("/api/v1/mp/host/release")
+async def mp_host_release(authorization: str = Header(default="")):
+    """The server code, for registered servers only (live service credential)."""
+    _require_multiplayer()
+    claims = await asyncio.to_thread(_live_service, authorization)
+    _rate_limit(f"mp_release:{claims.get('sub')}", max_hits=30, window=3600.0)
+    m = _release_manifest()
+    path = os.path.join(MP_RELEASE_DIR, str(m.get("file") or "server.tgz"))
+    if not m or os.path.sep in str(m.get("file") or "") or not os.path.isfile(path):
+        raise HTTPException(status_code=404, detail="No server release is published yet.")
+    return FileResponse(path, media_type="application/gzip", headers={
+        "X-Release-Version": str(m.get("version") or ""),
+        "X-Release-Sha256": str(m.get("sha256") or ""),
+        "Cache-Control": "no-store"})
+
+
+@app.post("/api/v1/mp/host/unregister")
+async def mp_host_unregister(authorization: str = Header(default="")):
+    """The installer's uninstall: the server withdraws its own registration."""
+    _require_multiplayer()
+    claims = await asyncio.to_thread(_live_service, authorization)
+    server_id = str(claims.get("sub") or "")
+    try:
+        await asyncio.to_thread(mp_servers.revoke, server_id, str(claims.get("operator") or ""))
+    except mp_servers.MpServerError:
+        raise HTTPException(status_code=404, detail="Not found.")
+    mp_host_commands.forget_credential(server_id)
+    return {"server_id": server_id, "revoked": True}
 
 
 # ── Presence: visibility, blocks and identity resolution ──────────────────────
