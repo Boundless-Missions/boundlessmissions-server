@@ -58,6 +58,7 @@ from datetime import datetime, timezone
 
 from data import mp_keys
 from data import mp_servers
+from data import geoip
 from data.store import _db
 
 log = logging.getLogger(__name__)
@@ -568,5 +569,7 @@ def servers_for(actor: str) -> list[dict]:
         s.pop("transition_jwk", None)
         s["agent"] = agent_state(s.get("server_id", ""))
         s["listing"] = None if s.get("revoked") else master_listing(s.get("server_id", ""))
+        addr = (s["listing"] or {}).get("address")
+        s["location"] = geoip.lookup(addr) if addr else None
         out.append(s)
     return out
