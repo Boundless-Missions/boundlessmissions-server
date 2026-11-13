@@ -48,7 +48,9 @@ import asyncio
 import hashlib
 import json
 import logging
+import os
 import secrets
+import urllib.request
 import threading
 import time
 from collections import deque
@@ -124,7 +126,8 @@ _loop: asyncio.AbstractEventLoop | None = None
 def _reset_for_tests() -> None:
     global _loop
     with _lock:
-        for d in (_pending, _agents, _results, _issued, _events, _live, _seq, _ephemeral):
+        for d in (_pending, _agents, _results, _issued, _events, _live, _seq, _ephemeral,
+                  _listing_cache):
             d.clear()
     _loop = None
 
@@ -150,7 +153,11 @@ def _wake(server_id: str) -> None:
 # ── the agent's side ─────────────────────────────────────────────────────────
 
 _AGENT_KEYS = ("remote_admin", "allow", "reason", "version", "active_state",
-               "players", "max_players")
+               "players", "max_players",
+               # live figures for the website's server panel (2026-11-13)
+               "vessels_active", "vessels_total", "bubbles_live", "server_type",
+               "universe_id", "started_wc", "store_bytes", "cpu_pct", "mem_bytes",
+               "host_mem_used", "host_mem_total", "host_load1", "cpu_count", "sample_t")
 
 
 def note_agent(server_id: str, state: dict | None) -> None:
@@ -338,6 +345,25 @@ def _clean_args(cmd: str, args: dict) -> dict:
         if not isinstance(modset, (dict, str)):
             raise HostCmdError("Upload the modset.json exported from your install.")
         return {"modset": modset}
+    if cmd == "listing.set":
+        base, listing = args.get("base_hash"), args.get("listing")
+        if not isinstance(base, str) or len(base) != 64 or not isinstance(listing, dict):
+            raise HostCmdError("Load the current settings before saving them.")
+        clean: dict = {}
+        for k in ("name", "summary", "description", "website", "discord", "thumbnail"):
+            v = listing.get(k)
+            if v is None:
+                continue
+            if not isinstance(v, str) or len(v) > 4000:
+                raise HostCmdError(f"{k} must be text.")
+            clean[k] = v
+        tags = listing.get("tags")
+        if tags is not None:
+            if not isinstance(tags, list) or len(tags) > 12 or \
+                    not all(isinstance(t, str) and len(t) <= 32 for t in tags):
+                raise HostCmdError("Tags must be a short list of names.")
+            clean["tags"] = tags
+        return {"base_hash": base, "listing": clean}
     if cmd == "metrics.get":
         out = {}
         for k in ("from", "to", "max_points"):
@@ -496,13 +522,51 @@ def history(server_id: str, actor: str, limit: int = 20) -> list[dict]:
     return [_present(r) for r in rows[:max(1, min(limit, HISTORY_LIMIT))]]
 
 
+#: The master (server listing). On the main VPS it runs beside the bot, so the
+#: default is loopback; MP_MASTER_URL points elsewhere (the public https URL works
+#: too). A failed read just leaves `listing` out.
+MASTER_URL = os.getenv("MP_MASTER_URL", "http://127.0.0.1:6700").rstrip("/")
+_LISTING_TTL = 20.0
+_listing_cache: dict[str, tuple[float, dict | None]] = {}
+_LISTING_KEYS = ("address", "port", "reachable", "players", "max_players", "tags",
+                 "description", "thumbnail", "blanked", "verified", "last_seen_wc",
+                 "mod_count")
+
+
+def master_listing(server_id: str) -> dict | None:
+    """This server's public listing on the master, or None (not listed / no master)."""
+    now = time.time()
+    with _lock:
+        hit = _listing_cache.get(server_id)
+    if hit and now - hit[0] < _LISTING_TTL:
+        return hit[1]
+    data = None
+    try:
+        with urllib.request.urlopen(f"{MASTER_URL}/v1/servers/{server_id}", timeout=2) as r:
+            raw = json.loads(r.read().decode("utf-8"))
+        if isinstance(raw, dict):
+            data = {k: raw.get(k) for k in _LISTING_KEYS}
+            thumb = data.get("thumbnail")
+            if isinstance(thumb, str) and thumb.startswith("/"):
+                data["thumbnail"] = PUBLIC_MASTER_URL + thumb
+    except Exception:
+        data = None
+    with _lock:
+        _listing_cache[server_id] = (now, data)
+    return data
+
+
+PUBLIC_MASTER_URL = os.getenv("MP_PUBLIC_MASTER_URL", "https://master.boundlessmissions.com")
+
+
 def servers_for(actor: str) -> list[dict]:
-    """The owner's servers, each with the agent's live state attached."""
+    """The owner's servers, each with the agent's live state and its listing."""
     out = []
     for s in mp_servers.list_for_account(actor):
         s = dict(s)
         s.pop("superseded_jtis", None)
         s.pop("transition_jwk", None)
         s["agent"] = agent_state(s.get("server_id", ""))
+        s["listing"] = None if s.get("revoked") else master_listing(s.get("server_id", ""))
         out.append(s)
     return out
