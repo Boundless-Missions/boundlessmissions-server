@@ -87,6 +87,7 @@ from data import mp_keys
 from data import mp_servers
 from data import mp_host_commands
 from data import testers
+from data import firstparty
 from data import mp_pairing
 from data import blocks as blocks_db
 from data import mp_visibility
@@ -11058,16 +11059,23 @@ def _server_operator(user: dict) -> dict:
     account by design; only managing one is gated here. Ownership of each server
     is still checked per call on top of this.
     """
-    uid = user.get("user_id")
-    if _is_owner_id(uid):
-        user["server_access"] = "owner"
-    elif testers.is_tester(uid):
-        user["server_access"] = "tester"
-    elif _admin_role_guild_ids(uid):
-        user["server_access"] = "admin"
-    else:
+    access = _server_access(user.get("user_id"))
+    if access is None:
         raise HTTPException(status_code=404, detail="Not found.")
+    user["server_access"] = access
     return user
+
+
+def _server_access(uid) -> Optional[str]:
+    """"owner" / "tester" / "admin" for the early-access group, else None. Shared by
+    server management and the launcher's testing release channel (one list)."""
+    if _is_owner_id(uid):
+        return "owner"
+    if testers.is_tester(uid):
+        return "tester"
+    if _admin_role_guild_ids(uid):
+        return "admin"
+    return None
 
 
 async def get_server_operator(user: dict = Depends(get_web_user)) -> dict:
@@ -11098,6 +11106,45 @@ async def get_web_or_launcher_user(request: Request,
 async def get_server_operator_any(user: dict = Depends(get_web_or_launcher_user)) -> dict:
     """Server management from the website or the launcher (list, commands)."""
     return await asyncio.to_thread(_server_operator, user)
+
+
+# ── First-party releases for the BM Launcher (bm-launcher.md §24) ──────────────
+#  The signed list the owner publishes with `BM Launcher/tools/publish_firstparty.py`.
+#  The launcher verifies every row against its compiled-in key; the bot only filters
+#  (testing rows → owner/admins/testers) and serves files named by a visible row.
+#  `data/firstparty.py`.
+
+FIRSTPARTY_DOWNLOADS_PER_HOUR = 60
+
+
+async def _firstparty_visible(user: dict) -> tuple:
+    """(visible (row, entry) pairs, whether testing rows are included)."""
+    pairs = await asyncio.to_thread(firstparty.load)
+    testing = (await asyncio.to_thread(_server_access, user.get("user_id"))) is not None
+    return firstparty.visible(pairs, testing), testing
+
+
+@app.get("/api/v1/launcher/releases")
+async def launcher_releases(user: dict = Depends(get_web_or_launcher_user)):
+    """The release rows this account may install, passed through byte for byte."""
+    _rate_limit(f"launcher-releases:{user['user_id']}", max_hits=120, window=3600.0)
+    pairs, testing = await _firstparty_visible(user)
+    return JSONResponse({"releases": [row for row, _ in pairs], "testing": testing},
+                        headers={"Cache-Control": "private, no-store"})
+
+
+@app.get("/api/v1/launcher/releases/file/{name}")
+async def launcher_release_file(name: str, user: dict = Depends(get_web_or_launcher_user)):
+    """One release zip. 404 unless a row visible to this account names it — so a
+    testing build is not downloadable by guessing its name."""
+    _rate_limit(f"launcher-release-dl:{user['user_id']}",
+                max_hits=FIRSTPARTY_DOWNLOADS_PER_HOUR, window=3600.0)
+    pairs, _ = await _firstparty_visible(user)
+    path = await asyncio.to_thread(firstparty.file_path, name, pairs)
+    if path is None:
+        raise HTTPException(status_code=404, detail="Not found.")
+    return FileResponse(path, media_type="application/zip", filename=name,
+                        headers={"Cache-Control": "private, no-store"})
 
 
 @app.get("/api/v1/web/mp/access")
