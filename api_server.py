@@ -25,7 +25,7 @@ from fastapi import (
     WebSocket, WebSocketDisconnect,
 )
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 from firebase_admin import firestore
 from pydantic import BaseModel, Field
 
@@ -88,6 +88,7 @@ from data import mp_servers
 from data import mp_host_commands
 from data import testers
 from data import firstparty
+from data import launcher_updates
 from data import mp_pairing
 from data import blocks as blocks_db
 from data import mp_visibility
@@ -11144,6 +11145,52 @@ async def launcher_release_file(name: str, user: dict = Depends(get_web_or_launc
     if path is None:
         raise HTTPException(status_code=404, detail="Not found.")
     return FileResponse(path, media_type="application/zip", filename=name,
+                        headers={"Cache-Control": "private, no-store"})
+
+
+# ── The launcher's own updates (bm-launcher.md §25) ───────────────────────────
+#  Answers tauri-plugin-updater in its format. The minisign signature is checked by
+#  the plugin against the key compiled into the launcher; the bot only filters testing
+#  builds (owner/admins/testers) and serves installers named by a visible release.
+#  `data/launcher_updates.py`.
+
+# Where installers are fetched from: the plugin needs an absolute URL. The launcher
+# refuses one that is not on its own account server.
+LAUNCHER_UPDATE_BASE = os.getenv("LAUNCHER_UPDATE_BASE", "https://mainserver.boundlessmissions.com").rstrip("/")
+
+
+@app.get("/api/v1/launcher/update/{target}/{arch}/{current}")
+async def launcher_update_check(target: str, arch: str, current: str,
+                                bundle: str = Query(default=""),
+                                user: dict = Depends(get_launcher_user)):
+    """`?bundle=` is the plugin's `{{bundle_type}}` (appimage / deb / rpm / nsis / msi):
+    a release is only offered in the format this launcher was installed as."""
+    _rate_limit(f"launcher-update:{user['user_id']}", max_hits=60, window=3600.0)
+    rows = await asyncio.to_thread(launcher_updates.load)
+    testing = (await asyncio.to_thread(_server_access, user.get("user_id"))) is not None
+    platform = f"{target}-{arch}-{bundle}"
+    best = launcher_updates.newest_for(rows, platform, current, testing)
+    if best is None:
+        return Response(status_code=204, headers={"Cache-Control": "private, no-store"})
+    plat = best["platforms"][platform]
+    return JSONResponse({
+        "version": best["version"],
+        "notes": best.get("notes", ""),
+        "pub_date": best.get("pub_date") or None,
+        "url": f"{LAUNCHER_UPDATE_BASE}/api/v1/launcher/update/file/{plat['file']}",
+        "signature": plat["signature"],
+    }, headers={"Cache-Control": "private, no-store"})
+
+
+@app.get("/api/v1/launcher/update/file/{name}")
+async def launcher_update_file(name: str, user: dict = Depends(get_launcher_user)):
+    _rate_limit(f"launcher-update-dl:{user['user_id']}", max_hits=20, window=3600.0)
+    rows = await asyncio.to_thread(launcher_updates.load)
+    testing = (await asyncio.to_thread(_server_access, user.get("user_id"))) is not None
+    path = await asyncio.to_thread(launcher_updates.file_path, name, rows, testing)
+    if path is None:
+        raise HTTPException(status_code=404, detail="Not found.")
+    return FileResponse(path, media_type="application/octet-stream", filename=name,
                         headers={"Cache-Control": "private, no-store"})
 
 
