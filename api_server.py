@@ -11048,26 +11048,56 @@ async def mp_host_result(cid: str, body: HostResult, authorization: str = Header
     return {"recorded": bool(stored)}
 
 
-async def get_server_operator(user: dict = Depends(get_web_user)) -> dict:
-    """Who may use the server-management page: the owner, mapped guild admins,
-    and accounts on the owner's tester list (`data/testers.py`). 404 for
-    everyone else — the page is not open yet, so it should be invisible rather
-    than merely closed, the same posture as the admin console.
+def _server_operator(user: dict) -> dict:
+    """Who may manage servers: the owner, mapped guild admins, and accounts on the
+    owner's tester list (`data/testers.py`). 404 for everyone else — the page is
+    not open yet, so it should be invisible rather than merely closed, the same
+    posture as the admin console.
 
     Registering a server (`POST /api/v1/mp/servers`) stays open to every
-    account by design; only managing one from the website is gated here.
-    Ownership of each server is still checked per call on top of this.
+    account by design; only managing one is gated here. Ownership of each server
+    is still checked per call on top of this.
     """
     uid = user.get("user_id")
     if _is_owner_id(uid):
         user["server_access"] = "owner"
-    elif await asyncio.to_thread(testers.is_tester, uid):
+    elif testers.is_tester(uid):
         user["server_access"] = "tester"
     elif _admin_role_guild_ids(uid):
         user["server_access"] = "admin"
     else:
         raise HTTPException(status_code=404, detail="Not found.")
     return user
+
+
+async def get_server_operator(user: dict = Depends(get_web_user)) -> dict:
+    """Server management from the website (pairing, the access probe)."""
+    return await asyncio.to_thread(_server_operator, user)
+
+
+# What a launcher token may ask a host to do (bm-launcher.md §23): read status, read
+# and replace the modset, inspect download links. Restart / stop / settings / listing
+# stay website-only, so a launcher token copied off a disk cannot take a server down.
+LAUNCHER_HOST_ACTIONS = frozenset({"status", "modset.get", "modset.set", "files.inspect"})
+
+
+async def get_web_or_launcher_user(request: Request,
+                                   authorization: str = Header(default=""),
+                                   x_device_id: str = Header(default="", alias="X-Device-Id")) -> dict:
+    """A website token, or a launcher token from its trusted device — for the
+    server-owner routes the launcher shares with the website (one API, not a fork).
+    The launcher path is `get_launcher_user` itself (device binding, suspension)."""
+    user = await _verify_bearer(authorization, allow_launcher=True)
+    if user.get("aud") == AUD_LAUNCHER:
+        user = await get_launcher_user(request, authorization, x_device_id)
+        user["via_launcher"] = True
+        return user
+    return await get_web_user(authorization)
+
+
+async def get_server_operator_any(user: dict = Depends(get_web_or_launcher_user)) -> dict:
+    """Server management from the website or the launcher (list, commands)."""
+    return await asyncio.to_thread(_server_operator, user)
 
 
 @app.get("/api/v1/web/mp/access")
@@ -11078,7 +11108,7 @@ async def web_mp_access(user: dict = Depends(get_server_operator)):
 
 
 @app.get("/api/v1/web/mp/servers")
-async def web_mp_servers(user: dict = Depends(get_server_operator)):
+async def web_mp_servers(user: dict = Depends(get_server_operator_any)):
     """The caller's own servers, with each one's admin-agent state."""
     _require_multiplayer()
     account_id = str(user["user_id"])
@@ -11100,10 +11130,12 @@ class HostCommandRequest(BaseModel):
 
 @app.post("/api/v1/web/mp/servers/{server_id}/commands")
 async def web_mp_issue(server_id: str, body: HostCommandRequest,
-                       user: dict = Depends(get_server_operator)):
+                       user: dict = Depends(get_server_operator_any)):
     _require_multiplayer()
     account_id = str(user["user_id"])
     _rate_limit(f"mp_host_issue:{account_id}", max_hits=60, window=600.0)
+    if user.get("via_launcher") and body.cmd not in LAUNCHER_HOST_ACTIONS:
+        raise HTTPException(status_code=403, detail="Do that from the server page on the website.")
     step_up = False
     if body.cmd in mp_host_commands.STEP_UP_ACTIONS:
         if not await asyncio.to_thread(twofa.is_enabled, account_id):
@@ -11131,7 +11163,7 @@ async def web_mp_issue(server_id: str, body: HostCommandRequest,
 
 
 @app.get("/api/v1/web/mp/servers/{server_id}/commands")
-async def web_mp_history(server_id: str, user: dict = Depends(get_server_operator)):
+async def web_mp_history(server_id: str, user: dict = Depends(get_server_operator_any)):
     _require_multiplayer()
     try:
         rows = await asyncio.to_thread(mp_host_commands.history, server_id,
@@ -11145,7 +11177,7 @@ async def web_mp_history(server_id: str, user: dict = Depends(get_server_operato
 
 
 @app.get("/api/v1/web/mp/servers/{server_id}/commands/{cid}")
-async def web_mp_command(server_id: str, cid: str, user: dict = Depends(get_server_operator)):
+async def web_mp_command(server_id: str, cid: str, user: dict = Depends(get_server_operator_any)):
     _require_multiplayer()
     try:
         return {"command": await asyncio.to_thread(
