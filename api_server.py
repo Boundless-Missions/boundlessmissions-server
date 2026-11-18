@@ -1584,15 +1584,49 @@ async def launcher_auth_totp(req: TwoFactorLoginRequest, request: Request,
     return _issue_link_token(result, device_id, aud=AUD_LAUNCHER)
 
 
+def _own_discord_avatar_url(uid: str, acct: dict | None, gid) -> str | None:
+    """The signed-in player's Discord avatar, for the launcher's account button.
+
+    From the bot's caches only (never fetch_user, like the corp list's) — the guild
+    member first (a server avatar is the face they chose here), then the global user —
+    as a 128 px PNG: it draws at 40 px on high-DPI screens, and a Nitro avatar's default
+    URL is an animated .gif the launcher does not decode. Called on the event loop (it
+    reads discord.py's caches); None when there is no cached Discord user.
+    """
+    acct = acct or {}
+    did = _discord_id(uid, allow_lookup=False) or (
+        int(acct["discord_id"]) if str(acct.get("discord_id") or "").isdigit() else None)
+    if did is not None and _bot_instance is not None:
+        guild = _bot_instance.get_guild(int(gid)) if str(gid or "").isdigit() else None
+        user_obj = (guild.get_member(did) if guild else None) or _bot_instance.get_user(did)
+        if user_obj is not None:
+            try:
+                asset = user_obj.display_avatar
+                try:
+                    return asset.replace(size=128, format="png").url
+                except Exception:
+                    return asset.url
+            except Exception:                      # pragma: no cover - defensive
+                pass
+    return None
+
+
 @app.get("/api/v1/launcher/me")
 async def launcher_me(user: dict = Depends(get_launcher_user)):
-    """Who the launcher is signed in as."""
-    acct = await asyncio.to_thread(accounts.get_account, str(user["user_id"]))
+    """Who the launcher is signed in as, with their picture (`avatar_url`, or null):
+    the Discord avatar, else the picture uploaded on the website, signed for the longest
+    GCS allows (the launcher caches the image, keyed without the signature)."""
+    uid = str(user["user_id"])
+    acct = await asyncio.to_thread(accounts.get_account, uid)
+    avatar_url = _own_discord_avatar_url(uid, acct, user.get("guild_id"))
+    if avatar_url is None and (acct or {}).get("avatar_url"):
+        avatar_url = await asyncio.to_thread(sign_stored, acct["avatar_url"], ttl=SIGNED_URL_MAX_TTL)
     return {
-        "user_id": str(user["user_id"]),
+        "user_id": uid,
         "username": (acct or {}).get("username") or user["username"],
         "display_name": (acct or {}).get("display_name") or user["username"],
         "guild_id": str(user["guild_id"]),
+        "avatar_url": avatar_url,
     }
 
 
