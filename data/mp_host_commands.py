@@ -368,12 +368,14 @@ def _clean_args(cmd: str, args: dict) -> dict:
         return {"base_hash": base, "listing": clean}
     if cmd == "files.inspect":
         url = args.get("url")
-        # A first look only; the agent applies the modset's exact rule
-        # (common/modset.py github_url_ok) before downloading anything.
-        if not isinstance(url, str) or len(url) > 300 or \
-                not url.startswith("https://github.com/") or "/releases/download/" not in url:
-            raise HostCmdError("Paste a GitHub release download link "
-                               "(github.com/…/releases/download/…).")
+        # A first look only; the agent applies the modset's exact rules
+        # (common/modset.py github_url_ok / link_url_ok — a GitHub release asset,
+        # or since 2026-11-18 a file on any public https host) before fetching,
+        # and fetches links only from public addresses.
+        if not isinstance(url, str) or len(url) > 300 or not url.startswith("https://") or \
+                any(ch.isspace() or not ch.isprintable() for ch in url):
+            raise HostCmdError("Paste an https link to the zip: a GitHub release download "
+                               "(github.com/…/releases/download/…) or a file on any public host.")
         return {"url": url}
     if cmd == "modset.get":
         return {}
