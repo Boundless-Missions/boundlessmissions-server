@@ -102,6 +102,7 @@ from data import suspicion as susp
 from data import telemetry_check as tcheck
 from data import cheat_check
 from data import craft_bans as cbans
+from data import mod_reviews
 from data import friends as friends_db
 from data import crew_ledger
 from data import mission_constraints as mc
@@ -1627,7 +1628,100 @@ async def launcher_me(user: dict = Depends(get_launcher_user)):
         "display_name": (acct or {}).get("display_name") or user["username"],
         "guild_id": str(user["guild_id"]),
         "avatar_url": avatar_url,
+        # Shows the launcher's tester tools (the problem-report card). Display only:
+        # every tester route checks `_is_launcher_tester` itself.
+        "tester": await asyncio.to_thread(_is_launcher_tester, uid),
     }
+
+
+# ── Tester problem reports from the BM Launcher ──────────────────────────────
+#  A tester presses "Send report" in the launcher's Settings; the launcher attaches
+#  the tail of its own log file and this opens a ticket in the home server that
+#  pings the owner. Testers only — the owner's list (`data/testers.py`) plus the
+#  owner — deliberately narrower than `_server_access`: guild admins are not testers.
+#  Everyone else gets 404, the console's rule (a 403 confirms the route exists).
+#
+#  The launcher sends at most ~900 KB of log so the whole request stays under
+#  PREAUTH_BODY_BYTES: the body-size middleware pre-authenticates bigger bodies
+#  with `get_user_token_only`, which refuses a launcher token by design.
+
+_LAUNCHER_REPORT_LOG_MAX = 1024 * 1024
+
+
+def _is_launcher_tester(uid) -> bool:
+    """The owner or an account on the tester list. Fails closed (`testers.is_tester`)."""
+    return _is_owner_id(uid) or testers.is_tester(uid)
+
+
+@app.post("/api/v1/launcher/bugreport")
+async def launcher_bug_report(request: Request,
+                              summary: str = Form(...),
+                              details: str = Form(default=""),
+                              launcher_version: str = Form(default=""),
+                              platform: str = Form(default=""),
+                              launcher_log: UploadFile = File(default=None),
+                              user: dict = Depends(get_launcher_user)):
+    """A tester's problem report from the launcher, as a ticket pinging the owner."""
+    uid = str(user["user_id"])
+    if not await asyncio.to_thread(_is_launcher_tester, uid):
+        raise HTTPException(status_code=404, detail="Not Found")
+    # The home server is where the owner reads tickets; a bot without one falls back
+    # to the tester's own guild, as the in-game bug report does.
+    gid = int(cfg.HOME_GUILD_ID or user["guild_id"])
+    _limit_ticket_open(uid, gid, request, per_user=5, bucket="launcher-report")
+
+    summary = (summary or "").strip()[:_BUG_SUMMARY_MAX]
+    details = (details or "").strip()[:_BUG_DETAILS_MAX]
+    if not summary:
+        raise HTTPException(status_code=400, detail="A summary is required.")
+    log_bytes = (await _read_upload(launcher_log, _LAUNCHER_REPORT_LOG_MAX)
+                 if launcher_log is not None else None) or None
+    log.info("Launcher report from tester %s (%s): %r (log=%d bytes)",
+             uid, user.get("username"), summary[:80], len(log_bytes) if log_bytes else 0)
+
+    if not _bot_instance:
+        return {"success": False, "message": "The bot is not available right now."}
+    guild = _bot_instance.get_guild(gid)
+    if guild is None:
+        return {"success": False, "message": "The Discord server is not reachable right now."}
+
+    import discord
+    from cogs.tickets import create_ticket
+
+    _esc = discord.utils.escape_markdown
+    one_line = lambda s, n: _esc(" ".join(str(s or "").split())[:n])  # noqa: E731
+    desc = (f"**Summary**\n{_esc(summary)}\n\n"
+            f"**Details**\n{_esc(details) if details else '_none given_'}")
+    e = discord.Embed(
+        title="🚀 BM Launcher",
+        description=(f"**Version:** `{one_line(launcher_version, 40) or 'unknown'}`\n"
+                     f"**Platform:** `{one_line(platform, 60) or 'unknown'}`\n"
+                     f"**launcher.log:** {'attached below' if log_bytes else '⚠️ not attached'}"),
+        color=discord.Color.blurple(),
+    )
+    files = [discord.File(io.BytesIO(log_bytes), filename="launcher.log")] if log_bytes else []
+    owner = int(cfg.OWNER_ID or 0)
+
+    channel = await create_ticket(
+        _bot_instance, guild,
+        opener_id=uid,
+        kind="bug",
+        title="Launcher problem (tester)",
+        description=desc,
+        color=discord.Color.orange(),
+        extra_embeds=[e],
+        files=files,
+        ping_mods=False,
+        # The owner, by name. No owner configured → the bug-report role, so the
+        # report is never left unread.
+        extra_user_ids=[owner] if owner else None,
+        ping_user_ids=[owner] if owner else None,
+        notify_role_key=None if owner else "bug_report",
+    )
+    if channel is None:
+        return {"success": False,
+                "message": "Couldn't open a ticket; the server's ticket system isn't set up."}
+    return {"success": True, "message": f"Sent. Ticket #{channel.name} is open in Discord."}
 
 
 @app.post("/api/v1/launcher/profile-session")
@@ -13568,6 +13662,94 @@ async def admin_policy_bump(req: AdminPolicyBump, user: dict = Depends(get_owner
     broadcast_policy_update()
     _admin_audit(user, "policy-bump", f"→ v{new_version}")
     return {"success": True, "policy": doc}
+
+
+# ── Mod reviews (admin) ───────────────────────────────────────────────────────
+#  Our rulings on third-party mod assets (server modpacks), held by the
+#  multiplayer master by sha256: verified / flagged / unreviewed. The master's
+#  admin routes take one shared secret and know nobody, so the bot holds that
+#  secret (never sent to the browser) and keeps the who-did-what in Firestore.
+#  `data/mod_reviews.py` has the rest.
+#
+#  Tier: `get_admin`, because the owner asked for the moderators to do this work
+#  and the console's only non-owner tier is the mapped bot-admin role. That is a
+#  deliberate departure from the craft-ban precedent (owner-only, since a hash is
+#  the same hash in every guild): a review cannot be cut to a guild — it reaches
+#  every player's launcher — so every action is attributed to a Discord id in the
+#  audit log. To make it owner-only, point this one name at `get_owner` (and add
+#  "modreviews" to the website's OWNER_ONLY_TABS).
+_mod_review_tier = get_admin
+
+
+class AdminModReview(BaseModel):
+    status: str
+    note: str = Field(default="", max_length=2000)   # cleaned and cut to 500 below
+
+
+def _mod_review_actor(user: dict) -> dict:
+    return {
+        "account_id": str(user["user_id"]),
+        "discord_id": accounts.discord_for_account(user["user_id"]),
+        "name": user.get("username") or "",
+        "is_owner": bool(user.get("is_owner")),
+        "guild_ids": user.get("admin_guild_ids") or [],
+    }
+
+
+@app.get("/api/v1/web/admin/modreviews")
+async def admin_mod_reviews(user: dict = Depends(_mod_review_tier)):
+    """The review queue: every github/link asset on the master's live listings,
+    unreviewed first. Reads only public master routes, so it works without the
+    admin token; `config.write_configured` says whether the actions will."""
+    state = mod_reviews.config_state()
+    out = {"config": state, "items": [], "counts": {s: 0 for s in mod_reviews.STATUSES},
+           "servers_listed": 0, "servers_with_modset": 0, "modsets_unavailable": 0,
+           "truncated": False}
+    if not state["read_configured"]:
+        return out
+    try:
+        out.update(await asyncio.to_thread(mod_reviews.queue))
+    except mod_reviews.ReviewError as exc:
+        raise HTTPException(status_code=exc.status, detail=str(exc))
+    return out
+
+
+@app.get("/api/v1/web/admin/modreviews/audit")
+async def admin_mod_review_audit(limit: int = 100, user: dict = Depends(_mod_review_tier)):
+    """Who set what, newest first — the only per-person record there is."""
+    try:
+        rows = await asyncio.to_thread(mod_reviews.recent, limit)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("mod review audit read failed: %s", exc)
+        raise HTTPException(status_code=503, detail="The audit log could not be read right now.")
+    return {"entries": rows}
+
+
+@app.put("/api/v1/web/admin/modreviews/{sha256}")
+async def admin_set_mod_review(sha256: str, req: AdminModReview,
+                               user: dict = Depends(_mod_review_tier)):
+    try:
+        # In the thread, actor and all: resolving a website-origin account to its
+        # Discord id is a Firestore read.
+        res = await asyncio.to_thread(lambda: mod_reviews.set_review(
+            sha256, req.status, req.note, _mod_review_actor(user)))
+    except mod_reviews.ReviewError as exc:
+        raise HTTPException(status_code=exc.status, detail=str(exc))
+    _admin_audit(user, "mod-review", f"{res['sha256'][:12]} {res['previous_status']} -> "
+                                     f"{res['status']} ({res['audit_id']})")
+    return {"success": True, **res}
+
+
+@app.delete("/api/v1/web/admin/modreviews/{sha256}")
+async def admin_reset_mod_review(sha256: str, user: dict = Depends(_mod_review_tier)):
+    try:
+        res = await asyncio.to_thread(lambda: mod_reviews.reset_review(
+            sha256, _mod_review_actor(user)))
+    except mod_reviews.ReviewError as exc:
+        raise HTTPException(status_code=exc.status, detail=str(exc))
+    _admin_audit(user, "mod-review-reset", f"{res['sha256'][:12]} was {res['previous_status']} "
+                                           f"({res['audit_id']})")
+    return {"success": True, **res}
 
 
 # ── Checkpoint Hero Shots ─────────────────────────────────────────────────────

@@ -260,9 +260,14 @@ async def create_ticket(
     ping_mods: bool = True,
     reserve_capacity: bool = True,
     notify_role_key: str | None = None,
+    ping_user_ids: list[int] | None = None,
 ) -> discord.TextChannel | None:
     """Create a private ticket channel under TICKET_CATEGORY_ID and post the opening
     message. Visible only to @mods, the opener (if any), and any extra_user_ids.
+
+    `ping_user_ids` are mentioned in the opening message (a person, not a role — the
+    launcher's tester reports ping the owner). Pass them in `extra_user_ids` too so
+    they can see the channel.
 
     `opener_id=None` makes a **mods-only** ticket (used for auto-flagged anti-cheat
     reports where the suspect must NOT see it); only mods can then close it.
@@ -457,6 +462,8 @@ async def create_ticket(
     if opener:
         content_bits.append(opener.mention)
     content_bits += [r.mention for r in dict.fromkeys(ping_roles)]
+    content_bits += [f"<@{u}>" for u in dict.fromkeys(ping_user_ids or [])
+                     if str(u).isdigit() and int(u) > 0]
     content = " ".join(content_bits) or None
 
     try:
